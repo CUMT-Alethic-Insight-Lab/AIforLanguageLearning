@@ -11,6 +11,8 @@ from . import models as _app_models  # noqa: F401
 
 # Import domain models to ensure all tables are registered in SQLModel metadata
 from .domain import models as _domain_models  # noqa: F401
+from .domain.analytics import models as _analytics_models  # noqa: F401
+from .domain.prompt_management import models as _prompt_models  # noqa: F401
 from .settings import settings
 
 _engine = None

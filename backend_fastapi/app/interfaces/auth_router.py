@@ -40,6 +40,7 @@ class RefreshRequest(BaseModel):
 
 
 class LoginUser(BaseModel):
+    id: int
     username: str
     role: str = "student"
 
@@ -112,7 +113,7 @@ async def register(req: RegisterRequest) -> LoginResponse:
             accessToken=access_token,
             refreshToken=refresh_token,
             expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(username=user.username, role=user.role or "student"),
+            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
         ),
     )
 
@@ -138,7 +139,7 @@ async def login(req: LoginRequest) -> LoginResponse:
             accessToken=access_token,
             refreshToken=refresh_token,
             expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(username=user.username, role=user.role or "student"),
+            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
         ),
     )
 
@@ -162,7 +163,7 @@ async def refresh(req: RefreshRequest) -> LoginResponse:
             accessToken=access_token,
             refreshToken=refresh_token,
             expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(username=user.username, role=user.role or "student"),
+            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
         ),
     )
 
@@ -198,6 +199,7 @@ async def get_student_profile(
         data={
             "id": profile.id,
             "user_id": profile.user_id,
+            "class_id": profile.class_id,
             "level": profile.level,
             "goals": profile.goals,
             "interests": profile.interests,
@@ -214,6 +216,7 @@ async def update_student_profile(
 ) -> StudentProfileResponse:
     profile = upsert_profile(
         current_user.id or 0,
+        class_id=data.get("class_id"),
         level=data.get("level"),
         goals=data.get("goals"),
         interests=data.get("interests"),
@@ -223,6 +226,7 @@ async def update_student_profile(
         data={
             "id": profile.id,
             "user_id": profile.user_id,
+            "class_id": profile.class_id,
             "level": profile.level,
             "goals": profile.goals,
             "interests": profile.interests,

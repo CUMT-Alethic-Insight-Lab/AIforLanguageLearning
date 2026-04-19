@@ -31,9 +31,10 @@
 
 **需要补充的工作:**
 - ❌ 场景设定注入到System Prompt
-- ❌ USER_MESSAGE/AI_MESSAGE事件持久化
-- ❌ 对话难度动态调整
-- ❌ 场景特定词汇高亮
+- ❌ 双模型并发测速降级机制 (Cloud Kimi vs Local Qwen3.5-9B)
+- ❌ USER_MESSAGE/AI_MESSAGE事件持久化及全量上下文加载
+- ❌ 动态难度调整
+- ❌ ASR静默处理（不直展给前端文字）
 
 ---
 
@@ -53,33 +54,29 @@
 │  └────────┬────────┘                                            │
 │           │                                                      │
 │           ▼                                                      │
-│  ┌─────────────────┐     ASR_PARTIAL / ASR_FINAL                 │
-│  │  ASR识别         │ ──► 发送识别结果                            │
+│  ┌─────────────────┐     (后端静默处理，前端根据音量显示水球动画)      │
+│  │  ASR识别         │ ──► 将识别结果作为 USER_MESSAGE 落库         │
 │  │  faster-whisper │                                            │
 │  └────────┬────────┘                                            │
 │           │                                                      │
 │           ▼                                                      │
 │  ┌─────────────────┐     构建LLM Prompt                          │
-│  │  上下文组装      │ ◄── 注入场景设定 + 对话历史                   │
+│  │  上下文组装      │ ◄── 注入场景设定 + 全部对话历史               │
 │  │  (需实现)        │                                            │
 │  └────────┬────────┘                                            │
 │           │                                                      │
 │           ▼                                                      │
-│  ┌─────────────────┐     LLM_TOKEN / LLM_RESULT                  │
-│  │  LLM生成         │ ──► 流式返回文本                            │
-│  │  stream_chat()  │                                            │
-│  └────────┬────────┘                                            │
+│  ┌────────────────────────────────────────────────────────┐      │
+│  │ 对话双模型竞速机制 (Race Condition)                       │      │
+│  │ • 云端模型 (Kimi): 高质量                                │      │
+│  │ • 本地模型 (Qwen3.5-9B): 优雅降级                       │      │
+│  │ 谁先产生回复，终止另一个，并作为最终 AI_MESSAGE 添加到上下文  │      │
+│  └────────┬───────────────────────────────────────────────┘      │
 │           │                                                      │
 │           ▼                                                      │
-│  ┌─────────────────┐     TTS_CHUNK / TTS_RESULT                  │
+│  ┌─────────────────┐     (后端消费 Token)                        │
 │  │  TTS合成         │ ──► 流式返回音频                            │
 │  │  synthesize_tts │                                            │
-│  └────────┬────────┘                                            │
-│           │                                                      │
-│           ▼                                                      │
-│  ┌─────────────────┐     USER_MESSAGE / AI_MESSAGE               │
-│  │  事件持久化      │ ──► 写入ConversationEvent                   │
-│  │  (需实现)        │                                            │
 │  └─────────────────┘                                            │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
@@ -109,27 +106,44 @@ async def ws_v1(ws: WebSocket) -> None:
     system_prompt = apply_difficulty_adjustment(system_prompt, user_level)
 ```
 
-### 2. 对话事件持久化
+### 2. 双模型竞速降级机制与上下文组装
 
-在ASR_FINAL和LLM_RESULT时写入事件:
+移除原来生硬的 10 轮上下文限制，利用 Transformer 的长上下文窗口。为保证高质量并预防云端故障，采用 Kimi（云）与 Qwen3.5-9B（本地） 竞速（Race Condition）机制。
 
 ```python
-# ASR识别完成后
-await send_event("ASR_FINAL", {"text": final_text}, ...)
-# 新增：同时写入USER_MESSAGE
+# ASR 识别结果不再发送给前端（静默处理，前端基于音量计算平滑水球动画），仅仅持久化：
 await store_dialogue_event(
     conversation_id=conversation_id,
     type="USER_MESSAGE",
     payload={"text": final_text, "source": "asr"}
 )
 
-# LLM生成完成后
-await send_event("LLM_RESULT", {"text": full_text, ...}, ...)
-# 新增：同时写入AI_MESSAGE
+# 提取上下文时，不要做数量截断，直接加载全部历史
+all_history = await get_all_chat_history(conversation_id)
+
+# 启动双模型并发竞速
+from asyncio import create_task, wait, FIRST_COMPLETED
+
+task_cloud = create_task(stream_chat(system_prompt, final_text, history=all_history, model="moonshot-v1-auto"))
+task_local = create_task(stream_chat(system_prompt, final_text, history=all_history, model="qwen3.5-9b"))
+
+done, pending = await wait([task_cloud, task_local], return_when=FIRST_COMPLETED)
+# 获胜者将作为本次回答
+winner_task = done.pop()
+stream = winner_task.result()
+# 取消较慢的协程
+for p in pending:
+    p.cancel()
+
+# LLM 生成（流式 Token 不直接暴漏给前端，它的唯一目的是喂给后续 TTS 从而加快出声）
+# 前端无感体验
+# ... TTS 生成后发送给前端音频块 ...
+
+# 此时，将**产生回复的胜者答案**正确写入上下文，并带上模型来源标记
 await store_dialogue_event(
     conversation_id=conversation_id,
     type="AI_MESSAGE",
-    payload={"text": full_text, "audio_duration": audio_duration}
+    payload={"text": full_text, "source": "cloud-kimi" 或 "local-qwen"}
 )
 ```
 
@@ -218,7 +232,8 @@ class DialogueContextBuilder:
     async def build_system_prompt(self) -> str:
         """构建System Prompt"""
         scene = await self._get_scene_setting()
-        history = await self._get_recent_history(limit=5)
+        # 加载过去的所有有效对话
+        history = await self._get_all_history()
         
         return f"""你是{scene.setting['roles'][0]}，正在{scene.setting['location']}与用户进行英语对话练习。
 
@@ -227,14 +242,11 @@ class DialogueContextBuilder:
 学习目标: {', '.join(scene.learning_objectives)}
 核心词汇: {', '.join(scene.key_vocabulary)}
 
-对话历史:
-{self._format_history(history)}
-
 请保持角色扮演，帮助用户完成学习目标。如果用户表达有误，请温和地纠正。
 """
     
     def _format_history(self, messages: list[dict]) -> str:
-        """格式化历史消息"""
+        """不再人为截断10轮限制，提供完整语境。并且必须区分 user vs assistant"""
         ...
 ```
 

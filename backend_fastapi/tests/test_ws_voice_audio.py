@@ -20,6 +20,12 @@ def test_ws_voice_audio_min_flow(tmp_path: Path, monkeypatch) -> None:
         yield "ok"
 
     monkeypatch.setattr("app.main.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "app.main.try_create_seamless_transcriber",
+        lambda **_: (lambda _audio, _cfg: "hello from asr"),
+    )
+    monkeypatch.setattr("app.main.settings.enable_asr", True)
+    monkeypatch.setattr("app.main.settings.asr_backend", "seamless")
 
     client = TestClient(app)
     with client.websocket_connect("/ws/v1?session_id=test&conversation_id=conv_voice") as ws:
@@ -54,11 +60,16 @@ def test_ws_voice_audio_min_flow(tmp_path: Path, monkeypatch) -> None:
             m = ws.receive_json()
             types.append(m.get("type"))
             if m.get("type") == "TASK_FINISHED":
+                assert isinstance((m.get("payload") or {}).get("pipeline_metrics"), dict)
+                metrics = (m.get("payload") or {}).get("pipeline_metrics") or {}
+                assert "llm_latency_ms" in metrics
+                assert "tts_total_ms" in metrics
+            if m.get("type") == "TASK_FINISHED":
                 break
 
         assert "ASR_FINAL" in types
-        if "LLM_TOKEN" in types:
-            assert types.index("LLM_TOKEN") < types.index("LLM_RESULT")
+        assert "LLM_TOKEN" in types
+        assert types.index("LLM_TOKEN") < types.index("LLM_RESULT")
         assert "LLM_RESULT" in types
         assert "TTS_CHUNK" in types
         assert "TTS_RESULT" in types

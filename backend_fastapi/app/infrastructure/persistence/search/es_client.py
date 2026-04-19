@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from elasticsearch import AsyncElasticsearch
+try:
+    from elasticsearch import AsyncElasticsearch
+    ELASTICSEARCH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency
+    AsyncElasticsearch = Any  # type: ignore[assignment]
+    ELASTICSEARCH_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +38,8 @@ class ESClient:
         self._client: AsyncElasticsearch | None = None
 
     async def connect(self) -> AsyncElasticsearch:
+        if not ELASTICSEARCH_AVAILABLE:
+            raise RuntimeError("elasticsearch package is not installed")
         if self._client is None:
             self._client = AsyncElasticsearch(self.hosts)
         return self._client
@@ -59,9 +66,9 @@ def get_es_client() -> ESClient:
 
 async def ensure_index(client: AsyncElasticsearch | None = None) -> bool:
     """检查并创建 vocabulary 索引"""
-    if client is None:
-        client = (await get_es_client().connect())
     try:
+        if client is None:
+            client = (await get_es_client().connect())
         exists = await client.indices.exists(index=INDEX_NAME)
         if not exists:
             await client.indices.create(index=INDEX_NAME, mappings=MAPPINGS)
@@ -78,9 +85,9 @@ async def index_document(
     client: AsyncElasticsearch | None = None,
 ) -> bool:
     """索引单个文档"""
-    if client is None:
-        client = (await get_es_client().connect())
     try:
+        if client is None:
+            client = (await get_es_client().connect())
         await client.index(index=INDEX_NAME, id=doc_id, document=doc)
         return True
     except Exception as e:
@@ -95,9 +102,9 @@ async def search_vocabulary(
     client: AsyncElasticsearch | None = None,
 ) -> list[dict[str, Any]]:
     """词汇全文搜索"""
-    if client is None:
-        client = (await get_es_client().connect())
     try:
+        if client is None:
+            client = (await get_es_client().connect())
         q: dict[str, Any] = {
             "multi_match": {
                 "query": query,

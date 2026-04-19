@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from enum import Enum
@@ -145,17 +146,38 @@ class ConversationContext:
         return [{"role": m.role, "content": m.content} for m in self.messages]
 
 
+
+def _resolve_model_id_sync(endpoint: ModelEndpoint) -> str:
+    """同步解析模型 ID，避免占位符导致 LM Studio 选择错误模型。"""
+    mid = (endpoint.model_id or "").strip()
+    if mid and mid not in {"local-model", "local-llm", "default", ""}:
+        return mid
+    # Fallback: read from runtime_config primary
+    try:
+        runtime = get_runtime_config()
+        primary = str(((runtime.get("models") or {}).get("primary") or "")).strip()
+        if primary and primary not in {"local-model", "local-llm", "default", ""}:
+            return primary
+    except Exception:
+        pass
+    return mid or "local-model"
+
+
 class ModelRouter:
     """模型路由器 - 核心类"""
     
     # 场景到模型提供商的映射
     SCENE_PROVIDER_MAP: dict[SceneType, ModelProvider] = {
         SceneType.CHAT: ModelProvider.LOCAL,
-        SceneType.VOCAB: ModelProvider.KIMI,
+        SceneType.VOCAB: ModelProvider.LOCAL,
         SceneType.ESSAY: ModelProvider.KIMI,
         SceneType.SCENARIO_EXPANSION: ModelProvider.KIMI,
     }
     
+    def _resolve_model_id(self, endpoint: ModelEndpoint) -> str:
+        """解析模型 ID，避免占位符导致 LM Studio 选择错误模型。"""
+        return _resolve_model_id_sync(endpoint)
+
     def __init__(self) -> None:
         self._endpoints: dict[ModelProvider, list[ModelEndpoint]] = {}
         self._contexts: dict[str, ConversationContext] = {}
@@ -163,12 +185,17 @@ class ModelRouter:
     
     def _init_endpoints(self) -> None:
         """初始化模型端点配置"""
-        # 本地模型端点
+        # 本地模型端点：优先使用运行时配置中的 primary（由 list_available_llm_models 维护）
+        # 避免使用 settings.llm_model 占位符（如 "local-model"）导致 LM Studio 选择错误的大模型
+        runtime = get_runtime_config()
+        primary_model = str(((runtime.get("models") or {}).get("primary") or "")).strip()
+        local_model_id = primary_model if primary_model and primary_model not in {"local-model", "local-llm", "default", ""} else settings.llm_model
+
         local_endpoint = ModelEndpoint(
             provider=ModelProvider.LOCAL,
             base_url=settings.llm_base_url,
             api_key=settings.llm_api_key,
-            model_id=settings.llm_model,
+            model_id=local_model_id,
             timeout_connect=5.0,
             timeout_read=60.0,  # 本地模型可能需要更长时间
             priority=1
@@ -183,7 +210,7 @@ class ModelRouter:
                 provider=ModelProvider.KIMI,
                 base_url=kimi_base_url,
                 api_key=kimi_api_key,
-                model_id="kimi-latest",  # 或其他具体模型
+                model_id="moonshot-v1-auto",  # OpenAI兼容默认模型
                 timeout_connect=5.0,
                 timeout_read=30.0,
                 priority=1
@@ -239,6 +266,12 @@ class ModelRouter:
         
         primary = endpoints[0] if endpoints else None
         fallbacks = endpoints[1:] if len(endpoints) > 1 else []
+        
+        # 当主选为云端 KIMI 时，追加本地模型作为跨提供商故障回退
+        if provider == ModelProvider.KIMI:
+            local_eps = self._endpoints.get(ModelProvider.LOCAL, [])
+            if local_eps:
+                fallbacks.extend(sorted(local_eps, key=lambda e: e.priority))
         
         # 场景扩写使用thinking模式，需要不同的temperature
         temperature = 0.7
@@ -372,8 +405,9 @@ class ModelRouter:
             )
             
             async with httpx.AsyncClient(base_url=endpoint.base_url, timeout=timeout) as client:
+                model_id = self._resolve_model_id(endpoint)
                 payload = {
-                    "model": endpoint.model_id,
+                    "model": model_id,
                     "messages": messages,
                     "stream": stream,
                     "temperature": temperature
@@ -455,6 +489,120 @@ class ModelRouter:
                 
                 await asyncio.sleep(delay)
 
+    async def call_cloud_local_race(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+    ) -> str:
+        """同时调用 KIMI 和 LOCAL，谁先成功返回用谁。
+
+        若 KIMI 未配置，直接回退到 LOCAL。
+        所有任务失败时抛 RuntimeError。
+        """
+        kimi_eps = self._endpoints.get(ModelProvider.KIMI, [])
+        local_eps = self._endpoints.get(ModelProvider.LOCAL, [])
+
+        if not kimi_eps:
+            if not local_eps:
+                raise RuntimeError("No endpoints available")
+            return await _call_endpoint_text(local_eps[0], messages, temperature)
+
+        tasks: list[asyncio.Task[str]] = []
+        for ep in kimi_eps:
+            tasks.append(asyncio.create_task(_call_endpoint_text(ep, messages, temperature)))
+        for ep in local_eps:
+            tasks.append(asyncio.create_task(_call_endpoint_text(ep, messages, temperature)))
+
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+
+        for task in done:
+            try:
+                return task.result()
+            except Exception:
+                continue
+
+        for task in pending:
+            try:
+                return await task
+            except Exception:
+                continue
+
+        raise RuntimeError("All model endpoints failed")
+
+    async def call_cloud_first_timeout(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+        timeout: float = 1.0,
+    ) -> str:
+        """同时发起 KIMI 和 LOCAL，优先等 KIMI timeout 秒，超时则用 LOCAL。
+
+        若 KIMI 未配置，直接回退到 LOCAL。
+        """
+        kimi_eps = self._endpoints.get(ModelProvider.KIMI, [])
+        local_eps = self._endpoints.get(ModelProvider.LOCAL, [])
+
+        if not kimi_eps:
+            if not local_eps:
+                raise RuntimeError("No endpoints available")
+            return await _call_endpoint_text(local_eps[0], messages, temperature)
+
+        cloud_task = asyncio.create_task(_call_endpoint_text(kimi_eps[0], messages, temperature))
+        local_task = asyncio.create_task(_call_endpoint_text(local_eps[0], messages, temperature))
+
+        try:
+            result = await asyncio.wait_for(cloud_task, timeout=timeout)
+            local_task.cancel()
+            return result
+        except (asyncio.TimeoutError, Exception):
+            pass
+
+        try:
+            return await local_task
+        except Exception:
+            pass
+
+        if not cloud_task.done():
+            try:
+                return await cloud_task
+            except Exception:
+                pass
+
+        raise RuntimeError("All model endpoints failed")
+
+
+async def _call_endpoint_text(
+    endpoint: ModelEndpoint,
+    messages: list[dict[str, str]],
+    temperature: float,
+) -> str:
+    """非流式调用单个端点，返回完整文本。失败时抛异常。"""
+    # 读取超时使用端点配置与全局设置中的较小值，避免测试/无响应环境挂死
+    read_timeout = min(endpoint.timeout_read, float(settings.llm_timeout_seconds))
+    connect_timeout = min(endpoint.timeout_connect, 2.0)
+    timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
+    async with httpx.AsyncClient(base_url=endpoint.base_url, timeout=timeout) as client:
+        model_id = _resolve_model_id_sync(endpoint)
+        payload: dict[str, Any] = {
+            "model": model_id,
+            "messages": messages,
+            "stream": False,
+            "temperature": temperature,
+        }
+        resp = await client.post(
+            "/chat/completions",
+            headers={"Authorization": f"Bearer {endpoint.api_key}"},
+            json=payload,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        if not content or not content.strip():
+            raise ValueError("Empty LLM response")
+        return content.strip()
+
 
 # 全局路由器实例
 _router: ModelRouter | None = None
@@ -468,45 +616,212 @@ def get_model_router() -> ModelRouter:
     return _router
 
 
+_SYSTEM_PROMPT_TAG_RE = re.compile(
+    r"<SYSTEM_PROMPT>\s*(.*?)\s*</SYSTEM_PROMPT>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _normalize_expanded_system_prompt(raw_text: str, append_anchor_rule: bool = False) -> str:
+    """将扩写结果标准化为可直接粘贴的 system prompt 正文。"""
+
+    text = str(raw_text or "").strip()
+    if not text:
+        return ""
+
+    tag_match = _SYSTEM_PROMPT_TAG_RE.search(text)
+    if tag_match:
+        text = tag_match.group(1).strip()
+
+    # 清理常见代码块包裹。
+    if text.startswith("```"):
+        text = re.sub(r"^\s*```[\w-]*\s*", "", text, count=1)
+        text = re.sub(r"\s*```\s*$", "", text, count=1)
+
+    # 清理模型常见前导话术。
+    text = re.sub(
+        r"^\s*(以下|下面).{0,48}(System\s*Prompt|系统提示词|可直接).{0,24}[:：]\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"^\s*System\s*Prompt\s*[:：]\s*", "", text, flags=re.IGNORECASE)
+
+    # 兜底：删除 AI 主动句中常见的英文肯定/安抚短语（保留用户回应后的使用）。
+    # 由于无法精确判断语境，这里采用保守策略：删除括号内或独立出现的常见英文短语。
+    for phrase in (
+        r"I see what you mean",
+        r"Good try",
+        r"Don't worry",
+        r"Take your time",
+        r"Well done",
+        r"Nice try",
+    ):
+        # 匹配括号包裹形式，如 (I see what you mean.) 或 （I see what you mean.）
+        text = re.sub(
+            rf"[（(]\s*{re.escape(phrase)}[.,!?]*\s*[）)]",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+        # 匹配独立出现的形式（前后有空格或标点）
+        text = re.sub(
+            rf"\b{re.escape(phrase)}[.,!?]*\b",
+            "",
+            text,
+            flags=re.IGNORECASE,
+        )
+    # 清理可能产生的多余空括号或双空格
+    text = re.sub(r"[（(]\s*[）)]", "", text)
+    text = re.sub(r"  +", " ", text)
+
+    # 折叠连续空行，保留单个空行。
+    normalized_lines: list[str] = []
+    prev_blank = False
+    for line in text.splitlines():
+        current = line.rstrip()
+        if not current.strip():
+            if not prev_blank:
+                normalized_lines.append("")
+            prev_blank = True
+            continue
+        normalized_lines.append(current)
+        prev_blank = False
+
+    text = "\n".join(normalized_lines).strip()
+    text = text.strip('"').strip("'").strip()
+
+    if append_anchor_rule:
+        # 强制追加场景锚定规则（工程兜底）：无论扩写结果如何，必须包含此条。
+        anchor_suffix = (
+            "\n\n【场景锚定强制规则】\n"
+            "无论用户输入语法是否正确、语义是否通顺，只要内容明显偏离当前实体场景，"
+            "你必须先假设为 ASR 识别错误或用户一时口误，用 1-2 个与场景相关的确认选项把话题拉回正轨，"
+            "绝对禁止直接接受偏离场景的内容并顺着话题聊下去。"
+        )
+        if anchor_suffix.strip() not in text:
+            text = text + anchor_suffix
+
+    return text
+
+
+# ---------------------------------------------------------------------------
+# 场景库文化语境匹配（内联精简版，供扩写时注入参考）
+# ---------------------------------------------------------------------------
+_SCENARIO_LIBRARY_SNIPPETS: dict[str, str] = {
+    # 一、出行交通
+    "机场": "- 日本机场：敬语层级（尊敬語・謙譲語・丁寧語）极其严格，排队距离和沉默等待的容忍度高。\n- 教学重点：让学生理解'敬语不是客气，是社会距离的管理工具'；练习用「～させていただきます」表达服务方的谦逊。",
+    "酒店": "- 美国酒店：门童搬行李期待 $1-2/件小费，但前台不收小费；投诉表达习惯直接。\n- 日本商务酒店：大浴场礼仪（先淋浴再入浴、毛巾不入水、纹身禁忌），退房时间通常 10:00 非常严格。\n- 教学重点：区分 service recovery 的直接表达与日常寒暄的边界；理解'规则前置'的日本服务文化。",
+    "租车": "- 美国租车：LDW 与 SLI 保险区分，条款质疑意识。\n- 英国租车：右舵左行，roundabout 让行规则。\n- 教学重点：培养'条款质疑意识'——学会说 'Could you walk me through what this covers?'；理解路权文化。",
+    "地铁": "- 英国伦敦地铁：Oyster Card daily cap 机制，指路以线路和终点站为锚点而非东南西北。\n- 教学重点：理解'方向感表达'的英式习惯。",
+    # 二、餐饮服务
+    "餐厅": "- 美国餐厅：小费 15-20% 是强社会规范；过敏声明需用 'I'm allergic to' 而非 'I don't like'。\n- 法国餐厅：用餐节奏慢是社交仪式，服务员不会频繁打扰；奶酪盘是独立一道。\n- 教学重点：区分 'I don't like'（偏好）和 'I'm allergic to'（医疗）的语用权重；理解'慢即是尊重'的法国餐饮哲学。",
+    "西餐": "- 美国餐厅：小费 15-20% 是强社会规范；过敏声明需用 'I'm allergic to' 而非 'I don't like'。\n- 法国餐厅：用餐节奏慢是社交仪式，服务员不会频繁打扰；奶酪盘是独立一道。\n- 教学重点：区分 'I don't like'（偏好）和 'I'm allergic to'（医疗）的语用权重；理解'慢即是尊重'的法国餐饮哲学。",
+    "居酒屋": "- 日本居酒屋：お通し是'空间租赁+社交启动器'，不能拒绝；互相倒酒礼仪（空杯表示请续杯）。\n- 教学重点：练习互相倒酒时的谦让表达「お先に失礼します」。",
+    "咖啡": "- 澳洲/英国精品咖啡：Flat White 是国民饮品，takeaway vs eat in 可能有 VAT 差异。\n- 教学重点：理解'咖啡文化中的地域身份认同'；学会用咖啡术语表达个人偏好。",
+    "酒吧": "- 英国酒吧：轮酒文化（buying rounds）是社交契约，必须去吧台点酒且排队是隐形的。\n- 教学重点：练习吧台点酒时的眼神交流和简洁表达。",
+    "外卖": "- 美国外卖：退款流程自动化但过度投诉会被标记为欺诈；'I'd like a refund' 正常，'You guys messed up' 带有指责性。\n- 教学重点：培养 assertive but polite 的投诉表达——描述事实而非指责人格。",
+    # 三、生活服务
+    "理发": "- 英国理发店：用 'fringe' 而非 'bangs'，trim 通常只修 1-2cm；小费 10% 是礼貌。\n- 日本理发店：沉默服务（no small talk）是尊重而非冷漠；服务流程固定（热毛巾、颈部按摩、耳部清洁）。\n- 教学重点：学会用具体长度和参考图片沟通；理解'沉默是服务的另一种形式'。",
+    "干洗": "- 美国干洗店：same-day service 通常是上午送下午取；专业护理消费观念。\n- 教学重点：学会描述污渍类型（coffee stain, ink stain, grease stain）。",
+    "银行": "- 美国银行：支票文化（voided check、routing number）仍广泛使用；信用记录与 debit/credit card 使用习惯相关。\n- 教学重点：理解'支票是另一种信任机制'；区分 debit card 和 credit card 的语用场景。",
+    "邮局": "- 英国邮政 Royal Mail：1st Class / 2nd Class 是速度和价格而非舱位；邮局通常只卖邮票和寄件服务。\n- 教学重点：理解 'Class' 在英国邮政中的特殊含义；学会用重量和尺寸描述包裹。",
+    "药店": "- 美国药店：药剂师有处方审核和用药咨询权，抗生素管控极严。\n- 教学重点：理解'药剂师是医疗团队的一员'；学会用具体症状和持续时间描述病情。",
+    # 四、购物消费
+    "超市": "- 英国超市：Best Before（品质保证期）vs Use By（安全截止日期）；自助结账礼仪。\n- 教学重点：理解'Best Before 不等于过期'；学会自助结账求助表达。",
+    "商场": "- 美国商场：'No Questions Asked' 退货文化是消费者权利，但频繁退货会被标记为 serial returner。\n- 教学重点：理解'退货是消费者权利'与'滥用权利会被反制'的平衡。",
+    "退换货": "- 美国商场：'No Questions Asked' 退货文化是消费者权利，但频繁退货会被标记为 serial returner。\n- 教学重点：理解'退货是消费者权利'与'滥用权利会被反制'的平衡。",
+    "二手店": "- 英国慈善商店：价格固定不接受砍价；购买二手是中产阶级的环保和品味象征。\n- 教学重点：区分 thrift store 和 vintage shop 的文化定位。",
+    "菜市场": "- 法国菜市场：商贩习惯聊食材产地和烹饪方法，是一种社交仪式；禁止用手摸蔬菜水果。\n- 教学重点：理解'市场对话是生活美学的一部分'；学会用 'What's in season?' 开启对话。",
+    # 五、医疗健康
+    "诊所": "- 英国 NHS：GP 需提前预约，急诊才去 A&E；医生期待患者自己描述症状。\n- 教学重点：理解分级诊疗逻辑；培养用时间线描述症状的能力。",
+    "牙科": "- 美国牙科：保险有 annual maximum 和 deductible；患者有权说 'I'd like a second opinion'。\n- 教学重点：理解'知情同意'的美国医疗文化；学会询问保险覆盖范围。",
+    "眼科": "- 日本眼镜店：30 分钟立等可取，验光师语气温和。\n- 教学重点：理解'效率与礼貌并重'的日本服务业；学会委婉表达不适「少し見にくいような気がします」。",
+    "急诊": "- 美国急诊室：费用昂贵，分诊护士有绝对权力决定等待优先级。\n- 教学重点：理解'医疗资源的稀缺性分配'；学会清晰简洁地描述病情严重程度。",
+    # 六、社交娱乐
+    "电影": "- 英国电影院：有 15-20 分钟开场广告和预告片，观影时极为安静。\n- 教学重点：理解'公共空间的沉默契约'；学会礼貌表达。",
+    "健身": "- 美国健身房：Don't talk to someone mid-set，用完器械归位；'How many sets do you have left?' 是礼貌轮换请求。\n- 教学重点：理解'健身房是共享空间，规则靠自律'；学会用健身术语描述训练目标。",
+    "博物馆": "- 法国博物馆：拍照限制严格（闪光灯绝对禁止），英国博物馆免费但建议捐赠。\n- 教学重点：理解'文化机构的规则是保护而非限制'；学会询问 'Is photography allowed here?'",
+    "派对": "- 英美 house party：BYOB（自带酒水），small talk 话题避开政治宗教和收入，告别时说 'I should probably make a move'。\n- 教学重点：理解'派对是社交投资'；培养用开放式问题维持对话的能力。",
+    # 七、居住事务
+    "租房": "- 英国租房：押金必须存入第三方保护机构（DPS/TDS），bills included 通常有合理使用上限。\n- 日本租房：礼金（感谢费，不退）与敷金（押金）区分，垃圾回收日和分类规则严格。\n- 教学重点：理解'租客权利受法律保护'；理解礼金是日本租房文化中的'社交润滑剂'。",
+    "家电维修": "- 美国维修服务：service window（如 8am-12pm）不会给出精确时间；维修前需提供书面估价单。\n- 教学重点：理解'时间窗口'的美国服务业惯例；学会描述故障现象而非猜测原因。",
+    "物业": "- 美国公寓物业：只处理公共事务，邻居纠纷建议先自行沟通；投诉讲究 document everything。\n- 教学重点：理解'自治优先'的美国社区文化；培养用事实和时间线写正式邮件的能力。",
+    # 八、学习教育
+    "图书馆": "- 英国大学图书馆：silent study 区域要求绝对安静；self-checkout 和 self-return 是常态。\n- 教学重点：理解'公共空间的使用边界'；学会用图书馆数据库搜索资源的术语。",
+    "书店": "- 法国书店：员工乐于讨论书籍内容，新书受 Lang Law 保护不能打折。\n- 教学重点：理解'书店是文化空间而非纯零售点'；学会用文学评论句式开启对话。",
+    "语言学校": "- 英国语言学校：placement test 测口语流利度和学习动机；课堂强调 participation。\n- 教学重点：理解'语言能力不等于考试成绩'；培养主动提问和课堂参与的意识。",
+    # 九、其他
+    "宠物医院": "- 英国兽医：宠物视为家庭成员，沟通方式非常温和委婉；宠物保险普及。\n- 教学重点：理解'动物福利文化'；学会用情感铺垫表达艰难决定。",
+    "汽车维修": "- 美国修车店：维修前必须提供书面估价单，未经同意不能额外收费。\n- 教学重点：学会说 'I'll stick to the original estimate for now'，防止过度推销。",
+    "美甲": "- 美国美甲店：小费 15-20%，需适应越南移民口音；区分 dip powder 和 gel。\n- 教学重点：适应不同口音的服务场景英语。",
+    "瑜伽": "- 美国瑜伽馆：强调 non-competitive 和 listen to your body，迟到通常不能进入教室。\n- 教学重点：理解'身心连接'的西方瑜伽文化。",
+    "宗教": "- 英国教堂：参观时恰逢礼拜必须保持绝对安静，某些区域禁止进入；捐赠不是强制门票。\n- 教学重点：理解宗教场所的礼仪边界。",
+}
+
+
+def _match_scenario_library(user_description: str, language: str = "en") -> str:
+    """根据用户描述匹配场景库中的文化语境摘要，返回供 Kimi 参考的文本。"""
+    desc = (user_description or "").lower()
+    matched: list[str] = []
+    seen_keys: set[str] = set()
+
+    # 按关键词优先级排序（先匹配长的/具体的）
+    for keyword, snippet in sorted(
+        _SCENARIO_LIBRARY_SNIPPETS.items(), key=lambda x: len(x[0]), reverse=True
+    ):
+        if keyword in desc and keyword not in seen_keys:
+            matched.append(f"【{keyword}】\n{snippet}")
+            seen_keys.add(keyword)
+
+    if not matched:
+        return ""
+
+    header = (
+        "以下是从场景库中匹配到的文化差异焦点与教学重点，"
+        "请在扩写时自然融入角色台词和 💡 学习提示中：\n"
+    )
+    return header + "\n\n".join(matched)
+
+
 async def expand_scenario(user_description: str, language: str = "en") -> str:
     """
     场景扩写: 用户描述 → Kimi API扩写 → 结构化场景描述
-    
+
     Args:
         user_description: 用户的场景描述
         language: 目标语言
-        
+
     Returns:
         str: 扩写后的场景描述（可作为System Prompt）
     """
     router = get_model_router()
     decision = router.route(SceneType.SCENARIO_EXPANSION)
-    
-    # 构建扩写Prompt
-    prompt = f"""请将用户的简短场景描述扩写为一个详细的口语练习场景设定。
 
-用户描述: {user_description}
-目标语言: {language}
+    scenario_library_context = _match_scenario_library(user_description, language)
 
-请输出一个结构化的场景描述，包含:
-1. 场景背景设定
-2. 用户角色
-3. AI角色
-4. 对话目标
-5. 关键话题点
-
-输出格式为纯文本，直接可用作System Prompt。"""
+    # 使用可编辑模板生成扩写任务，便于手工调优。
+    prompt = render_prompt(
+        "scenario_expand_system_prompt.j2",
+        user_description=user_description,
+        language=language,
+        scenario_library_context=scenario_library_context,
+    )
     
     messages = [
-        {"role": "system", "content": "你是一个专业的英语口语练习场景设计师。"},
-        {"role": "user", "content": prompt}
+        {
+            "role": "system",
+            "content": "你是有着对于各种场景广泛且深入理解的AI人机场景对话提示词工程专家。严格遵循输出格式，只返回用于引导对话的system prompt正文。",
+        },
+        {"role": "user", "content": prompt},
     ]
     
     result = ""
     async for chunk in router.call_with_fallback(decision, messages, stream=False):
         result += chunk
-    
-    return result.strip()
+
+    normalized = _normalize_expanded_system_prompt(result, append_anchor_rule=True)
+    return normalized or result.strip()
 
 
 async def chat_with_context(

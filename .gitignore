@@ -64,6 +64,10 @@ logs/
 *.log
 
 .tmp/
+*.pid
+
+# Netstat temp dumps
+_netstat*.txt
 
 temp/
 */temp/
@@ -73,6 +77,24 @@ temp/
 *.sqlite3
 *.db
 
+# Archives / bundles
+*.7z
+*.tar.gz
+release/
+
+# Electron build artifacts
+dist-electron/
+
+# Process/status reports (dated snapshots, not architecture docs)
+docs/ASR_LLM_TestMode_Summary_*.md
+docs/Dialogue_Voice_Module_Summary_Report.md
+docs/Voice_Dialogue_Full_Status_20260418.md
+docs/team_performance_analysis.md
+
+# Infrastructure binaries / runtime data
+infra_bin/
+!infra_bin/.gitkeep
+
 # === Project-specific ===
 backend/logs/
 backend/temp/
@@ -80,3 +102,14 @@ backend/data/*.sqlite*
 
 # Large vendored dependencies / generated deps (adjust if you really want to version them)
 third_party/
+
+# Project-specific runtime data
+backend_fastapi/data/*.db
+backend_fastapi/data/*.sqlite*
+env_check/obsolete/
+env_check/tmp/
+app/v5/resources/whisper/*.zip
+app/v5/resources/whisper/*.bin
+app/v5/resources/whisper/Release/
+app/v5/resources/whisper/*.exe
+app/v5/resources/whisper/*.dll

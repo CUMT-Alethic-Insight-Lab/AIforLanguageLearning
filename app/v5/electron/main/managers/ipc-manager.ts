@@ -1,10 +1,11 @@
-import { ipcMain, shell, app } from 'electron';
+import { ipcMain, shell, app, clipboard } from 'electron';
 import Store from 'electron-store';
 import log from 'electron-log';
 import fs from 'node:fs';
 import { WindowManager } from './window-manager.js';
 import { ServiceProbeManager } from './service-probe-manager.js';
 import { Config, SKey } from '../types.js';
+import { AsrManager } from './asr-manager.js';
 
 function normalizeBackendConfig(input: { url?: string; wsUrl?: string }) {
     const rawUrl = String(input?.url || '').trim();
@@ -35,11 +36,14 @@ export class IpcManager {
     private store: Store<Config>;
     private windowManager: WindowManager;
     private serviceProbeManager: ServiceProbeManager;
+    private asrManager: AsrManager;
 
     constructor(store: Store<Config>, windowManager: WindowManager, serviceProbeManager: ServiceProbeManager) {
         this.store = store;
         this.windowManager = windowManager;
         this.serviceProbeManager = serviceProbeManager;
+        this.asrManager = new AsrManager();
+        this.asrManager.registerIpcHandlers();
     }
 
     public registerHandlers() {
@@ -159,6 +163,55 @@ export class IpcManager {
                 log.error('overlay:show error', e);
                 return false;
             }
+        });
+
+        // ── 智能悬浮窗 IPC ──
+
+        ipcMain.handle('smart-overlay:show', async (_e, payload: any) => {
+            try {
+                this.windowManager.showSmartOverlay(payload);
+                return true;
+            } catch (e) {
+                log.error('smart-overlay:show error', e);
+                return false;
+            }
+        });
+
+        ipcMain.handle('smart-overlay:close', async () => {
+            try {
+                this.windowManager.closeSmartOverlay();
+                return true;
+            } catch (e) {
+                log.error('smart-overlay:close error', e);
+                return false;
+            }
+        });
+
+        ipcMain.handle('smart-overlay:resize', async (_e, bounds: { width: number; height: number }) => {
+            try {
+                this.windowManager.resizeSmartOverlay(bounds.width, bounds.height);
+                return true;
+            } catch (e) {
+                log.error('smart-overlay:resize error', e);
+                return false;
+            }
+        });
+
+        ipcMain.on('smart-overlay:action', (_e, data: any) => {
+            // Forward overlay action to main window
+            this.windowManager.send('smart-overlay-action', data);
+        });
+
+        // ── 剪贴板 IPC ──
+
+        ipcMain.handle('clipboard:read-text', () => {
+            return clipboard.readText();
+        });
+
+        ipcMain.handle('clipboard:read-image', () => {
+            const image = clipboard.readImage();
+            if (image.isEmpty()) return null;
+            return `data:image/png;base64,${image.toPNG().toString('base64')}`;
         });
     }
 }

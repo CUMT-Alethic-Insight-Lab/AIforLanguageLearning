@@ -12,6 +12,7 @@ from alembic import context
 
 # Import domain models to ensure all tables are registered in SQLModel metadata
 from app.domain import models as _domain_models  # noqa: F401
+from app.domain.analytics import models as _analytics_models  # noqa: F401
 from app import models as _app_models  # noqa: F401
 
 # this is the Alembic Config object, which provides

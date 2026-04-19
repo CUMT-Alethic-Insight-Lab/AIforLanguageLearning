@@ -12,6 +12,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from sqlmodel import Session, col, select
 
+from .application.db_learning import create_record
 from .db import get_engine, init_db
 from .domain import models as _domain_models  # noqa: F401  # registers new tables
 from .infrastructure.telemetry.metrics import get_metrics_collector, get_metrics_response
@@ -19,31 +20,33 @@ from .infrastructure.telemetry.tracing import TraceMiddleware, get_request_id, g
 from .interfaces.admin_router import router as admin_router
 from .interfaces.auth_router import router as auth_router
 from .interfaces.knowledge_graph_router import router as knowledge_graph_router
+from .interfaces.analytics_router import router as analytics_router
+from .interfaces.prompt_registry_router import router as prompt_registry_router
+from .interfaces.realtime_assistant_router import router as realtime_assistant_router
 from .interfaces.storage_router import router as storage_router
 from .interfaces.tasks_router import router as tasks_router
-from .llm import chat_complete, generate_definition, grade_essay, stream_chat
+from .llm import chat_complete, stream_chat
 from .logging import configure_logging
 from .models import (
     ConversationEvent,
     EssayResult,
     EssaySubmission,
-    PublicVocabEntry,
     UserVocabQuery,
 )
+from .runtime_config import get_runtime_config
 from .routers.compat_legacy import router as compat_legacy_router
 from .routers.essays import router as essays_router
 from .routers.learning import router as learning_router
 from .routers.model_routing import router as model_routing_router
 from .routers.system import router as system_router
-from .routers.vocab import router as vocab_router
+from .routers.vocab import _resolve_lookup_payload, router as vocab_router
 from .routers.voice import router as voice_router
 from .settings import settings
 from .tts import synthesize_tts_wav
 from .voice_stream import (
     VoiceStream,
     VoiceStreamConfig,
-    try_create_faster_whisper_transcriber,
-    try_create_openai_whisper_transcriber,
+    try_create_seamless_transcriber,
 )
 
 configure_logging()
@@ -93,6 +96,9 @@ app.include_router(model_routing_router)
 app.include_router(knowledge_graph_router)
 app.include_router(storage_router)
 app.include_router(tasks_router)
+app.include_router(analytics_router)
+app.include_router(prompt_registry_router)
+app.include_router(realtime_assistant_router)
 if bool(getattr(settings, "enable_legacy_compat_api", True)):
     app.include_router(compat_legacy_router)
 
@@ -131,8 +137,20 @@ async def metrics():
 async def ws_v1(ws: WebSocket) -> None:
     await ws.accept()
 
+    INTERNAL_PERSIST_ONLY_TYPES = {"USER_MESSAGE", "AI_MESSAGE"}
+
     session_id = ws.query_params.get("session_id") or "anonymous"
     conversation_id = ws.query_params.get("conversation_id") or f"conv_{uuid.uuid4().hex[:8]}"
+    user_id_raw = ws.query_params.get("user_id")
+    session_user_id: int | None
+    try:
+        session_user_id = int(user_id_raw) if user_id_raw is not None else None
+        if session_user_id is not None and session_user_id <= 0:
+            session_user_id = None
+    except ValueError:
+        session_user_id = None
+    session_language = ""
+    session_scenario = ""
 
     last_seq_raw = ws.query_params.get("last_seq")
     last_seq: int | None
@@ -186,6 +204,7 @@ async def ws_v1(ws: WebSocket) -> None:
             with Session(get_engine()) as session:
                 session.add(
                     ConversationEvent(
+                        user_id=session_user_id,
                         session_id=session_id,
                         conversation_id=conversation_id,
                         seq=msg_seq,
@@ -197,6 +216,37 @@ async def ws_v1(ws: WebSocket) -> None:
                     )
                 )
                 session.commit()
+
+    async def persist_event_only(
+        event_type: str,
+        payload: dict,
+        *,
+        request_id: str = "ws",
+        final: bool = False,
+        ts: int = 0,
+    ) -> None:
+        """Persist an event without sending it to websocket clients."""
+
+        nonlocal seq
+
+        seq += 1
+        msg_seq = seq
+
+        with Session(get_engine()) as session:
+            session.add(
+                ConversationEvent(
+                    user_id=session_user_id,
+                    session_id=session_id,
+                    conversation_id=conversation_id,
+                    seq=msg_seq,
+                    type=event_type,
+                    ts=ts,
+                    request_id=request_id,
+                    final=bool(final),
+                    payload=payload,
+                )
+            )
+            session.commit()
 
     def get_latest_system_prompt() -> str:
         try:
@@ -265,35 +315,64 @@ async def ws_v1(ws: WebSocket) -> None:
         )
         return merged
 
-    def get_recent_chat_history(*, exclude_request_id: str, max_messages: int = 10) -> list[dict[str, str]]:
-        """从会话事件中提取最近对话轮次（user/assistant）供 LLM 续文使用。"""
+    def get_all_chat_history_from_events(*, exclude_request_id: str) -> list[dict[str, str]]:
+        """按 seq 升序组装会话历史（优先 USER_MESSAGE / AI_MESSAGE）。"""
         try:
             with Session(get_engine()) as session:
                 rows = session.exec(
                     select(ConversationEvent)
                     .where(ConversationEvent.conversation_id == conversation_id)
-                    .where(col(ConversationEvent.type).in_(["ASR_FINAL", "LLM_RESULT"]))
+                    .where(
+                        col(ConversationEvent.type).in_(
+                            ["USER_MESSAGE", "AI_MESSAGE", "ASR_FINAL", "LLM_RESULT"]
+                        )
+                    )
                     .order_by(col(ConversationEvent.seq).asc())
                 ).all()
         except Exception:
             return []
 
         messages: list[dict[str, str]] = []
+        user_message_request_ids: set[str] = set()
+        ai_message_request_ids: set[str] = set()
+
         for row in rows:
-            if str(row.request_id or "") == exclude_request_id:
+            req_id = str(row.request_id or "")
+            if req_id == exclude_request_id:
                 continue
+
             payload = dict(row.payload or {})
+
+            if row.type == "USER_MESSAGE":
+                text = str(payload.get("text") or "").strip()
+                if text:
+                    messages.append({"role": "user", "content": text})
+                if req_id:
+                    user_message_request_ids.add(req_id)
+                continue
+
+            if row.type == "AI_MESSAGE":
+                text = str(payload.get("text") or payload.get("markdown") or "").strip()
+                if text:
+                    messages.append({"role": "assistant", "content": text})
+                if req_id:
+                    ai_message_request_ids.add(req_id)
+                continue
+
+            # 兼容旧历史：当未落 USER_MESSAGE/AI_MESSAGE 时，回退到 ASR_FINAL/LLM_RESULT。
             if row.type == "ASR_FINAL":
+                if req_id and req_id in user_message_request_ids:
+                    continue
                 text = str(payload.get("text") or "").strip()
                 if text:
                     messages.append({"role": "user", "content": text})
             elif row.type == "LLM_RESULT":
+                if req_id and req_id in ai_message_request_ids:
+                    continue
                 text = str(payload.get("markdown") or payload.get("text") or "").strip()
                 if text:
                     messages.append({"role": "assistant", "content": text})
 
-        if len(messages) > max_messages:
-            messages = messages[-max_messages:]
         return messages
 
     # 重连恢复：先重放遗漏事件，再继续处理后续消息
@@ -307,6 +386,8 @@ async def ws_v1(ws: WebSocket) -> None:
             ).all()
 
         for row in rows:
+            if str(row.type or "") in INTERNAL_PERSIST_ONLY_TYPES:
+                continue
             await send_event(
                 row.type,
                 dict(row.payload or {}),
@@ -333,43 +414,303 @@ async def ws_v1(ws: WebSocket) -> None:
         voice_tts_total_bytes: dict[str, int] = {}
         voice_tts_sent_bytes: dict[str, int] = {}
         voice_tts_sent_chunks: dict[str, int] = {}
+        voice_audio_bytes: dict[str, int] = {}
+        voice_request_started_ms: dict[str, int] = {}
+        voice_user_message_ts_ms: dict[str, int] = {}
+
+        voice_cloud_model = "moonshot-v1-auto"
+        voice_local_model = "qwen3.5-9b"
+        runtime_cfg = get_runtime_config()
+        kimi_cfg = runtime_cfg.get("kimi", {}) if isinstance(runtime_cfg, dict) else {}
+        voice_cloud_base_url = str(
+            (kimi_cfg.get("base_url") if isinstance(kimi_cfg, dict) else "")
+            or os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
+        ).strip()
+        voice_cloud_api_key = str(
+            (kimi_cfg.get("api_key") if isinstance(kimi_cfg, dict) else "")
+            or os.getenv("KIMI_API_KEY", "")
+        ).strip()
 
         pending_binary_chunk_for: str | None = None
         asr_transcriber = None
         if settings.enable_asr:
-            preferred = str(settings.asr_backend or "").strip() or "faster-whisper"
+            preferred = str(settings.asr_backend or "").strip() or "seamless"
 
-            if preferred == "faster-whisper":
-                asr_transcriber = try_create_faster_whisper_transcriber(
+            if preferred == "seamless":
+                asr_transcriber = try_create_seamless_transcriber(
                     model_name=settings.asr_model,
                     device=settings.asr_device,
                     compute_type=settings.asr_compute_type,
                 )
-                if asr_transcriber is None:
-                    # fallback
-                    asr_transcriber = try_create_openai_whisper_transcriber(
-                        model_name=settings.asr_model,
-                        device=settings.asr_device,
-                    )
-            elif preferred == "openai-whisper":
-                asr_transcriber = try_create_openai_whisper_transcriber(
-                    model_name=settings.asr_model,
-                    device=settings.asr_device,
-                )
-                if asr_transcriber is None:
-                    # fallback
-                    asr_transcriber = try_create_faster_whisper_transcriber(
-                        model_name=settings.asr_model,
-                        device=settings.asr_device,
-                        compute_type=settings.asr_compute_type,
-                    )
 
             # If ASR is enabled but no backend is available, provide a clear degraded transcriber.
             if asr_transcriber is None:
                 def _asr_unavailable(_audio: bytes, _cfg: "VoiceStreamConfig") -> str:
-                    return "（ASR 已启用，但当前 Python 环境未安装 ASR 后端依赖：请使用 conda env 'asr' 启动，或安装 faster-whisper/openai-whisper）"
+                    return "（ASR 已启用，但当前 Python 环境未安装 ASR 后端依赖：请安装 transformers + torchaudio 以使用 SeamlessM4T）"
 
                 asr_transcriber = _asr_unavailable
+
+        async def _collect_model_reply(
+            *,
+            request_id: str,
+            system_prompt: str,
+            user_prompt: str,
+            history: list[dict[str, str]],
+            source: str,
+            model: str,
+            emit_tokens: bool = False,
+        ) -> dict[str, object]:
+            parts: list[str] = []
+            endpoint_base_url: str | None = None
+            endpoint_api_key: str | None = None
+            started_ms = int(time.time() * 1000)
+            first_token_latency_ms: int | None = None
+            token_count = 0
+            if source == "cloud":
+                endpoint_base_url = voice_cloud_base_url
+                endpoint_api_key = voice_cloud_api_key or None
+
+            try:
+                try:
+                    stream_iter = stream_chat(
+                        system_prompt=system_prompt,
+                        user_text=user_prompt,
+                        history=history,
+                        model=model,
+                        base_url=endpoint_base_url,
+                        api_key=endpoint_api_key,
+                    )
+                except TypeError:
+                    # 兼容测试里的 monkeypatch（不带 model 参数）。
+                    stream_iter = stream_chat(
+                        system_prompt=system_prompt,
+                        user_text=user_prompt,
+                        history=history,
+                    )
+
+                async for delta in stream_iter:
+                    if request_id in voice_aborted:
+                        raise asyncio.CancelledError()
+                    if first_token_latency_ms is None:
+                        first_token_latency_ms = max(0, int(time.time() * 1000) - started_ms)
+                    parts.append(delta)
+                    token_count += 1
+                    if emit_tokens and delta:
+                        await send_event(
+                            "LLM_TOKEN",
+                            {"text": delta, "source": source, "model": model},
+                            request_id=request_id,
+                        )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                parts = []
+
+            if parts:
+                text = ("".join(parts)).strip() or "（LLM 输出为空）"
+            else:
+                try:
+                    try:
+                        text = await chat_complete(
+                            system_prompt=system_prompt,
+                            user_text=user_prompt,
+                            history=history,
+                            model=model,
+                            base_url=endpoint_base_url,
+                            api_key=endpoint_api_key,
+                        )
+                    except TypeError:
+                        text = await chat_complete(
+                            system_prompt=system_prompt,
+                            user_text=user_prompt,
+                            history=history,
+                        )
+                except Exception:
+                    text = "（网络不太稳定，请稍后再试）"
+
+            degraded_markers = {"（网络不太稳定，请稍后再试）", "（LLM 输出为空）"}
+            success = bool(str(text).strip()) and text not in degraded_markers
+
+            return {
+                "text": text,
+                "source": source,
+                "model": model,
+                "success": success,
+                "token_count": token_count,
+                "first_token_latency_ms": first_token_latency_ms,
+                "llm_generation_ms": max(0, int(time.time() * 1000) - started_ms),
+            }
+
+        async def _stream_chat_with_fallback(
+            *,
+            request_id: str,
+            system_prompt: str,
+            user_prompt: str,
+            history: list[dict[str, str]],
+        ) -> dict[str, object]:
+            candidates: list[tuple[str, str]] = []
+            if voice_cloud_api_key:
+                candidates.append(("cloud", voice_cloud_model))
+            candidates.append(("local", voice_local_model))
+
+            # 只有一方可用时直接调用（保持流式）
+            if len(candidates) == 1:
+                return await _collect_model_reply(
+                    request_id=request_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    history=history,
+                    source=candidates[0][0],
+                    model=candidates[0][1],
+                    emit_tokens=True,
+                )
+
+            # 竞速：同时启动两方（不发 token，只收集结果）
+            async def _race_task(source: str, model: str) -> dict[str, object]:
+                return await _collect_model_reply(
+                    request_id=request_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    history=history,
+                    source=source,
+                    model=model,
+                    emit_tokens=False,
+                )
+
+            tasks = {
+                asyncio.create_task(_race_task(source, model)): (source, model)
+                for source, model in candidates
+            }
+
+            winner_result: dict[str, object] | None = None
+            winner_source = "local"
+            winner_model = voice_local_model
+
+            done, pending = await asyncio.wait(tasks.keys(), return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+
+            for task in done:
+                try:
+                    result = task.result()
+                    if bool(result.get("success", False)) or int(result.get("token_count", 0) or 0) > 0:
+                        winner_result = result
+                        winner_source, winner_model = tasks[task]
+                        break
+                except Exception:
+                    continue
+
+            # 若先完成的都失败，尝试等待其余任务
+            if winner_result is None:
+                for task in pending:
+                    try:
+                        result = await task
+                        if bool(result.get("success", False)) or int(result.get("token_count", 0) or 0) > 0:
+                            winner_result = result
+                            winner_source, winner_model = tasks[task]
+                            break
+                    except Exception:
+                        continue
+
+            if winner_result is not None:
+                text = str(winner_result.get("text") or "").strip()
+                # 模拟流式发送 token，保持前端体验一致
+                if text and text not in {"（网络不太稳定，请稍后再试）", "（LLM 输出为空）"}:
+                    # 按句子或短句切分，模拟自然流式输出
+                    import re
+                    chunks = re.split(r'(?<=[。，！？；：""''】）}])', text)
+                    chunks = [c for c in chunks if c.strip()]
+                    if not chunks:
+                        chunks = [text[i:i + 20] for i in range(0, len(text), 20)]
+                    for idx, chunk in enumerate(chunks):
+                        if request_id in voice_aborted:
+                            break
+                        await send_event(
+                            "LLM_TOKEN",
+                            {"text": chunk, "source": winner_source, "model": winner_model},
+                            request_id=request_id,
+                        )
+                return {
+                    **winner_result,
+                    "source": winner_source,
+                    "model": winner_model,
+                }
+
+            return {
+                "text": "（网络不太稳定，请稍后再试）",
+                "source": "local",
+                "model": voice_local_model,
+                "success": False,
+                "token_count": 0,
+                "first_token_latency_ms": None,
+                "llm_generation_ms": 0,
+            }
+
+        async def _emit_tts_audio(
+            *,
+            request_id: str,
+            text: str,
+            started_ms: int,
+        ) -> dict[str, int]:
+            wav_bytes = await asyncio.to_thread(synthesize_tts_wav, text)
+            synthesis_ms = max(0, int(time.time() * 1000) - started_ms)
+            voice_tts_total_bytes[request_id] = len(wav_bytes)
+            voice_tts_sent_bytes[request_id] = 0
+            voice_tts_sent_chunks[request_id] = 0
+
+            chunk_size = (
+                int(settings.tts_chunk_size_bytes)
+                if int(settings.tts_chunk_size_bytes) > 0
+                else 16 * 1024
+            )
+            chunks = [wav_bytes[i : i + chunk_size] for i in range(0, len(wav_bytes), chunk_size)] or [b""]
+
+            for idx, ch in enumerate(chunks):
+                if request_id in voice_aborted:
+                    return {
+                        "tts_synthesis_ms": synthesis_ms,
+                        "tts_first_chunk_latency_ms": synthesis_ms,
+                        "tts_total_ms": synthesis_ms,
+                        "tts_chunk_count": idx,
+                        "tts_audio_bytes": int(voice_tts_sent_bytes.get(request_id, 0)),
+                    }
+
+                voice_tts_sent_bytes[request_id] = int(voice_tts_sent_bytes.get(request_id, 0)) + len(ch)
+                voice_tts_sent_chunks[request_id] = idx + 1
+
+                await send_event(
+                    "TTS_CHUNK",
+                    {
+                        "format": "wav",
+                        "sample_rate": 16000,
+                        "channels": 1,
+                        "data_b64": base64.b64encode(ch).decode("utf-8"),
+                        "index": idx,
+                        "is_last": idx == (len(chunks) - 1),
+                        "tts_synthesis_ms": synthesis_ms,
+                    },
+                    request_id=request_id,
+                )
+
+            await send_event(
+                "TTS_RESULT",
+                {
+                    "text": text,
+                    "audio_base64": base64.b64encode(wav_bytes).decode("utf-8"),
+                    "tts_synthesis_ms": synthesis_ms,
+                    "tts_chunk_count": len(chunks),
+                    "tts_audio_bytes": len(wav_bytes),
+                    "tts_total_ms": max(0, int(time.time() * 1000) - started_ms),
+                },
+                request_id=request_id,
+            )
+            return {
+                "tts_synthesis_ms": synthesis_ms,
+                "tts_first_chunk_latency_ms": synthesis_ms,
+                "tts_total_ms": max(0, int(time.time() * 1000) - started_ms),
+                "tts_chunk_count": len(chunks),
+                "tts_audio_bytes": len(wav_bytes),
+            }
 
         async def abort_voice_request(req_id: str, *, reason: str) -> None:
             # Idempotent: abort only once.
@@ -425,6 +766,7 @@ async def ws_v1(ws: WebSocket) -> None:
             voice_tts_total_bytes.pop(req_id, None)
             voice_tts_sent_bytes.pop(req_id, None)
             voice_tts_sent_chunks.pop(req_id, None)
+            voice_audio_bytes.pop(req_id, None)
 
             await send_event(
                 "TASK_ABORTED",
@@ -457,6 +799,7 @@ async def ws_v1(ws: WebSocket) -> None:
                 voice_last_activity_ms.pop(rid, None)
                 voice_streams.pop(rid, None)
                 voice_asr_only.pop(rid, None)
+                voice_audio_bytes.pop(rid, None)
                 t = voice_partial_tasks.pop(rid, None)
                 if t is not None and not t.done():
                     t.cancel()
@@ -498,7 +841,47 @@ async def ws_v1(ws: WebSocket) -> None:
                     t.cancel()
 
             final_text = await stream.transcribe_final()
-            await send_event("ASR_FINAL", {"text": final_text, "reason": reason}, request_id=req_id)
+            final_audio_bytes = int(voice_audio_bytes.pop(req_id, 0))
+            audio_duration_ms = int(final_audio_bytes / 32) if final_audio_bytes > 0 else 0
+            final_ts = int(time.time() * 1000)
+            asr_latency_ms = max(0, final_ts - int(voice_request_started_ms.get(req_id, final_ts)))
+            spoken_word_count = max(0, len((final_text or "").split()))
+            paraphrase_markers = sum(
+                1
+                for marker in ["means", "in other words", "that is", "like", "similar to"]
+                if marker in (final_text or "").lower()
+            )
+
+            await persist_event_only(
+                "USER_MESSAGE",
+                {
+                    "text": final_text,
+                    "source": "asr",
+                    "language": session_language,
+                    "scenario": session_scenario,
+                    "audio_duration_ms": audio_duration_ms,
+                    "word_count": spoken_word_count,
+                    "paraphrase_markers": paraphrase_markers,
+                    "asr_latency_ms": asr_latency_ms,
+                },
+                request_id=req_id,
+                final=True,
+                ts=final_ts,
+            )
+            voice_user_message_ts_ms[req_id] = final_ts
+
+            asr_final_payload: dict[str, object] = {
+                "reason": reason,
+                "bytes": final_audio_bytes,
+                "text": final_text,
+                "audio_duration_ms": audio_duration_ms,
+                "word_count": spoken_word_count,
+                "language": session_language,
+                "scenario": session_scenario,
+                "asr_latency_ms": asr_latency_ms,
+            }
+
+            await send_event("ASR_FINAL", asr_final_payload, request_id=req_id)
 
             if req_id in voice_aborted:
                 return
@@ -515,6 +898,7 @@ async def ws_v1(ws: WebSocket) -> None:
                 return
 
             user_prompt = (final_text or "").strip()
+            reply_source = "local"
             if not user_prompt:
                 reply_md = "（未检测到语音内容）"
             else:
@@ -526,39 +910,52 @@ async def ws_v1(ws: WebSocket) -> None:
                     else:
                         system_prompt = context_memory
 
-                history = get_recent_chat_history(exclude_request_id=req_id, max_messages=10)
+                history = get_all_chat_history_from_events(exclude_request_id=req_id)
 
-                parts: list[str] = []
-                streamed = False
-                async for delta in stream_chat(
+                llm_started_ms = int(time.time() * 1000)
+                llm_result = await _stream_chat_with_fallback(
+                    request_id=req_id,
                     system_prompt=system_prompt,
-                    user_text=user_prompt,
+                    user_prompt=user_prompt,
                     history=history,
-                ):
-                    if req_id in voice_aborted:
-                        return
-                    streamed = True
-                    parts.append(delta)
-                    await send_event(
-                        "LLM_TOKEN",
-                        {"text": delta},
-                        request_id=req_id,
-                    )
-                if streamed:
-                    reply_md = ("".join(parts)).strip() or "（LLM 输出为空）"
-                else:
-                    reply_md = await chat_complete(
-                        system_prompt=system_prompt,
-                        user_text=user_prompt,
-                        history=history,
-                    )
+                )
+                reply_md = str(llm_result.get("text") or "").strip() or "（LLM 输出为空）"
+                reply_source = str(llm_result.get("source") or "local")
+                llm_latency_ms = max(0, int(time.time() * 1000) - final_ts)
 
             if req_id in voice_aborted:
                 return
 
+            await persist_event_only(
+                "AI_MESSAGE",
+                {
+                    "text": reply_md,
+                    "source": reply_source,
+                    "language": session_language,
+                    "scenario": session_scenario,
+                    "response_latency_ms": llm_latency_ms,
+                    "llm_first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                    "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                },
+                request_id=req_id,
+                final=True,
+                ts=int(time.time() * 1000),
+            )
+
             await send_event(
                 "LLM_RESULT",
-                {"format": "markdown", "markdown": reply_md},
+                {
+                    "format": "markdown",
+                    "markdown": reply_md,
+                    "source": reply_source,
+                    "response_latency_ms": llm_latency_ms,
+                    "language": session_language,
+                    "scenario": session_scenario,
+                    "model": llm_result.get("model"),
+                    "token_count": llm_result.get("token_count"),
+                    "first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                    "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                },
                 request_id=req_id,
             )
 
@@ -568,48 +965,57 @@ async def ws_v1(ws: WebSocket) -> None:
             if req_id in voice_aborted:
                 return
 
-            # P1: TTS_CHUNK
-            wav_bytes = await asyncio.to_thread(synthesize_tts_wav, reply_md)
-            voice_tts_total_bytes[req_id] = len(wav_bytes)
-            voice_tts_sent_bytes[req_id] = 0
-            voice_tts_sent_chunks[req_id] = 0
-
-            chunk_size = int(settings.tts_chunk_size_bytes) if int(settings.tts_chunk_size_bytes) > 0 else 16 * 1024
-            chunks = [wav_bytes[i : i + chunk_size] for i in range(0, len(wav_bytes), chunk_size)] or [b""]
-
-            for idx, ch in enumerate(chunks):
-                if req_id in voice_aborted:
-                    return
-
-                voice_tts_sent_bytes[req_id] = int(voice_tts_sent_bytes.get(req_id, 0)) + len(ch)
-                voice_tts_sent_chunks[req_id] = idx + 1
-
-                await send_event(
-                    "TTS_CHUNK",
-                    {
-                        "format": "wav",
-                        "sample_rate": 16000,
-                        "channels": 1,
-                        "data_b64": base64.b64encode(ch).decode("utf-8"),
-                        "index": idx,
-                        "is_last": idx == (len(chunks) - 1),
-                    },
-                    request_id=req_id,
-                )
-
-            # Backward-compatible: still provide the full audio in one event.
-            await send_event(
-                "TTS_RESULT",
-                {"text": reply_md, "audio_base64": base64.b64encode(wav_bytes).decode("utf-8")},
+            tts_metrics = await _emit_tts_audio(
                 request_id=req_id,
+                text=reply_md,
+                started_ms=int(time.time() * 1000),
             )
-            await send_event("TASK_FINISHED", {"ok": True, "reason": reason}, request_id=req_id, final=True)
+            total_roundtrip_ms = max(0, int(time.time() * 1000) - int(voice_request_started_ms.get(req_id, final_ts)))
+            await send_event(
+                "TASK_FINISHED",
+                {
+                    "ok": True,
+                    "reason": reason,
+                    "pipeline_metrics": {
+                        "asr_latency_ms": asr_latency_ms,
+                        "audio_duration_ms": audio_duration_ms,
+                        "llm_latency_ms": llm_latency_ms,
+                        "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                        "llm_first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                        **tts_metrics,
+                        "total_roundtrip_ms": total_roundtrip_ms,
+                    },
+                },
+                request_id=req_id,
+                final=True,
+            )
+            if session_user_id:
+                create_record(
+                    user_id=session_user_id,
+                    record_type="dialogue",
+                    content=user_prompt[:200],
+                    metadata={
+                        "action": "voice_turn",
+                        "scenario": session_scenario,
+                        "language": session_language,
+                        "request_id": req_id,
+                        "asr_text": final_text,
+                        "assistant_reply": reply_md[:500],
+                        "asr_latency_ms": asr_latency_ms,
+                        "llm_latency_ms": llm_latency_ms,
+                        "total_roundtrip_ms": total_roundtrip_ms,
+                        **tts_metrics,
+                    },
+                )
             voice_completed.add(req_id)
             voice_finalize_tasks.pop(req_id, None)
             voice_reply_text.pop(req_id, None)
             voice_tts_total_bytes.pop(req_id, None)
             voice_tts_sent_bytes.pop(req_id, None)
             voice_tts_sent_chunks.pop(req_id, None)
+            voice_audio_bytes.pop(req_id, None)
+            voice_request_started_ms.pop(req_id, None)
+            voice_user_message_ts_ms.pop(req_id, None)
 
         while True:
             await cleanup_stale_voice_requests()
@@ -664,6 +1070,7 @@ async def ws_v1(ws: WebSocket) -> None:
                         continue
 
                     size = await stream.add_chunk_bytes(b)
+                    voice_audio_bytes[rid] = int(size)
                     voice_last_activity_ms[rid] = int(time.time() * 1000)
 
                     existing = voice_partial_tasks.get(rid)
@@ -676,9 +1083,13 @@ async def ws_v1(ws: WebSocket) -> None:
                             try:
                                 partial = await s.maybe_transcribe_partial()
                                 if partial:
+                                    partial_payload: dict[str, object] = {
+                                        "bytes": buffer_size,
+                                        "text": partial,
+                                    }
                                     await send_event(
                                         "ASR_PARTIAL",
-                                        {"text": partial, "bytes": buffer_size},
+                                        partial_payload,
                                         request_id=rid2,
                                     )
                             except Exception as e:
@@ -735,9 +1146,26 @@ async def ws_v1(ws: WebSocket) -> None:
                 ts = int(time.time() * 1000)
                 system_prompt = str(payload.get("system_prompt") or payload.get("systemPrompt") or "")
                 language = str(payload.get("language") or "")
+                scenario = str(payload.get("scenario") or "")
+                payload_user_id = payload.get("user_id")
+                try:
+                    next_user_id = int(payload_user_id) if payload_user_id is not None else None
+                    if next_user_id is not None and next_user_id > 0:
+                        session_user_id = next_user_id
+                except (TypeError, ValueError):
+                    pass
+                if language:
+                    session_language = language
+                if scenario:
+                    session_scenario = scenario
                 await send_event(
                     "CONTEXT_SET",
-                    {"system_prompt": system_prompt, "language": language},
+                    {
+                        "system_prompt": system_prompt,
+                        "language": session_language,
+                        "scenario": session_scenario,
+                        "user_id": session_user_id,
+                    },
                     request_id=req_id,
                     ts=ts,
                     final=False,
@@ -794,10 +1222,19 @@ async def ws_v1(ws: WebSocket) -> None:
                 )
                 voice_streams[req_id] = VoiceStream(config=cfg, transcriber=asr_transcriber)
                 voice_last_activity_ms[req_id] = int(time.time() * 1000)
+                voice_request_started_ms[req_id] = voice_last_activity_ms[req_id]
                 voice_asr_only[req_id] = bool(payload.get("asr_only") or False)
+                voice_audio_bytes[req_id] = 0
                 await send_event(
                     "TASK_STARTED",
-                    {"task": "voice_audio", "request_id": req_id, "config": cfg.__dict__},
+                    {
+                        "task": "voice_audio",
+                        "request_id": req_id,
+                        "config": cfg.__dict__,
+                        "language": session_language or (cfg.language or ""),
+                        "scenario": session_scenario,
+                        "user_id": session_user_id,
+                    },
                     request_id=req_id,
                 )
                 continue
@@ -820,6 +1257,7 @@ async def ws_v1(ws: WebSocket) -> None:
 
                 data_b64 = str(payload.get("data_b64") or "")
                 size = await stream.add_chunk_b64(data_b64)
+                voice_audio_bytes[req_id] = int(size)
                 voice_last_activity_ms[req_id] = int(time.time() * 1000)
 
                 # 真实时间流式输入时，不能在这里 await 重型 ASR（会导致 backpressure，客户端 send 卡死）。
@@ -834,9 +1272,13 @@ async def ws_v1(ws: WebSocket) -> None:
                         try:
                             partial = await s.maybe_transcribe_partial()
                             if partial:
+                                partial_payload: dict[str, object] = {
+                                    "bytes": buffer_size,
+                                    "text": partial,
+                                }
                                 await send_event(
                                     "ASR_PARTIAL",
-                                    {"text": partial, "bytes": buffer_size},
+                                    partial_payload,
                                     request_id=rid,
                                 )
                         except Exception as e:
@@ -928,6 +1370,133 @@ async def ws_v1(ws: WebSocket) -> None:
                     voice_finalize_tasks[req_id] = asyncio.create_task(_run_finalize(req_id))
                 continue
 
+            # 文本直连模式：绕过 ASR，直接走 LLM 竞速 + TTS，便于快速测试对话体验。
+            if msg_type == "TEXT" and isinstance(payload, dict):
+                req_id = str(data.get("request_id") or f"text_{uuid.uuid4().hex[:8]}")
+                user_text = str(payload.get("text") or "").strip()
+
+                if not user_text:
+                    await send_event(
+                        "ERROR",
+                        {"code": "VALIDATION_ERROR", "message": "text is empty"},
+                        request_id=req_id,
+                    )
+                    continue
+
+                text_ts = int(time.time() * 1000)
+                await persist_event_only(
+                    "USER_MESSAGE",
+                    {
+                        "text": user_text,
+                        "source": "text",
+                        "language": session_language,
+                        "scenario": session_scenario,
+                        "word_count": len(user_text.split()),
+                        "paraphrase_markers": sum(
+                            1
+                            for marker in ["means", "in other words", "that is", "like", "similar to"]
+                            if marker in user_text.lower()
+                        ),
+                    },
+                    request_id=req_id,
+                    final=True,
+                    ts=text_ts,
+                )
+                voice_user_message_ts_ms[req_id] = text_ts
+
+                system_prompt = get_latest_system_prompt()
+                context_memory = get_latest_context_memory()
+                if context_memory:
+                    if system_prompt:
+                        system_prompt = f"{system_prompt}\n\n{context_memory}"
+                    else:
+                        system_prompt = context_memory
+
+                history = get_all_chat_history_from_events(exclude_request_id=req_id)
+
+                llm_result = await _stream_chat_with_fallback(
+                    request_id=req_id,
+                    system_prompt=system_prompt,
+                    user_prompt=user_text,
+                    history=history,
+                )
+                reply_md = str(llm_result.get("text") or "").strip() or "（LLM 输出为空）"
+                reply_source = str(llm_result.get("source") or "local")
+                llm_latency_ms = max(0, int(time.time() * 1000) - text_ts)
+
+                await persist_event_only(
+                    "AI_MESSAGE",
+                    {
+                        "text": reply_md,
+                        "source": reply_source,
+                        "language": session_language,
+                        "scenario": session_scenario,
+                        "response_latency_ms": llm_latency_ms,
+                        "llm_first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                        "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                    },
+                    request_id=req_id,
+                    final=True,
+                    ts=int(time.time() * 1000),
+                )
+
+                await send_event(
+                    "LLM_RESULT",
+                    {
+                        "format": "markdown",
+                        "markdown": reply_md,
+                        "source": reply_source,
+                        "response_latency_ms": llm_latency_ms,
+                        "language": session_language,
+                        "scenario": session_scenario,
+                        "model": llm_result.get("model"),
+                        "token_count": llm_result.get("token_count"),
+                        "first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                        "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                    },
+                    request_id=req_id,
+                )
+
+                tts_metrics = await _emit_tts_audio(
+                    request_id=req_id,
+                    text=reply_md,
+                    started_ms=int(time.time() * 1000),
+                )
+                total_roundtrip_ms = max(0, int(time.time() * 1000) - text_ts)
+                await send_event(
+                    "TASK_FINISHED",
+                    {
+                        "ok": True,
+                        "reason": "text",
+                        "pipeline_metrics": {
+                            "llm_latency_ms": llm_latency_ms,
+                            "llm_generation_ms": llm_result.get("llm_generation_ms"),
+                            "llm_first_token_latency_ms": llm_result.get("first_token_latency_ms"),
+                            **tts_metrics,
+                            "total_roundtrip_ms": total_roundtrip_ms,
+                        },
+                    },
+                    request_id=req_id,
+                    final=True,
+                )
+                if session_user_id:
+                    create_record(
+                        user_id=session_user_id,
+                        record_type="dialogue",
+                        content=user_text[:200],
+                        metadata={
+                            "action": "text_turn",
+                            "scenario": session_scenario,
+                            "language": session_language,
+                            "request_id": req_id,
+                            "assistant_reply": reply_md[:500],
+                            "llm_latency_ms": llm_latency_ms,
+                            "total_roundtrip_ms": total_roundtrip_ms,
+                            **tts_metrics,
+                        },
+                    )
+                continue
+
             if msg_type == "LOOKUP_VOCAB" and isinstance(payload, dict):
                 term = str(payload.get("term") or "").strip()
                 req_id = str(data.get("request_id") or "ws") if isinstance(data, dict) else "ws"
@@ -939,31 +1508,35 @@ async def ws_v1(ws: WebSocket) -> None:
                     continue
 
                 with Session(get_engine()) as session:
-                    entry = session.exec(
-                        select(PublicVocabEntry).where(PublicVocabEntry.term == term)
-                    ).first()
-
-                    if entry is not None and entry.definition:
-                        definition = entry.definition
-                        from_public_vocab = True
-                    else:
-                        definition = await generate_definition(term)
-                        from_public_vocab = False
-
+                    lookup_response, lookup_meta = await _resolve_lookup_payload(
+                        term=term,
+                        fuzzy=True,
+                        include_relations=True,
+                        user_id=session_user_id,
+                        source="manual",
+                        session=session,
+                    )
                     session.add(
                         UserVocabQuery(
+                            user_id=session_user_id,
                             session_id=session_id,
                             conversation_id=conversation_id,
-                            term=term,
+                            term=lookup_response.term,
                             source="manual",
-                            result=definition,
+                            result=lookup_response.definition,
+                            meta_data={
+                                **lookup_meta,
+                                "origin": "voice_lookup",
+                                "language": session_language,
+                                "scenario": session_scenario,
+                            },
                         )
                     )
                     session.commit()
 
                 await send_event(
                     "VOCAB_RESULT",
-                    {"term": term, "definition": definition, "from_public_vocab": from_public_vocab},
+                    lookup_response.model_dump(),
                     request_id=req_id,
                 )
 
@@ -987,6 +1560,7 @@ async def ws_v1(ws: WebSocket) -> None:
                 # 先持久化 submission，确保事件里可以带 submission_id
                 with Session(get_engine()) as session:
                     submission = EssaySubmission(
+                        user_id=session_user_id,
                         session_id=session_id,
                         conversation_id=conversation_id,
                         request_id=req_id,
@@ -1013,8 +1587,11 @@ async def ws_v1(ws: WebSocket) -> None:
                     request_id=req_id,
                 )
 
-                result = await grade_essay(ocr_text=ocr_text, language=language)
-                score = int(result.get("score") or 0)
+                from .application.essay_grading import run_grading_pipeline
+
+                result = await run_grading_pipeline(ocr_text=ocr_text, language=language)
+                score = int(round(result["total_score"] * 10))
+                score = max(0, min(100, score))
 
                 with Session(get_engine()) as session:
                     session.add(
@@ -1025,6 +1602,19 @@ async def ws_v1(ws: WebSocket) -> None:
                         )
                     )
                     session.commit()
+
+                if session_user_id:
+                    create_record(
+                        user_id=session_user_id,
+                        record_type="essay",
+                        content=ocr_text[:200],
+                        metadata={
+                            "action": "grade_essay",
+                            "submission_id": submission_id,
+                            "language": language,
+                            "score": score,
+                        },
+                    )
 
                 await send_event(
                     "ANALYSIS_RESULT",

@@ -96,9 +96,11 @@ from app.llm import chat_complete
 
 async def expand_scene(user_input: str, user_level: str) -> SceneSetting:
     prompt = render_scene_prompt(user_input, user_level)
+    # 强制路由到云端Kimi模型进行场景扩写
     response = await chat_complete(
         system_prompt=SCENE_SYSTEM_PROMPT,
-        user_text=prompt
+        user_text=prompt,
+        model="moonshot-v1-auto" # 或配置中指定的Kimi模型id
     )
     return parse_scene_response(response)
 ```

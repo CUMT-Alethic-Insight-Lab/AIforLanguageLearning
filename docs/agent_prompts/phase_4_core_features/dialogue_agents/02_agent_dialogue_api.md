@@ -46,27 +46,18 @@
 {
   "success": true,
   "data": {
-    "conversation_id": "conv-uuid-123",
-    "scene_setting": {
-      "scene_name": "餐厅点餐",
-      "setting": {...},
-      "learning_objectives": [...],
-      "key_vocabulary": ["appetizer", "entree", "beverage"],
-      "difficulty_level": "intermediate",
-      "opening_line": "Hi, welcome to our restaurant! ..."
-    },
-    "opening_audio": "base64_encoded_wav"
+    "conversation_id": "conv-uuid-123"
   }
 }
 ```
 
 **实现逻辑:**
 1. 接收场景描述
-2. 调用场景扩写引擎生成结构化设定
+2. 调用场景扩写引擎（强制路由至云端Kimi）生成结构化设定
 3. 创建 `conversation_id` (UUID)
-4. 将 `SCENE_SET` 事件写入 `ConversationEvent`
-5. 调用TTS生成开场白音频
-6. 返回会话信息
+4. 将 `SCENE_SET` 事件写入 `ConversationEvent`（作为后续对话的 System Prompt 基础）
+5. 异步调用TTS生成开场白音频（目的：作为加载预热，降低实际对话时的 TTS TTFT，音频结果无需返回给前端）
+6. 仅返回基本的会话状态信息
 
 ### GET /api/v1/dialogues/{conversation_id}
 

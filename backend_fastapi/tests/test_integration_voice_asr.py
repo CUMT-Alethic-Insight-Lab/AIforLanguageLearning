@@ -74,7 +74,8 @@ def test_integration_voice_asr_produces_real_text(capfd) -> None:
 
     # 默认开启（允许外部环境覆盖）
     os.environ.setdefault("AIFL_ENABLE_ASR", "1")
-    os.environ.setdefault("AIFL_ASR_BACKEND", "faster-whisper")
+    os.environ.setdefault("AIFL_ASR_BACKEND", "seamless")
+    os.environ.setdefault("AIFL_VOICE_EMIT_ASR_TEXT", "1")
 
     app = _load_app_with_current_env()
 
@@ -166,7 +167,7 @@ def test_integration_voice_asr_produces_real_text(capfd) -> None:
             # 必须不是占位文案（否则说明生产 ASR 未启用或不可用）
             assert "未启用" not in text
 
-            # 预期：后端输出不应包含 faster-whisper/ctranslate2 的噪声信息。
+            # 预期：后端输出不应包含 legacy ASR 后端的噪声信息。
             out, err = capfd.readouterr()
             combined = (out + "\n" + err).lower()
             assert "ctranslate2" not in combined
@@ -188,7 +189,8 @@ def test_integration_voice_asr_vad_auto_end_asr_only(capfd) -> None:
         pytest.skip("integration tests disabled (set AIFL_RUN_INTEGRATION=1)")
 
     os.environ.setdefault("AIFL_ENABLE_ASR", "1")
-    os.environ.setdefault("AIFL_ASR_BACKEND", "faster-whisper")
+    os.environ.setdefault("AIFL_ASR_BACKEND", "seamless")
+    os.environ.setdefault("AIFL_VOICE_EMIT_ASR_TEXT", "1")
 
     app = _load_app_with_current_env()
     pcm = _load_asr_test_pcm_16k()

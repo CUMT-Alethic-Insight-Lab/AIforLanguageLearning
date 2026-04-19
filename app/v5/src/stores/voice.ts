@@ -11,6 +11,19 @@ import { audioManager } from '../services/audio-manager';
 import { ConfigService } from '../services/config';
 
 export const useVoiceStore = defineStore('voice', () => {
+  const getCurrentUserId = (): number | undefined => {
+    try {
+      const raw = localStorage.getItem('auth_user');
+      if (!raw) return undefined;
+      const user = JSON.parse(raw) as { id?: number | string };
+      const id = Number(user?.id);
+      if (!Number.isFinite(id) || id <= 0) return undefined;
+      return id;
+    } catch {
+      return undefined;
+    }
+  };
+
   // ============ 状态定义 ============
   
   /** 是否正在录音 (用户正在说话) */
@@ -39,7 +52,6 @@ export const useVoiceStore = defineStore('voice', () => {
   const sessionId = ref(`desktop_${Math.random().toString(16).slice(2)}`);
   const conversationId = ref(`conv_${Date.now().toString(16)}`);
   const currentRequestId = ref<string | null>(null);
-  const wsV1PreferBinary = ref(true);
   const autoCaptureEnabled = ref(false);
   const speechThreshold = ref(420);
 
@@ -76,7 +88,8 @@ export const useVoiceStore = defineStore('voice', () => {
       voiceSocket.connectWsV1({
         backendUrl,
         sessionId: sessionId.value,
-        conversationId: conversationId.value
+        conversationId: conversationId.value,
+        userId: getCurrentUserId(),
       });
     } catch (e) {
       console.warn('ws-v1 connect failed, falling back to legacy connect', e);
@@ -143,6 +156,11 @@ export const useVoiceStore = defineStore('voice', () => {
         case 'ASR_FINAL': {
           const text = String(payload?.text || '');
           if (text) addMessage('user', text);
+          if (testIsRunning.value) {
+            testAsrText.value = text;
+            testMetrics.value.asr_latency_ms =
+              typeof payload?.asr_latency_ms === 'number' ? payload.asr_latency_ms : null;
+          }
           setStatus(text ? `识别: ${text}` : '识别完成', 'processing');
           isProcessing.value = true;
           return;
@@ -152,11 +170,16 @@ export const useVoiceStore = defineStore('voice', () => {
           if (delta) {
             isProcessing.value = true;
             appendToLastAssistantMessage(delta);
+            if (testIsRunning.value) {
+              testLlmText.value += delta;
+              if (typeof payload?.first_token_latency_ms === 'number') {
+                testMetrics.value.llm_first_token_latency_ms = payload.first_token_latency_ms;
+              }
+            }
           }
           return;
         }
         case 'LLM_RESULT': {
-          // Fallback: if server didn't stream tokens, use the final markdown/text.
           const markdown = String(payload?.markdown || payload?.text || '');
           if (markdown) {
             const lastMsg = currentDialogue.value[currentDialogue.value.length - 1];
@@ -166,12 +189,27 @@ export const useVoiceStore = defineStore('voice', () => {
               addMessage('assistant', markdown);
             }
           }
+          if (testIsRunning.value) {
+            testLlmText.value = markdown;
+            testMetrics.value.llm_latency_ms =
+              typeof payload?.response_latency_ms === 'number' ? payload.response_latency_ms : null;
+            testMetrics.value.llm_first_token_latency_ms =
+              typeof payload?.first_token_latency_ms === 'number' ? payload.first_token_latency_ms : testMetrics.value.llm_first_token_latency_ms;
+          }
           setStatus('正在合成语音...', 'processing');
           isProcessing.value = true;
           return;
         }
-        case 'TTS_CHUNK': {
-          const b64 = String(payload?.data_b64 || '');
+        case 'TTS_CHUNK':
+        case 'TTS_RESULT': {
+          const b64 = String(payload?.data_b64 || payload?.audio_base64 || '');
+          if (testIsRunning.value) {
+            testTtsState.value = `已收到${t === 'TTS_CHUNK' ? '音频分片' : '最终音频'}`
+            testMetrics.value.tts_synthesis_ms =
+              typeof payload?.tts_synthesis_ms === 'number' ? payload.tts_synthesis_ms : testMetrics.value.tts_synthesis_ms;
+            testMetrics.value.tts_total_ms =
+              typeof payload?.tts_total_ms === 'number' ? payload.tts_total_ms : testMetrics.value.tts_total_ms;
+          }
           if (b64) {
             setStatus('正在回复...', 'speaking');
             isSpeaking.value = true;
@@ -195,8 +233,24 @@ export const useVoiceStore = defineStore('voice', () => {
           if (rid && rid === currentRequestId.value) {
             isProcessing.value = false;
             currentRequestId.value = null;
-            // We don't have a precise audio-ended callback; best-effort clear UI state when task completes.
             isSpeaking.value = false;
+            if (testIsRunning.value && payload?.pipeline_metrics) {
+              const metrics = payload.pipeline_metrics as Record<string, unknown>;
+              testMetrics.value.asr_latency_ms =
+                typeof metrics.asr_latency_ms === 'number' ? metrics.asr_latency_ms : testMetrics.value.asr_latency_ms;
+              testMetrics.value.llm_latency_ms =
+                typeof metrics.llm_latency_ms === 'number' ? metrics.llm_latency_ms : testMetrics.value.llm_latency_ms;
+              testMetrics.value.llm_first_token_latency_ms =
+                typeof metrics.llm_first_token_latency_ms === 'number'
+                  ? metrics.llm_first_token_latency_ms
+                  : testMetrics.value.llm_first_token_latency_ms;
+              testMetrics.value.tts_synthesis_ms =
+                typeof metrics.tts_synthesis_ms === 'number' ? metrics.tts_synthesis_ms : testMetrics.value.tts_synthesis_ms;
+              testMetrics.value.tts_total_ms =
+                typeof metrics.tts_total_ms === 'number' ? metrics.tts_total_ms : testMetrics.value.tts_total_ms;
+              testMetrics.value.total_roundtrip_ms =
+                typeof metrics.total_roundtrip_ms === 'number' ? metrics.total_roundtrip_ms : testMetrics.value.total_roundtrip_ms;
+            }
             if ((payload?.ok ?? true) === false) {
               setStatus('任务已结束（取消/失败）', 'error');
             } else if (payload?.asr_only) {
@@ -274,7 +328,13 @@ export const useVoiceStore = defineStore('voice', () => {
    * 
    * @param config - 会话配置对象
    */
-  const startCustomSession = async (config: { systemPrompt: string; openingText: string; openingAudio: string; language: string }) => {
+  const startCustomSession = async (config: {
+    systemPrompt: string;
+    openingText: string;
+    openingAudio: string;
+    language: string;
+    scenario?: string;
+  }) => {
     // Ensure WS handler is registered before any server events arrive.
     init();
     if (!isConnected.value) {
@@ -284,6 +344,7 @@ export const useVoiceStore = defineStore('voice', () => {
     // 重置状态
     currentDialogue.value = [];
     currentLanguage.value = config.language;
+    currentScenario.value = config.scenario || currentScenario.value;
     autoCaptureEnabled.value = true;
     
     // 添加开场白消息
@@ -310,7 +371,9 @@ export const useVoiceStore = defineStore('voice', () => {
         'CONTEXT_SET',
         {
           system_prompt: config.systemPrompt,
-          language: config.language
+          language: config.language,
+          scenario: config.scenario || currentScenario.value,
+          user_id: getCurrentUserId(),
         },
         ctxRid
       );
@@ -320,7 +383,8 @@ export const useVoiceStore = defineStore('voice', () => {
         type: 'init_session',
         config: {
           systemPrompt: config.systemPrompt,
-          language: config.language
+          language: config.language,
+          scenario: config.scenario || currentScenario.value,
         }
       });
     }
@@ -349,8 +413,13 @@ export const useVoiceStore = defineStore('voice', () => {
   };
 
   /**
-   * 开始录音
-   * 启动音频管理器并开始流式传输音频数据。
+   * 开始录音（向后端发送音频流，由后端 SeamlessM4T 进行 ASR）
+   *
+   * 流程：
+   * 1. 通过 WebSocket 发送 AUDIO_START 建立请求上下文。
+   * 2. 持续录音，将 Int16 PCM 数据通过 AUDIO_CHUNK_BIN 发送到后端。
+   * 3. 后端 VAD 检测到语音结束后自动进行 ASR，并通过 ASR_FINAL 事件返回文本。
+   * 4. 后端在同一条音频请求内继续执行 LLM 与 TTS，并通过事件流返回结果与指标。
    */
   const startRecording = async () => {
     // Ensure WS handler is registered before any server events arrive.
@@ -360,49 +429,46 @@ export const useVoiceStore = defineStore('voice', () => {
       await waitForConnected(6000);
     }
 
+    const rid = `audio_${Date.now().toString(16)}`;
+    currentRequestId.value = rid;
+
     try {
       isRecording.value = true;
       autoCaptureEnabled.value = true;
       setStatus('正在聆听...', 'listening');
-      
-      // 持续录音：检测到语音能量后自动创建 request，并交给后端 VAD 自动收句。
-      await audioManager.startRecording((data) => {
-        if (!isRecording.value || !autoCaptureEnabled.value) {
-          return;
-        }
 
-        const rms = calcRms(data);
+      const langMap: Record<string, string> = {
+        'English': 'en',
+        'Japanese': 'ja',
+        'Chinese': 'zh',
+        'French': 'fr',
+      };
+      const lang = langMap[currentLanguage.value] || currentLanguage.value || 'auto';
 
-        // 没有进行中的语音请求时，只有检测到明确语音才发起新请求。
-        if (!currentRequestId.value && rms >= speechThreshold.value) {
-          const rid = `voice_${Date.now().toString(16)}`;
-          currentRequestId.value = rid;
+      // 发送 AUDIO_START 建立音频流上下文
+      voiceSocket.startAudio(rid, {
+        sample_rate: 16000,
+        channels: 1,
+        encoding: 'pcm_s16le',
+        language: lang,
+        vad_enabled: true,
+        vad_mode: 2,
+        vad_silence_ms: 800,
+      });
 
-          // barge-in: 本地立即停止旧播报，随后后端也会基于新请求触发中断逻辑。
-          audioManager.stopPlayback();
-          isSpeaking.value = false;
-          isProcessing.value = false;
-
-          voiceSocket.startAudio(rid, {
-            sample_rate: 16000,
-            channels: 1,
-            encoding: 'pcm_s16le',
-            vad_enabled: true,
-            vad_silence_ms: 700,
-          });
-          setStatus('检测到语音，正在识别...', 'listening');
-        }
-
-        // 只有有 request_id 时才上传 chunk。
-        if (currentRequestId.value) {
-          voiceSocket.sendAudioChunkWsV1(currentRequestId.value, data, wsV1PreferBinary.value);
-        }
+      await audioManager.startRecordingForBackend({
+        requestId: rid,
+        onChunk: (data) => {
+          // 使用二进制模式发送音频 chunk（更高效）
+          voiceSocket.sendAudioChunkWsV1(rid, data, true);
+        },
       });
 
     } catch (e) {
       console.error(e);
       setStatus('无法启动录音', 'error');
       isRecording.value = false;
+      currentRequestId.value = null;
     }
   };
 
@@ -412,14 +478,13 @@ export const useVoiceStore = defineStore('voice', () => {
   const stopRecording = () => {
     autoCaptureEnabled.value = false;
     isRecording.value = false;
-    audioManager.stopRecording();
-    if (currentRequestId.value) {
-      voiceSocket.endAudio(currentRequestId.value);
-      currentRequestId.value = null;
-    } else {
-      // legacy fallback
-      voiceSocket.send({ type: 'stop' });
+    audioManager.stopRecordingForBackend();
+    // 发送 AUDIO_END 通知后端收句
+    const rid = currentRequestId.value;
+    if (rid) {
+      voiceSocket.endAudio(rid);
     }
+    currentRequestId.value = null;
     isProcessing.value = false;
     setStatus('已暂停自动聆听', 'success');
   };
@@ -435,17 +500,117 @@ export const useVoiceStore = defineStore('voice', () => {
     }
   };
 
-  /**
-   * 计算一段 PCM16 音频的 RMS（用于语音起始检测）。
-   */
-  const calcRms = (pcm: Int16Array): number => {
-    if (!pcm || pcm.length === 0) return 0;
-    let sum = 0;
-    for (let i = 0; i < pcm.length; i++) {
-      const v = pcm[i];
-      sum += v * v;
+  // ============ 纯本地 ASR 调试模式（不依赖后端）============
+  const localAsrText = ref('');
+  const localVadSpeaking = ref(false);
+  const localBargeInCount = ref(0);
+
+  // ============ ASR+LLM+TTS 端到端测试模式（需后端，TTS 正常播放）============
+  const testAsrText = ref('');
+  const testLlmText = ref('');
+  const testIsRunning = ref(false);
+  const testTtsState = ref('');
+  const testMetrics = ref<Record<string, number | null>>({
+    asr_latency_ms: null,
+    llm_latency_ms: null,
+    llm_first_token_latency_ms: null,
+    tts_synthesis_ms: null,
+    tts_total_ms: null,
+    total_roundtrip_ms: null,
+  });
+
+  const startAsrLlmTest = async () => {
+    try {
+      testIsRunning.value = true;
+      testAsrText.value = '';
+      testLlmText.value = '';
+      testTtsState.value = '';
+      testMetrics.value = {
+        asr_latency_ms: null,
+        llm_latency_ms: null,
+        llm_first_token_latency_ms: null,
+        tts_synthesis_ms: null,
+        tts_total_ms: null,
+        total_roundtrip_ms: null,
+      };
+      isProcessing.value = false;
+      setStatus('ASR+LLM+TTS 测试模式：等待语音...', 'listening');
+
+      // 走完整 ASR -> LLM -> TTS 流程，测试面板只负责展示文本与延迟指标。
+      await startRecording();
+    } catch (e) {
+      console.error(e);
+      setStatus('无法启动 ASR+LLM+TTS 测试', 'error');
+      testIsRunning.value = false;
     }
-    return Math.sqrt(sum / pcm.length);
+  };
+
+  const stopAsrLlmTest = () => {
+    testIsRunning.value = false;
+    stopRecording();
+    setStatus('ASR+LLM+TTS 测试已停止', 'success');
+  };
+
+  const startLocalAsrTest = async () => {
+    try {
+      isRecording.value = true;
+      localAsrText.value = '';
+      localVadSpeaking.value = false;
+      localBargeInCount.value = 0;
+      setStatus('本地 ASR 测试中...', 'listening');
+
+      await audioManager.startRecordingWithAsr({
+        language: currentLanguage.value,
+        speechThreshold: speechThreshold.value,
+        silenceMs: 700,
+        minSpeechMs: 300,
+        onVadChange: (speaking) => {
+          localVadSpeaking.value = speaking;
+          if (speaking) {
+            setStatus('检测到语音', 'listening');
+            // 模拟打断：如果 AI 正在播放，则计数打断
+            if (isSpeaking.value) {
+              localBargeInCount.value += 1;
+            }
+            audioManager.stopPlayback();
+            isSpeaking.value = false;
+            isProcessing.value = false;
+          } else {
+            setStatus('语音结束，识别中...', 'processing');
+            isProcessing.value = true;
+          }
+        },
+        onResult: (text) => {
+          localAsrText.value = text;
+          if (!text) {
+            isProcessing.value = false;
+            setStatus('未识别到语音，继续聆听...', 'listening');
+            return;
+          }
+          addMessage('user', text);
+          setStatus(`识别: ${text}`, 'success');
+          isProcessing.value = false;
+          // 纯本地模式：不发送给后端
+        },
+        onError: (err) => {
+          console.error('ASR error:', err);
+          setStatus(`识别错误: ${err}`, 'error');
+          isProcessing.value = false;
+        },
+      });
+    } catch (e) {
+      console.error(e);
+      setStatus('无法启动本地 ASR 测试', 'error');
+      isRecording.value = false;
+    }
+  };
+
+  const stopLocalAsrTest = () => {
+    isRecording.value = false;
+    audioManager.stopRecordingWithAsr();
+    isProcessing.value = false;
+    localVadSpeaking.value = false;
+    setStatus('本地 ASR 测试已停止', 'success');
   };
 
   return {
@@ -460,11 +625,23 @@ export const useVoiceStore = defineStore('voice', () => {
     currentLanguage,
     currentScenario,
     currentDialogue,
-    
+    localAsrText,
+    localVadSpeaking,
+    localBargeInCount,
+    testAsrText,
+    testLlmText,
+    testIsRunning,
+    testTtsState,
+    testMetrics,
+
     // Actions
     init,
     toggleRecording,
     startCustomSession,
-    stopSession
+    stopSession,
+    startLocalAsrTest,
+    stopLocalAsrTest,
+    startAsrLlmTest,
+    stopAsrLlmTest,
   };
 });

@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Overlay</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body {
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+      background: transparent;
+      user-select: none;
+    }
+    #root {
+      width: 100%;
+      min-height: 100px;
+      padding: 10px;
+      display: flex;
+      flex-direction: column;
+    }
+    .card {
+      background: rgba(25, 25, 35, 0.88);
+      backdrop-filter: blur(18px) saturate(1.5);
+      -webkit-backdrop-filter: blur(18px) saturate(1.5);
+      border: 1px solid rgba(255, 255, 255, 0.07);
+      border-radius: 14px;
+      box-shadow: 0 10px 40px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+      color: #e8e8ec;
+      overflow: hidden;
+      animation: slideIn 0.3s cubic-bezier(0.22, 1, 0.36, 1);
+      display: flex;
+      flex-direction: column;
+    }
+    @keyframes slideIn {
+      from { opacity: 0; transform: translateY(12px) scale(0.96); }
+      to   { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @keyframes fadeOut {
+      from { opacity: 1; transform: scale(1); }
+      to   { opacity: 0; transform: scale(0.96); }
+    }
+    .card.closing { animation: fadeOut 0.2s ease forwards; }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 9px 13px 7px;
+      -webkit-app-region: drag;
+      app-region: drag;
+      cursor: grab;
+    }
+    .header-title {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 12px;
+      font-weight: 600;
+      color: #a5b4fc;
+      letter-spacing: 0.3px;
+    }
+    .header-title .dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: #6366f1;
+      box-shadow: 0 0 6px rgba(99, 102, 241, 0.5);
+      animation: pulse 2s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.5} }
+    .header-actions {
+      display: flex;
+      gap: 5px;
+      -webkit-app-region: no-drag;
+      app-region: no-drag;
+    }
+    .header-actions button {
+      background: rgba(255,255,255,0.06);
+      border: none;
+      color: #9ca3af;
+      width: 22px;
+      height: 22px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 11px;
+      line-height: 1;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.15s;
+    }
+    .header-actions button:hover { background: rgba(255,255,255,0.14); color: #e5e7eb; }
+
+    .body {
+      padding: 4px 13px 10px;
+      font-size: 13px;
+      line-height: 1.6;
+      color: #d1d5db;
+      word-break: break-word;
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .body::-webkit-scrollbar { width: 4px; }
+    .body::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.1); border-radius: 2px; }
+
+    .preview-img {
+      max-width: 100%;
+      max-height: 140px;
+      border-radius: 8px;
+      border: 1px solid rgba(255,255,255,0.08);
+      display: block;
+      margin-bottom: 8px;
+    }
+    .preview-text {
+      background: rgba(255,255,255,0.04);
+      border-radius: 8px;
+      padding: 8px 10px;
+      font-size: 12.5px;
+      color: #c4c4cc;
+      border-left: 3px solid #6366f1;
+      margin-bottom: 8px;
+      max-height: 80px;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      display: -webkit-box;
+      -webkit-line-clamp: 3;
+      -webkit-box-orient: vertical;
+    }
+
+    .footer {
+      display: flex;
+      gap: 7px;
+      padding: 0 13px 11px;
+      -webkit-app-region: no-drag;
+      app-region: no-drag;
+    }
+    .footer button {
+      flex: 1;
+      padding: 7px 0;
+      border-radius: 8px;
+      border: none;
+      font-size: 12px;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all 0.15s;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+      color: #fff;
+      box-shadow: 0 2px 8px rgba(99, 102, 241, 0.25);
+    }
+    .btn-primary:hover { filter: brightness(1.1); }
+    .btn-ghost {
+      background: rgba(255,255,255,0.06);
+      color: #9ca3af;
+    }
+    .btn-ghost:hover { background: rgba(255,255,255,0.12); color: #e5e7eb; }
+
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-right: 5px;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      vertical-align: middle;
+    }
+    .badge-hint { background: rgba(99,102,241,0.18); color: #a5b4fc; }
+    .badge-alert { background: rgba(239,68,68,0.14); color: #fca5a5; }
+    .badge-assist { background: rgba(34,197,94,0.14); color: #86efac; }
+
+    /* 加载动画 */
+    .spinner {
+      display: inline-block;
+      width: 14px;
+      height: 14px;
+      border: 2px solid rgba(255,255,255,0.1);
+      border-top-color: #6366f1;
+      border-radius: 50%;
+      animation: spin 0.8s linear infinite;
+      margin-right: 6px;
+      vertical-align: middle;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="root">
+    <div class="card" id="card">
+      <div class="header">
+        <div class="header-title">
+          <div class="dot" id="dot"></div>
+          <span id="title">AI 助手</span>
+        </div>
+        <div class="header-actions">
+          <button id="pinBtn" title="固定">📌</button>
+          <button id="closeBtn" title="关闭">✕</button>
+        </div>
+      </div>
+      <div class="body" id="body"></div>
+      <div class="footer" id="footer">
+        <button class="btn-ghost" id="dismissBtn">忽略</button>
+        <button class="btn-primary" id="actionBtn">查词</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const params = new URLSearchParams(location.search);
+    const payload = JSON.parse(decodeURIComponent(params.get('payload') || '{}'));
+
+    const titleEl = document.getElementById('title');
+    const bodyEl = document.getElementById('body');
+    const cardEl = document.getElementById('card');
+    const closeBtn = document.getElementById('closeBtn');
+    const pinBtn = document.getElementById('pinBtn');
+    const dismissBtn = document.getElementById('dismissBtn');
+    const actionBtn = document.getElementById('actionBtn');
+    const footerEl = document.getElementById('footer');
+    const dotEl = document.getElementById('dot');
+
+    let isPinned = false;
+    let autoCloseTimer = null;
+
+    function render(data) {
+      const mode = data.mode || 'entry'; // 'entry' | 'result' | 'loading'
+      const priority = data.priority || 'medium';
+
+      // Title
+      titleEl.textContent = data.title || (mode === 'entry' ? '检测到内容' : 'AI 助教');
+
+      // Body
+      bodyEl.innerHTML = '';
+      if (mode === 'entry') {
+        // 入口模式：展示预览 + 查词按钮
+        if (data.imageBase64) {
+          const img = document.createElement('img');
+          img.className = 'preview-img';
+          img.src = data.imageBase64;
+          img.alt = 'screenshot';
+          bodyEl.appendChild(img);
+        }
+        if (data.textPreview) {
+          const div = document.createElement('div');
+          div.className = 'preview-text';
+          div.textContent = data.textPreview;
+          bodyEl.appendChild(div);
+        }
+        actionBtn.textContent = data.actionLabel || '查词';
+        dotEl.style.background = '#f59e0b';
+        dotEl.style.boxShadow = '0 0 6px rgba(245,158,11,0.5)';
+      } else if (mode === 'loading') {
+        bodyEl.innerHTML = '<span class="spinner"></span>' + (data.content || '正在分析...');
+        footerEl.style.display = 'none';
+        dotEl.style.background = '#6366f1';
+      } else {
+        // result 模式
+        const badgeMap = { high: 'alert', medium: 'assist', low: 'hint' };
+        const labelMap = { high: '重要', medium: '辅助', low: '提示' };
+        const badgeClass = 'badge-' + (badgeMap[priority] || 'hint');
+        const badgeLabel = labelMap[priority] || '提示';
+        bodyEl.innerHTML = '<span class="badge ' + badgeClass + '">' + badgeLabel + '</span>' + (data.content || '');
+        actionBtn.textContent = data.actionLabel || '查看详情';
+        dotEl.style.background = priority === 'high' ? '#ef4444' : priority === 'medium' ? '#6366f1' : '#22c55e';
+      }
+
+      if (data.hideFooter) {
+        footerEl.style.display = 'none';
+      } else {
+        footerEl.style.display = 'flex';
+      }
+
+      // Notify main process of content height
+      requestAnimationFrame(() => {
+        const h = document.documentElement.scrollHeight;
+        window.api?.overlayResize?.({ width: 360, height: Math.min(Math.max(h, 100), 420) });
+      });
+
+      if (mode !== 'loading') startAutoClose();
+    }
+
+    function closeOverlay() {
+      if (autoCloseTimer) { clearTimeout(autoCloseTimer); autoCloseTimer = null; }
+      cardEl.classList.add('closing');
+      setTimeout(() => window.api?.overlayClose?.(), 250);
+    }
+
+    function startAutoClose() {
+      if (autoCloseTimer) clearTimeout(autoCloseTimer);
+      if (isPinned) return;
+      autoCloseTimer = setTimeout(() => closeOverlay(), 8000);
+    }
+
+    closeBtn.addEventListener('click', closeOverlay);
+    dismissBtn.addEventListener('click', closeOverlay);
+
+    pinBtn.addEventListener('click', () => {
+      isPinned = !isPinned;
+      pinBtn.textContent = isPinned ? '📍' : '📌';
+      pinBtn.title = isPinned ? '已固定' : '固定';
+      if (isPinned) {
+        if (autoCloseTimer) clearTimeout(autoCloseTimer);
+      } else {
+        startAutoClose();
+      }
+    });
+
+    actionBtn.addEventListener('click', () => {
+      window.api?.overlayAction?.({ type: payload.mode === 'entry' ? 'entry-action' : 'action', payload: payload.actionPayload });
+      closeOverlay();
+    });
+
+    if (window.api?.onOverlayUpdate) {
+      window.api.onOverlayUpdate((data) => render(data));
+    }
+
+    render(payload);
+  </script>
+</body>
+</html>

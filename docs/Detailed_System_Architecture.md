@@ -1,5 +1,16 @@
 # AI外语学习系统 - 细化架构设计
 
+> 当前文档已按 2026-04-18 代码现状校准，以下实现基线以仓库代码为准，而非早期方案草图：
+> - 主语音对话链路 ASR：`SeamlessM4T`（`backend_fastapi/app/voice_stream.py`，CPU 推理，默认后端）
+> - 主语音对话链路 TTS：`Kokoro`（`backend_fastapi/app/tts.py`，本地优先，`Edge-TTS` 在线回退，最终 `silence` 兜底）
+> - OCR：`PaddleOCR`（`backend_fastapi/app/ocr.py`，懒加载，CPU 运行）
+> - WebSocket 语音协议：实际已发送 `ASR_PARTIAL / ASR_FINAL / LLM_TOKEN / LLM_RESULT / TTS_CHUNK / TTS_RESULT / TASK_FINISHED`
+> - 学情分析：当前已采用“规则统计优先、自动化辅助补位、LLM 仅处理高阶语义维度”的混合架构
+>
+> 说明：
+> - 文档中若出现 `faster-whisper / XTTS / Surya`，均视为早期历史方案，不代表当前主链路实现。
+> - Electron 端仍保留一套本地 `whisper.cpp` 辅助 ASR 管理器，但它不是当前后端主语音链路的事实标准。
+
 ## 一、单词模块详细架构
 
 ### 1.1 功能拆解
@@ -133,11 +144,94 @@
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 1.4 推荐复习/学习算法
+### 1.3 已落实的算法与数据层
+
+#### 1.3.1 SM-2 间隔重复算法（简化版已落地）
+
+```python
+# backend_fastapi/app/domain/srs/sm2.py
+
+def calculate_next_review(mastery_level: int, correct: bool) -> tuple[int, datetime]:
+    now = datetime.utcnow()
+    if correct:
+        new_level = mastery_level + 1
+        days = 2 ** (new_level - 1) if new_level > 0 else 1
+        # 间隔序列: 1天, 2天, 4天, 8天, 16天, 32天...
+        next_review = now + timedelta(days=days)
+    else:
+        new_level = max(0, mastery_level - 1)
+        next_review = now + timedelta(minutes=10)  # 答错10分钟后复习
+    return new_level, next_review
+```
+
+**当前状态**：✅ 已实现，支撑复习列表管理和评分提交（`POST /v1/vocab/review`）。
+**已知限制**：缺少传统SM-2的EF因子和难度调整，为简化实现。
+
+#### 1.3.2 词汇难度分级（启发式规则已落地）
+
+```python
+def _estimate_vocab_metadata(term, definitions):
+    base = 1
+    if " " in term: base += 1          # 短语+1
+    if len(term) >= 7: base += 1       # 长词+1
+    if len(term) >= 10: base += 1      # 更长+1
+    if len(definitions) >= 2: base += 1 # 多义项+1
+    if syllable_count >= 4: base += 1   # 多音节+1
+    difficulty = max(1, min(6, base))   # 1-6级
+    cefr = {1:"A1", 2:"A2", 3:"B1", 4:"B2", 5:"C1", 6:"C2"}[difficulty]
+```
+
+**当前状态**：✅ 已实现，自动标注CEFR等级（A1-C2）、学段、考试标签。
+
+#### 1.3.3 知识图谱与词汇推荐（已落地）
+
+**Neo4j 图结构**：
+- 节点: `Word {word, phonetic, meaning, difficulty, tags}`
+- 关系: `SYNONYM` / `ANTONYM` / `COGNATE` / `SIMILAR_FORM` / `BELONGS_TO`
+- 属性: `strength (0.0-1.0)`
+
+**三层推荐策略（已落实）**：
+1. **薄弱点扩展**：基于薄弱词汇推荐同义词(0.90)、反义词(0.85)、同根词(0.80)
+2. **已学词汇扩展**：基于最近学过词汇推荐相关词汇(0.75)
+3. **兜底词库**：按用户等级从预定义词池选取(0.55)
+
+**A*学习路径算法（已落实）**：
+```python
+# backend_fastapi/app/domain/knowledge_graph/service.py
+async def generate_learning_path(start_word, target_word, max_depth=5):
+    # g_score = 累计路径成本 (1 - relation.strength)
+    # f_score = g_score + heuristic(edit_distance)
+```
+
+#### 1.3.4 多数据源查询优先级（已落地）
+
+```
+词汇查询时的数据源优先级：
+1. PublicVocabEntry (本地公共词库)
+2. Elasticsearch (全文搜索，fuzzy匹配)
+3. LLM生成 (generate_vocab_fields)
+4. 兜底: generate_definition (简化定义)
+```
+
+#### 1.3.5 异步任务队列（Celery已落地）
+
+| 任务 | 队列 | 说明 |
+|------|------|------|
+| `generate_daily_vocab_task` | `default_tasks` | 按主题批量生成词汇 |
+| `grade_essay_task` | `urgent_tasks` | 作文批改 |
+| `generate_all_daily_summaries_task` | `batch_tasks` | 每日学生摘要 |
+| `run_tiered_analysis_task` | `batch_tasks` | 分层Agent分析 |
+| `generate_class_weekly_report_task` | `batch_tasks` | 班级周报 |
+
+**降级保护**：Celery不可用时自动回退到本地同步执行 (`_DummyCelery`)。
+
+### 1.4 推荐复习/学习算法（轻量规则已落地，LightFM+FAISS 接口占位）
+
+> **⚠️ 当前状态**：推荐引擎的 Neo4j 规则层已落地；LightFM + FAISS 基础设施已接口化占位（`backend_fastapi/app/domain/knowledge_graph/recommendation_engine.py`），实际模型训练待数据量达标后启用。
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          词汇推荐引擎                                        │
+│                          词汇推荐引擎（设计目标）                            │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  数据源                                                                      │
@@ -172,12 +266,12 @@
 │                                   │                                        │
 │                                   ▼                                        │
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                      个性化推荐算法                                  │  │
+│  │                      个性化推荐算法（规划中）                        │  │
 │  │                                                                     │  │
 │  │  输入: 薄弱点 + 用户画像 + 当前学习进度                              │  │
 │  │                                                                     │  │
 │  │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│  │  │  LightFM矩阵分解 + FAISS向量检索                            │   │  │
+│  │  │  LightFM矩阵分解 + FAISS向量检索（待实现）                  │   │  │
 │  │  │                                                             │   │  │
 │  │  │  用户特征: [学习水平, 目标场景, 薄弱标签, 时间偏好]          │   │  │
 │  │  │  词汇特征: [难度, 主题标签, 词性, 关联度]                    │   │  │
@@ -203,119 +297,66 @@
 │                              作文批改流程                                    │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  阶段1: 预处理 + OCR + 可靠语料库检查                                         │
-│  ═══════════════════════════════════                                        │
+│  用户提交作文 (文本 或 图片)                                                  │
+│       │                                                                     │
+│       ▼                                                                     │
+│  ┌─────────────────┐    图片输入时自动触发                                     │
+│  │   OCR文本提取    │    ┌─────────────────┐                                 │
+│  │  (PaddleOCR)    │◄───│   图片 → 文本    │                                 │
+│  │                 │    │  • Base64解码    │                                 │
+│  │ • 图片转文本     │    │  • PaddleOCR    │                                 │
+│  │ • 段落顺序还原   │    │  • 文本提取      │                                 │
+│  │ • 噪声字符清理   │    └─────────────────┘                                 │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐                                                        │
+│  │   文本预处理     │                                                        │
+│  │ • 编码规范化(NFKC)│                                                       │
+│  │ • 分段分句       │                                                        │
+│  │ • 语言检测       │                                                        │
+│  │ • 2000词上限截断 │                                                        │
+│  └────────┬────────┘                                                        │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐         │
+│  │  结构+拼写补充   │    │  LLM综合批改     │    │  评分标准化      │         │
+│  │ • 连接词检测    │    │ (Kimi API/Qwen) │    │ • 0-100 → 0-10  │         │
+│  │ • 段落分析      │◄───│ • 6维度评分     │───►│ • 加权总分计算   │         │
+│  │ • 拼写检查(LT)  │    │ • 错误映射      │    │ • A+/A/B+/B/C/D │         │
+│  └────────┬────────┘    └─────────────────┘    └─────────────────┘         │
+│           │                                                                 │
+│           ▼                                                                 │
+│  ┌─────────────────┐                                                        │
+│  │  结果持久化      │                                                        │
+│  │ • EssaySubmission│                                                       │
+│  │ • EssayResult   │                                                        │
+│  │ • ConversationEvent                                                      │
+│  └─────────────────┘                                                        │
 │                                                                             │
-│  用户提交作文 ──► ┌─────────────────┐                                       │
-│                   │   文本预处理     │                                       │
-│                   │ • 编码规范化     │                                       │
-│                   │ • 分段分句       │                                       │
-│                   │ • 语言检测       │                                       │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│                   ┌─────────────────┐                                       │
-│                   │   OCR文本提取    │                                       │
-│                   │  (PaddleOCR)    │                                       │
-│                   │                 │                                       │
-│                   │ • 图片转文本     │                                       │
-│                   │ • 段落顺序还原   │                                       │
-│                   │ • 噪声字符清理   │                                       │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│                   ┌─────────────────┐                                       │
-│                   │  可靠语料库API   │                                       │
-│                   │  (LanguageTool/  │                                       │
-│                   │   Grammarly API) │                                       │
-│                   │                 │                                       │
-│                   │ • 拼写错误检测   │                                       │
-│                   │ • 基础语法检查   │                                       │
-│                   │ • 标点符号规范   │                                       │
-│                   │ • 常见搭配检查   │                                       │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│                   ┌─────────────────┐                                       │
-│                   │  GEC语法纠错     │                                       │
-│                   │  (T5-GECToR)     │                                       │
-│                   │                 │                                       │
-│                   │ • 深层语法错误   │                                       │
-│                   │ • 句法结构问题   │                                       │
-│                   │ • 时态语态错误   │                                       │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│  阶段2: LLM综合分析与逻辑判断                                                 │
-│  ═══════════════════════════════════                                        │
-│                                                                             │
-│                   ┌─────────────────┐                                       │
-│                   │  作文结构化解析  │                                       │
-│                   │ • 论点提取      │                                       │
-│                   │ • 论据识别      │                                       │
-│                   │ • 结构分析      │                                       │
-│                   │ • 逻辑链梳理    │                                       │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│                   ┌─────────────────────────────────────────┐              │
-│                   │         LLM综合分析 (Kimi API)           │              │
-│                   │                                         │              │
-│                   │  Prompt: "作为资深英语教师，请对以下作文 │              │
-│                   │  进行深入分析：                          │              │
-│                   │                                         │              │
-│                   │  1. 内容理解：主题把握、观点深度、论证充分性│             │
-│                   │  2. 逻辑结构：段落组织、过渡衔接、整体连贯性│             │
-│                   │  3. 语言表达：词汇运用、句式多样、修辞手法  │             │
-│                   │  4. 创新思维：独特见解、批判性思维         │              │
-│                   │                                         │              │
-│                   │  前置分析结果：                          │              │
-│                   │  - OCR文本: [clean_text]                 │              │
-│                   │  - 语法错误: [列表]                      │              │
-│                   │  - 拼写问题: [列表]                      │              │
-│                   │  - 基础评分: [分数]"                     │              │
-│                   │                                         │              │
-│                   └─────────────────────────────────────────┘              │
-│                            │                                                │
-│                            ▼                                                │
-│  阶段3: 评分与格式化输出                                                      │
-│  ═══════════════════════════════════                                        │
-│                                                                             │
-│                   ┌─────────────────┐                                       │
-│                   │  多维度评分      │                                       │
-│                   │                 │                                       │
-│                   │  内容(30%): ████████░░ 8/10                          │
-│                   │  结构(25%): ███████░░░ 7/10                          │
-│                   │  语言(25%): ████████░░ 8/10                          │
-│                   │  语法(20%): ██████░░░░ 6/10                          │
-│                   │  ─────────────────────                               │
-│                   │  总分: 7.25/10                                       │
-│                   │  等级: B+                                            │
-│                   └────────┬────────┘                                       │
-│                            │                                                │
-│                            ▼                                                │
-│                   ┌─────────────────┐                                       │
-│                   │  算法匹配前端展示 │                                       │
-│                   │                 │                                       │
-│                   │  ┌───────────┐  ┌───────────┐  ┌───────────┐          │
-│                   │  │ 错误标注  │  │ 改进建议  │  │ 范文对比  │          │
-│                   │  │  (高亮)   │  │  (分类)   │  │  (示例)   │          │
-│                   │  └───────────┘  └───────────┘  └───────────┘          │
-│                   │                                                 │      │
-│                   │  ┌───────────┐  ┌───────────┐  ┌───────────┐          │
-│                   │  │ 能力雷达  │  │ 进步曲线  │  │ 推荐练习  │          │
-│                   │  │  (图表)   │  │  (趋势)   │  │  (链接)   │          │
-│                   │  └───────────┘  └───────────┘  └───────────┘          │
-│                   └─────────────────┘                                       │
+│  【统一入口】POST /v1/essays/grade                                          │
+│  • 请求体: { text?: string, image?: string, language?: string }             │
+│  • text 和 image 至少提供一个                                               │
+│  • 优先使用 text，提供 image 时自动 OCR 提取                                │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 2.1.1 作文OCR前置（节省VLM Token）
+### 2.1.1 作文输入与OCR处理
 
-- 默认链路：`OCR -> 语料库/语法检测 -> LLM综合批改`。
-- 原则：作文批改优先走文本链路，不走VLM图片理解。
-- 回退：OCR低置信度时提示重拍或手动校对，不默认切VLM。
+**统一入口**：`POST /v1/essays/grade`
+
+| 输入方式 | 请求字段 | 处理流程 |
+|----------|----------|----------|
+| 纯文本 | `text` | 直接进入预处理 |
+| 图片 | `image` (base64) | PaddleOCR → 文本 → 预处理 |
+| 同时提供 | `text` + `image` | 优先使用 `text` |
+
+- 图片输入时自动调用 `ocr_image_base64()` 提取文本
+- OCR 失败返回 400 错误，提示"ocr failed or empty text"
+- 文本提取后统一走 `run_grading_pipeline()` 批改流水线
+- 作文批改优先走文本链路，不走 VLM 图片理解
+- 兼容旧端点：`/v1/essays/grade-ocr` 仍保留（图片专用）
 
 ### 2.2 作文评分算法
 
@@ -372,88 +413,130 @@
 
 ## 三、对话模块详细架构
 
-### 3.1 双LLM架构设计
+### 3.1 双LLM架构设计（已落实为竞速机制）
+
+> **📌 架构演进说明**：原设计的"小LLM扩写 + 大LLM执行"两阶段架构，在实际落地中已演进为 **LLM竞速机制**（Race Mode）。场景扩写由独立API完成（`POST /api/v1/model-routing/expand-scenario`），对话执行阶段采用云端+本地双路并发竞速。
+
+#### 3.1.1 场景扩写（已落地）
+
+```
+用户输入场景描述
+       │
+       ▼
+┌─────────────────────────────────────────────────────────────┐
+│              场景扩写API (Kimi API)                          │
+│  backend_fastapi/app/model_router.py::expand_scenario()     │
+│                                                             │
+│  • 输入: 用户描述 + 目标语言                                │
+│  • 匹配场景库文化语境 (scenario_library_cultural_context.md)│
+│  • 使用 Jinja2 模板: scenario_expand_system_prompt.j2       │
+│  • 输出: 标准化 System Prompt（含场景锚定强制规则）          │
+│                                                             │
+│  场景库覆盖: 机场/酒店/租车/地铁/餐厅/居酒屋/咖啡/酒吧/     │
+│  外卖/理发/干洗/银行/邮局/药店/超市/商场/二手店/菜市场/     │
+│  诊所/牙科/眼科/急诊/电影/健身/博物馆/派对/租房/家电维修等  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**文化语境注入**：扩写时自动匹配 `_SCENARIO_LIBRARY_SNIPPETS` 中的文化差异焦点（如日本敬语层级、美国小费文化、英国轮酒文化等），融入角色台词和 💡 学习提示。
+
+#### 3.1.2 对话执行：LLM竞速机制（已落地）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          对话系统架构                                        │
+│                        语音对话全链路（ws-v1协议）                           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│   阶段1: Prompt Engineering (小LLM)                                         │
-│   ═══════════════════════════════════                                       │
-│                                                                             │
-│   用户输入场景                                                              │
-│   "我想练习餐厅点餐"                                                         │
+│  用户语音输入                                                                │
 │       │                                                                     │
 │       ▼                                                                     │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │                    场景Reasoning扩写引擎                             │  │
-│   │                    (轻量级LLM - 9B模型)                              │  │
-│   │                                                                     │  │
-│   │  Prompt Engineering:                                                │  │
-│   │  ─────────────────                                                  │  │
-│   │  你是一个专业的英语对话场景设计专家。                                  │  │
-│   │  请将用户的简单场景描述扩展为详细的对话设定：                          │  │
-│   │                                                                     │  │
-│   │  输入: {user_scene}                                                  │  │
-│   │                                                                     │  │
-│   │  请输出JSON格式：                                                    │  │
-│   │  {                                                                  │  │
-│   │    "scene_name": "餐厅点餐",                                          │  │
-│   │    "setting": {                                                     │  │
-│   │      "location": "美式休闲餐厅",                                      │  │
-│   │      "time": "晚餐时段",                                              │  │
-│   │      "roles": ["顾客(用户)", "服务员"],                               │  │
-│   │      "atmosphere": "轻松友好"                                        │  │
-│   │    },                                                               │  │
-│   │    "learning_objectives": [                                          │  │
-│   │      "掌握点餐常用表达",                                              │  │
-│   │      "学会询问推荐和特殊要求",                                        │  │
-│   │      "练习礼貌用语和支付方式表达"                                     │  │
-│   │    ],                                                               │  │
-│   │    "key_vocabulary": ["appetizer", "entree", "beverage", ...],       │  │
-│   │    "difficulty_level": "intermediate",                               │  │
-│   │    "estimated_duration": "10-15分钟",                                │  │
-│   │    "opening_line": "Hi, welcome to our restaurant! ..."              │  │
-│   │  }                                                                  │  │
-│   │                                                                     │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
+│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐                   │
+│  │  AUDIO_START │───►│  麦克风录音  │───►│ AUDIO_CHUNK  │                  │
+│  │  (ws-v1)     │    │  16kHz PCM  │    │  二进制分片   │                  │
+│  └─────────────┘    └─────────────┘    └──────┬──────┘                   │
+│                                                │                          │
+│                                                ▼                          │
+│  ┌─────────────────────────────────────────────────────────────────────┐  │
+│  │                         后端处理流程                                 │  │
+│  │                                                                     │  │
+│  │  1. VAD自动收句 (webrtcvad + 能量阈值兜底)                          │  │
+│  │     └── 检测到语音结束 → 触发 ASR                                    │  │
+│  │                                                                     │  │
+│  │  2. ASR (SeamlessM4T, CPU, int8/float32, 默认 small/medium)        │  │
+│  │     └── 输出: "I'd like to order a pizza"                           │  │
+│  │                                                                     │  │
+│  │  3. LLM竞速 (双路并发)                                              │  │
+│  │     ├─► 云端: moonshot-v1-auto (Kimi API)                           │  │
+│  │     └─► 本地: qwen3.5-9b (vLLM, INT4, ~7GB显存)                    │  │
+│  │     └── 1.2s宽限期: 先到先用，后到丢弃                               │  │
+│  │                                                                     │  │
+│  │  4. TTS多后端降级链                                                 │  │
+│  │     ├─► Kokoro (82M, CPU, 首选)                                    │  │
+│  │     ├─► Edge-TTS (在线回退)                                         │  │
+│  │     └─► Silence (兜底)                                              │  │
+│  │                                                                     │  │
+│  │  5. 音频流返回 (TTS_CHUNK → 前端播放)                               │  │
+│  │                                                                     │  │
+│  └─────────────────────────────────────────────────────────────────────┘  │
 │       │                                                                     │
 │       ▼                                                                     │
-│   生成详细对话Prompt                                                         │
-│                                                                             │
-│   阶段2: 对话执行 (大LLM)                                                    │
-│   ═══════════════════════════════════                                       │
-│                                                                             │
-│       │                                                                     │
-│       ▼                                                                     │
-│   ┌─────────────────────────────────────────────────────────────────────┐  │
-│   │                    对话LLM (Kimi API)                                │  │
-│   │                                                                     │  │
-│   │  System Prompt = 阶段1生成的场景设定                                 │  │
-│   │                                                                     │  │
-│   │  "你是一位友好的餐厅服务员。场景设定如下：                           │  │
-│   │   {scene_setting}                                                   │  │
-│   │                                                                     │  │
-│   │   你的任务：                                                        │  │
-│   │   1. 扮演服务员角色，引导用户完成点餐流程                            │  │
-│   │   2. 使用自然、地道的英语表达                                        │  │
-│   │   3. 根据用户的英语水平调整语速和用词                                │  │
-│   │   4. 如果用户表达有困难，给予适当的提示和帮助                        │  │
-│   │   5. 在对话中自然地使用目标词汇和表达                                │  │
-│   │   6. 对话结束后，给予建设性的反馈和建议"                             │  │
-│   │                                                                     │  │
-│   │  User Message: {用户语音输入(经ASR转换)}                             │  │
-│   │                                                                     │  │
-│   │  输出: AI回复文本                                                    │  │
-│   │                                                                     │  │
-│   └─────────────────────────────────────────────────────────────────────┘  │
-│       │                                                                     │
-│       ▼                                                                     │
-│   TTS语音输出                                                                │
+│  TASK_FINISHED / TASK_ABORTED (用户打断)                                   │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+#### 3.1.3 Barge-in 打断续接（已落地）
+
+**机制**：用户在AI播报过程中可随时打断，系统按TTS字节比例计算已播报位置，将未播报内容作为上下文记忆注入下一轮对话。
+
+**关键实现**：
+- 已播报位置计算：`played_ratio = bytes_sent / total_bytes`
+- 上下文记忆注入：未播报文本截断至2400字符硬上限
+- 前端状态：`isSpeaking` → `TASK_ABORTED` → `audioManager.stopPlayback()`
+
+#### 3.1.4 ws-v1 事件协议（已落地）
+
+| 事件 | 方向 | 说明 |
+|------|------|------|
+| `AUDIO_START` | 前端→后端 | 启动音频流，含 rid/sample_rate/channels/vad_enabled |
+| `AUDIO_CHUNK_BIN` | 前端→后端 | 二进制 Int16 PCM 分片（双帧结构：JSON头+原始数据） |
+| `AUDIO_END` | 前端→后端 | 用户停止说话 |
+| `TASK_STARTED` | 后端→前端 | 开始处理 |
+| `ASR_PARTIAL` | 后端→前端 | 实时转写片段 |
+| `ASR_FINAL` | 后端→前端 | 最终识别结果 |
+| `LLM_TOKEN` | 后端→前端 | 流式token增量输出（已实际启用） |
+| `LLM_RESULT` | 后端→前端 | LLM完整回复 |
+| `TTS_CHUNK` | 后端→前端 | TTS音频分片(Base64 WAV) |
+| `TTS_RESULT` | 后端→前端 | TTS合成完成 |
+| `TASK_FINISHED` | 后端→前端 | 全流程结束 |
+| `TASK_ABORTED` | 后端→前端 | 用户打断/中断 |
+| `ERROR` | 后端→前端 | 错误信息 |
+
+**双协议支持**：ws-v1（主协议，支持二进制帧、last_seq断线重连）+ legacy-stream（兼容旧版纯JSON）。
+
+#### 3.1.5 前端架构（已落地）
+
+```
+VoiceView.vue (Step1/2/3 三步骤UI)
+    │
+    ├── voice.ts (Pinia Store, ~580行)
+    │       ├── 状态: isRecording/isProcessing/isSpeaking/currentDialogue
+    │       ├── WebSocket消息分发: handleMessage()
+    │       └── 测试模式: ASR+LLM+TTS端到端测试面板（TTS正常播放）
+    │
+    ├── voice-socket.ts (~280行)
+    │       ├── 自动重连: 指数退避，最多5次
+    │       ├── last_seq追踪: 断线重连后事件回放
+    │       └── 音频流控制: startAudio()/endAudio()
+    │
+    ├── audio-manager.ts (~320行)
+    │       ├── 录音: ScriptProcessorNode (4096 buffer, 16kHz mono PCM)
+    │       └── 播放: playWavChunk() / playChunk()
+    │
+    └── WaterBall.vue (Three.js 3D动画)
+```
+
+> **⚠️ 已知限制**：TTS 当前仍是“先完整合成 WAV，再按分片回放”，属于伪流式；主要瓶颈在 TTS 首包产生而非 WebSocket 传输。`LLM_TOKEN` 已实际发送到前端，可用于调试 LLM 首 token 延迟与增量输出质量。
 
 ### 3.2 Prompt Engineering优化策略
 
@@ -515,13 +598,230 @@
 
 ---
 
-## 四、教师端模块详细架构
+## 四、教师端模块详细架构（已大规模落地）
 
-### 4.1 数据分析与总结
+### 4.1 20维度学情分析体系（已落实）
+
+#### 4.1.1 学生每日纵向摘要（Agent-0）
+
+**数据模型**：`StudentDailySummary`（`backend_fastapi/app/domain/analytics/models.py`）
+
+| 维度 | 字段 | 状态 | 计算方式 |
+|------|------|------|----------|
+| **A1** | 词汇增长率 | ✅ | `avg(mastery_level for all vocab items)` |
+| **A2** | SM-2保持率 | ✅ | `count(mastery_level >= 3) / total_vocab` |
+| **A3** | 查词转化率 | ✅ | `query_terms ∩ mastered_words / query_terms` |
+| **A4** | 构词法迁移能力 | ✅ | 基于作文文本与已学词汇的词根词缀匹配规则（`backend_fastapi/app/application/analytics/_text_analysis.py`） |
+| **A5** | 长时记忆健壮度 | ✅ | `count(next_review_at >= now + 365 days)` |
+| **A6** | 语法错误收敛速度 | ✅ | 最近5篇作文grammar分数线性斜率 |
+| **A7** | 高级词汇替代率 | ✅ | 优先使用 EssayResult.dimensions.vocabulary；无数据时用文本高级形态词汇比例代理 |
+| **A8** | 句式多样性指数 | ✅ | 基于作文文本句长标准差 + 复合句占比规则（`_text_analysis.py`） |
+| **A9** | 逻辑衔接连贯度 | ✅ | 最近5篇作文structure维度均值 |
+| **A10** | 语义表达准确性 | ✅ | 最近5篇作文language维度均值取反 |
+| **A11** | 对话响应潜伏期 | ✅ | `ConversationEvent.payload.response_latency_ms` 均值 |
+| **A12** | 语音产出速率 | ✅ | `word_count / (audio_duration_ms/60000)`，WPM 计算 |
+| **A13** | 难度跳变成功率 | ✅ | 场景难度 >= 4 的对话中，输出量与延迟达标率 |
+| **A14** | 跨文化得体性偏离 | ✅ | 优先复用事件 payload 评分；无数据时 LLM 轻量评估（0-100） |
+| **A15** | 口语解释/转述能力 | ✅ | 基于 `ConversationEvent.payload.paraphrase_markers` 计数 |
+| **A16** | 学习行为稳定性 | ✅ | 近7日学习记录每日频次标准差 |
+| **A17** | 错误复发率 | ✅ | 近7日复习记录中错误占比 |
+| **A18** | 反馈响应深度 | ✅ | 连续作文是否提升 × 0.7 + 跟进行为计数 × 0.3 |
+| **A19** | 主题覆盖广度 | ✅ | 基于关键词规则聚类的主题桶数量（daily_life/travel/business等） |
+| **A20** | 自主学习驱动力 | ✅ | 主动查词/manual/ocr/review 等行为计数 |
+
+**冷启动保护**：无数据时维度返回 `None`，不阻塞系统运行。
+
+#### 4.1.2 班级横向快照（ClassDailySnapshot）
+
+| 维度 | 字段 | 说明 |
+|------|------|------|
+| **B1** | 中下层进步斜率 | `lower_tier_lift_rate` |
+| **B2** | 群体性错误共性指数 | `common_error_index` |
+| **B3** | 中层难度耐受力 | `mid_tier_difficulty_tolerance` |
+| **B4** | 学习路径收敛度 | `learning_path_convergence` |
+| **B5** | 能力等级分布位移 | `ability_distribution_shift` |
+| **B6** | 协作/竞争活跃度 | 🔲 | 预留：需协作模块就绪 |
+| **B7** | 知识图谱连通性 | 🔲 | 预留：需 Neo4j KG 班级级统计 |
+| **B8** | 中上层瓶颈期时长 | ✅ | 综合分前40%学生中 logical_coherence_trend < 60 的比例代理 |
+| **B9** | 反馈采纳群体倾向 | ✅ | feedback_response_depth 分布统计（高/中/低采纳比例） |
+| **B10** | 任务完成韧性 | ✅ | sm2_retention_rate + long_term_memory_robustness 综合代理 |
+
+> **✅ 已落地**：`ClassDailySnapshot` 自动生成逻辑已接入 `generate_all_daily_summaries_task` 每日任务（`backend_fastapi/app/application/analytics/class_snapshot.py`）。
+
+#### 4.1.3 学生窗口级纵向总结与分析产物（已落实）
+
+当前教师端 analytics 不再只停留在 `StudentDailySummary` 单表，而是扩展为三层持久化主线：
+
+| 模型 | 角色 | 当前用途 |
+|------|------|----------|
+| `StudentDailySummary` | 每日客观摘要 | 当天状态、图表、分层分析起点 |
+| `StudentLongitudinalSummary` | 学生窗口级 LLM 纵向总结 | 学生近 `N` 天趋势总结、风险/优势标签、证据片段 |
+| `AnalyticsArtifact` | 通用文本型分析产物 | 班级近况分析、Agent报告、周报、分班变更记录 |
+
+**当前真实链路**：
+
+```text
+StudentDailySummary（日客观指标）
+  -> StudentLongitudinalSummary（近N天学生纵向总结，入DB + 可选RAG）
+  -> Agent-1/2/3（读取纵向总结、历史风险、干预结果）
+  -> AnalyticsArtifact（agent_report / class_window_analysis / weekly_report）
+```
+
+**证据策略**：
+- **数据库为主存**：所有教师可读结论均先写 DB。
+- **Elasticsearch 为可选索引**：`backend_fastapi/app/infrastructure/persistence/search/analytics_rag.py`
+- **ES 不可用时优雅降级**：回退到 DB 中的 `StudentLongitudinalSummary` 和 `AnalyticsArtifact` 检索。
+
+#### 4.1.4 班级归属与脏数据治理（已落实）
+
+当前 analytics 的班级语义以 `StudentProfile.class_id` 为**主真相源**，并通过同步层灌入下游表：
+
+- `StudentProfile.class_id`：学生归班主字段
+- `StudentDailySummary.class_id`：当天摘要过滤与班级看板
+- `StudentLongitudinalSummary.class_id`：纵向总结窗口归属
+- `InterventionTask.class_id`：干预任务归属
+- `AnalyticsArtifact.class_id`：班级分析、周报、分班变更证据
+
+**新增治理能力**：
+- 教师端可直接进行**分班/调班**
+- 支持遗留数据 `class_id` **回填脚本**
+- 调班时会同步修正相关 analytics 表，并在 `AnalyticsArtifact` 中留下 `class_assignment_change` 记录
+- 若发现同一学生同一窗口存在“旧 `class_id` 记录”和“新 `class_id` 记录”，同步层会做谨慎合并，避免简单覆盖
+
+### 4.2 三层Agent分层干预（已落实，并已接入纵向上下文）
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                          教师端数据分析                                      │
+│                        分层分析引擎（Agent-1/2/3）                           │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  综合分计算（基于5个可用维度加权平均）                                        │
+│  ├── vocab_growth_rate × 20                                                │
+│  ├── sm2_retention_rate × 100                                              │
+│  ├── grammar_error_decay_slope × 10 + 50（截断到非负）                      │
+│  ├── logical_coherence_trend（原始值）                                      │
+│  └── semantic_accuracy_trend（原始值）                                      │
+│                                                                             │
+│  分层比例：底层20% / 中层60% / 顶层20%                                       │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Agent-1 BottomTierAgent（底层托底）                                │   │
+│  │  • 风险：vocab_growth_rate < 2.0 → "基础词汇掌握薄弱"               │   │
+│  │  • 风险：learning_stability_std > 2.0 → "学习行为波动大"            │   │
+│  │  • 风险：response_latency_avg_ms > 3000 → "对话响应异常迟缓"        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Agent-2 MiddleTierAgent（中层突破）                                │   │
+│  │  • 进步信号：grammar_error_decay_slope > 0.5 → 进步学生             │   │
+│  │  • 瓶颈信号：logical_coherence_trend < 60 → 瓶颈期学生              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  Agent-3 TopTierAgent（顶层突破）                                     │   │
+│  │  • 风险：autonomous_drive_count < 2 → "自主探索行为不足"            │   │
+│  │  • 风险：topic_coverage_breadth < 5 → "主题覆盖广度有限"            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  上下文增强：每个学生会先生成 StudentLongitudinalSummary                   │
+│  • 输入不再只看当天 StudentDailySummary                                   │
+│  • 还会补充纵向风险标签、亮点标签、近期证据切片                           │
+│                                                                             │
+│  持久化：                                                                   │
+│  • InterventionTask：干预任务                                              │
+│  • AnalyticsArtifact(artifact_type=agent_report)：分层结论                 │
+│                                                                             │
+│  LLM增强：`_llm_enhance_insights()` 将硬编码洞察转化为教师友好语言          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 4.3 干预任务管理（已落实）
+
+**InterventionTask 模型**：
+- 状态流转：`pending → active → resolved/dismissed`
+- 优先级：`low/normal/high/critical`
+- 来源：`bottom/middle/top/manual`
+
+### 4.4 班级周报与班级近况分析（已落实）
+
+当前班级侧不是单一“周报生成器”，而是两条并行产线：
+
+- `class_window_analysis`：最近 `3/5/7` 天班级近况分析
+- `weekly_report`：班级周报
+
+**班级近况分析真实流程**：
+```text
+班级窗口内 StudentDailySummary 聚合
+  -> 拉取窗口内学生 StudentLongitudinalSummary
+  -> 检索历史证据（优先 ES，失败回退 DB）
+  -> 生成班级近况总结
+  -> 写入 AnalyticsArtifact(artifact_type=class_window_analysis)
+```
+
+**周报真实流程**：
+```text
+班级数据聚合(DB)
+  + 学生纵向总结(StudentLongitudinalSummary)
+  + 历史分析产物(AnalyticsArtifact / RAG证据)
+  -> LLM生成教师可读周报
+  -> 写入 AnalyticsArtifact(artifact_type=weekly_report)
+```
+
+**设计原则**：
+- 客观聚合尽量前置在程序侧完成
+- LLM 负责教师可读总结，而不是替代全部统计逻辑
+- 周报与近况分析都以 DB 为主存，RAG 只是检索增强
+
+### 4.5 教师端API（已落实，RBAC控制，兼容层已保留）
+
+| 接口 | 方法 | 说明 | 权限 |
+|------|------|------|------|
+| `/api/v1/analytics/class/{id}/dashboard` | GET | 班级统一聚合接口（overview + students + 可选weekly） | TEACHER/ADMIN |
+| `/api/v1/analytics/student/{id}/dashboard` | GET | 学生统一聚合接口（profile + report） | TEACHER/ADMIN |
+| `/api/v1/analytics/class/{id}/overview` | GET | 班级总览（能力分布饼图、7日趋势折线图） | TEACHER/ADMIN |
+| `/api/v1/analytics/class/{id}/students` | GET | 学生列表（带风险标签、综合评分） | TEACHER/ADMIN |
+| `/api/v1/analytics/student/{id}/profile` | GET | 学生画像（20维度雷达图、趋势折线图） | TEACHER/ADMIN |
+| `/api/v1/analytics/student/{id}/report` | GET | 学生分析报告（Agent-1/2/3输出） | TEACHER/ADMIN |
+| `/api/v1/analytics/class-assignments` | GET | 教师查看学生分班情况 | TEACHER/ADMIN |
+| `/api/v1/analytics/student/{id}/class-assignment` | POST | 教师分班/调班，并同步修正相关 analytics 数据 | TEACHER/ADMIN |
+| `/api/v1/analytics/intervention` | POST | 创建干预任务 | TEACHER/ADMIN |
+| `/api/v1/analytics/class/{id}/weekly` | GET | 班级周报 | TEACHER/ADMIN |
+| `/api/v1/analytics/student/{id}/llm-profile` | POST | 主动触发LLM深度画像 | TEACHER/ADMIN |
+
+**接口收敛原则**：
+- 新页面优先使用 `dashboard` 统一接口，减少前端多次拼装
+- 原有 `overview/profile/report/students/weekly` 接口继续保留，作为兼容层
+- 路由层不再承担主要业务编排，主要由 `backend_fastapi/app/application/analytics/facade.py` 收口
+
+### 4.6 Celery异步定时任务（已落实）
+
+| 任务 | 调度 | 队列 | 说明 |
+|------|------|------|------|
+| `generate_all_daily_summaries_task` | 每日凌晨 | `batch_tasks` | 为所有学生生成20维度摘要 |
+| `run_tiered_analysis_task` | 每日凌晨 | `batch_tasks` | 运行三层Agent分析并生成干预任务 |
+| `generate_class_weekly_report_task` | 每周日凌晨 | `batch_tasks` | 生成班级周报 |
+
+### 4.7 数据可视化（已落实）
+
+- **学生侧**：
+  - 20维度雷达图
+  - 当天 vs 窗口均值柱状图
+  - 核心趋势 / 状态趋势折线图
+  - 纵向 LLM 总结 + Agent 报告
+- **班级侧**：
+  - 能力分布饼图
+  - 风险分布柱状图
+  - 班级趋势折线图
+  - 班级能力雷达图
+  - 最近 `3/5/7` 天班级分析 + 周报
+- **ChartData结构**：与前端 `BaseChart.vue` 兼容
+
+### 4.8 数据分析与总结（当前落地 + 后续延伸）
+
+> 下图更多体现长期愿景；当前版本已落地的是“每日摘要 → 学生纵向总结 → Agent → 周报/班级近况分析”的闭环，但尚未把更广义的 prompt 管理、memory patch、RAG 注入完全并到同一套全局能力层。
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          教师端数据分析（设计愿景）                          │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  数据来源                                                                   │
@@ -536,100 +836,20 @@
 │  ┌─────────────────────────────────────────────────────────────────────┐  │
 │  │                      用户画像聚合引擎                                │  │
 │  │                                                                     │  │
-│  │  输入: 原始学习数据                                                  │  │
-│  │                                                                     │  │
-│  │  处理流程：                                                          │  │
+│  │  当前已落地处理流程：                                                │  │
 │  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                 │  │
-│  │  │  数据清洗   │──►│  特征工程   │──►│  画像建模   │                 │  │
-│  │  │             │  │             │  │  (DKT+规则) │                 │  │
+│  │  │  数据清洗   │──►│  特征工程   │──►│ 日摘要/窗口总结│               │  │
+│  │  │             │  │             │  │  (规则+LLM)  │                 │  │
 │  │  └─────────────┘  └─────────────┘  └──────┬──────┘                 │  │
 │  │                                           │                        │  │
 │  │                                           ▼                        │  │
-│  │  输出: 用户画像向量                                                  │  │
+│  │  当前输出: 教师可读分析对象                                           │  │
 │  │  {                                                                  │  │
-│  │    "user_id": "U12345",                                             │  │
-│  │    "overall_level": "B1",                                           │  │
-│  │    "skill_levels": {                                                │  │
-│  │      "listening": 0.75,                                             │  │
-│  │      "speaking": 0.68,                                              │  │
-│  │      "reading": 0.82,                                               │  │
-│  │      "writing": 0.70                                                │  │
-│  │    },                                                               │  │
-│  │    "weak_areas": ["past_tense", "business_vocabulary"],             │  │
-│  │    "strong_areas": ["daily_conversation", "reading_comprehension"], │  │
-│  │    "learning_style": "visual",                                      │  │
-│  │    "engagement_score": 0.85                                         │  │
+│  │    "daily_summary": {...},                                          │  │
+│  │    "longitudinal_summary": {...},                                   │  │
+│  │    "agent_reports": [...],                                          │  │
+│  │    "weekly_report": {...}                                           │  │
 │  │  }                                                                  │  │
-│  │                                                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                   │                                        │
-│                                   ▼                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                      横向总结 (班级/群体层面)                        │  │
-│  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│  │  │  班级整体能力分布                                            │   │  │
-│  │  │                                                             │   │  │
-│  │  │  听力:  ████████████████████░░░░░░░░  平均: 72分            │   │  │
-│  │  │  口语:  █████████████████░░░░░░░░░░░  平均: 65分 ⚠️         │   │  │
-│  │  │  阅读:  █████████████████████░░░░░░░  平均: 78分            │   │  │
-│  │  │  写作:  ██████████████████░░░░░░░░░░  平均: 70分            │   │  │
-│  │  │                                                             │   │  │
-│  │  │  共性薄弱点:                                                │   │  │
-│  │  │  1. 过去时态使用 (67%学生存在问题)                           │   │  │
-│  │  │  2. 商务词汇量不足 (54%学生)                                 │   │  │
-│  │  │  3. 连读和弱读 (口语普遍问题)                                │   │  │
-│  │  │                                                             │   │  │
-│  │  │  建议教学重点:                                              │   │  │
-│  │  │  • 增加过去时态专项练习                                      │   │  │
-│  │  │  • 引入商务英语词汇模块                                      │   │  │
-│  │  │  • 加强语音训练                                              │   │  │
-│  │  └─────────────────────────────────────────────────────────────┘   │  │
-│  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│  │  │  学习活跃度分析                                              │   │  │
-│  │  │                                                             │   │  │
-│  │  │  高活跃用户: 15人 (30%)  │  平均学习时长: 45分钟/天         │   │  │
-│  │  │  中等用户: 25人 (50%)    │  平均学习时长: 20分钟/天         │   │  │
-│  │  │  低活跃用户: 10人 (20%)  │  平均学习时长: 5分钟/天 ⚠️       │   │  │
-│  │  │                                                             │   │  │
-│  │  │  流失风险用户: 3人 (需关注)                                  │   │  │
-│  │  └─────────────────────────────────────────────────────────────┘   │  │
-│  │                                                                     │  │
-│  └─────────────────────────────────────────────────────────────────────┘  │
-│                                   │                                        │
-│                                   ▼                                        │
-│  ┌─────────────────────────────────────────────────────────────────────┐  │
-│  │                      纵向总结 (个人进步追踪)                         │  │
-│  │                                                                     │  │
-│  │  学生: 张三                                                          │  │
-│  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│  │  │  能力进步曲线 (近3个月)                                      │   │  │
-│  │  │                                                             │   │  │
-│  │  │  总分:  65 ────────► 72 ────────► 78  (+13分) ✅            │   │  │
-│  │  │  听力:  70 ────────► 75 ────────► 80  (+10分)               │   │  │
-│  │  │  口语:  58 ────────► 65 ────────► 70  (+12分) ✅            │   │  │
-│  │  │  阅读:  72 ────────► 78 ────────► 82  (+10分)               │   │  │
-│  │  │  写作:  60 ────────► 68 ────────► 75  (+15分) ✅            │   │  │
-│  │  │                                                             │   │  │
-│  │  │  显著进步领域: 写作 (+15分), 口语 (+12分)                    │   │  │
-│  │  │  仍需加强: 语法准确性                                        │   │  │
-│  │  └─────────────────────────────────────────────────────────────┘   │  │
-│  │                                                                     │  │
-│  │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│  │  │  学习习惯分析                                                │   │  │
-│  │  │                                                             │   │  │
-│  │  │  最佳学习时段: 晚上8-10点                                    │   │  │
-│  │  │  偏好内容类型: 场景对话 > 词汇 > 作文                        │   │  │
-│  │  │  平均专注时长: 25分钟                                        │   │  │
-│  │  │  复习完成率: 85% (优秀)                                      │   │  │
-│  │  │                                                             │   │  │
-│  │  │  个性化建议:                                                │   │  │
-│  │  │  • 利用晚间高效时段安排难点学习                              │   │  │
-│  │  │  • 增加语法专项练习，目标：写作突破80分                      │   │  │
-│  │  └─────────────────────────────────────────────────────────────┘   │  │
-│  │                                                                     │  │
 │  └─────────────────────────────────────────────────────────────────────┘  │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -639,12 +859,12 @@
 
 ## 五、实时助教模块详细架构
 
-> **⚠️ 开发优先级: P0 (最后开发)**
+> **⚠️ 开发优先级: P0 (基础设施已就位，等待前端接入)**
 > 
 > **🎯 项目定位: 核心亮点与最高技术难度模块**
 > 
-> 实时助教系统是本项目的**最具创新性的功能**，也是**技术实现难度最高**的部分。
-> 建议在完成单词、作文、对话等核心学习模块后再投入开发。
+> 实时助教系统后端基础设施已落地（屏幕变化检测、智能触发决策、主动服务建议、WebSocket 通道）。
+> 前端教师端接入后可立即启用。
 > 
 > **难点说明:**
 > - 多模态实时融合 (屏幕+语音+行为)
@@ -653,7 +873,13 @@
 > - 前端超轻量模型部署 (WebGL/ONNX)
 > - Token成本控制 (五级筛选机制)
 
-### 5.1 整体架构
+### 5.1 整体架构（后端基础设施已落地）
+
+> **实现状态**：
+> - `ScreenChangeDetector` ✅ (`backend_fastapi/app/domain/realtime_assistant/screen_detector.py`)
+> - `SmartTriggerEngine` ✅ (`backend_fastapi/app/domain/realtime_assistant/trigger_engine.py`)
+> - `ProactiveSuggestionEngine` ✅ (`backend_fastapi/app/domain/realtime_assistant/suggestion_engine.py`)
+> - WebSocket 通道 `/api/v1/realtime-assistant/ws` ✅ (`backend_fastapi/app/interfaces/realtime_assistant_router.py`)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -723,7 +949,7 @@
 │   │  │              多模态融合处理流程                              │   │  │
 │   │  │                                                             │   │  │
 │   │  │  输入1: 屏幕截图 (来自前端视频流)                            │   │  │
-│   │  │  输入2: ASR识别的教师语音文本 (faster-whisper)               │   │  │
+│   │  │  输入2: ASR识别的教师语音文本 (SeamlessM4T)                 │   │  │
 │   │  │  输入3: 历史上下文 (本地Redis)                               │   │  │
 │   │  │                                                             │   │  │
 │   │  │  ┌─────────────────────────────────────────────────────┐    │   │  │
@@ -731,14 +957,14 @@
 │   │  │  │                                                     │    │   │  │
 │   │  │  │  • 模型: Kimi K2.5 (统一多模态模型)                │    │   │  │
 │   │  │  │  • 输入: 课件截图 + 教师语音转写 + 历史上下文        │    │   │  │
-│   │  │  │  • 输出: 结构化助教建议                             │    │   │  │
+│   │  │  │  • 输出: JSON 结构化决策                             │    │   │  │
+│   │  │  │    (should_intervene / content / use_tts / urgency)  │    │   │  │
 │   │  │  │                                                     │    │   │  │
-│   │  │  │  Prompt: "你是一位英语教学助教，基于当前课件内容     │    │   │  │
-│   │  │  │  和教师讲解，为教师提供实时教学建议：                │    │   │  │
-│   │  │  │  1. 当前知识点的补充说明                            │    │   │  │
-│   │  │  │  2. 学生可能产生的疑问及解答思路                    │    │   │  │
-│   │  │  │  3. 相关例句或拓展知识                              │    │   │  │
-│   │  │  │  4. 教学技巧提示"                                   │    │   │  │
+│   │  │  │  Prompt核心原则: "无感、非侵入"                     │    │   │  │
+│   │  │  │  - LLM 判断当前是否需要介入 (should_intervene)      │    │   │  │
+│   │  │  │  - 若不需要: 返回静默，前端无感知                   │    │   │  │
+│   │  │  │  - 若需要: 返回简短口语化建议 + use_tts 标记        │    │   │  │
+│   │  │  │  - 默认不播报，仅当 LLM 显式 use_tts=true 才 TTS   │    │   │  │
 │   │  │  │                                                     │    │   │  │
 │   │  │  └─────────────────────────────────────────────────────┘    │   │  │
 │   │  └─────────────────────────────────────────────────────────────┘   │  │
@@ -746,15 +972,16 @@
 │   │                              │ Kimi API返回助教建议                  │  │
 │   │                              ▼                                      │  │
 │   │  ┌─────────────────────────────────────────────────────────────┐   │  │
-│   │  │              语音合成与播放 (返回给教师)                     │   │  │
+│   │  │              语音合成与播放 (条件触发)                       │   │  │
 │   │  │                                                             │   │  │
 │   │  │  ┌─────────────┐  ┌─────────────┐                          │   │  │
-│   │  │  │  本地XTTS   │  │  WebSocket  │                          │   │  │
-│   │  │  │ • 语音合成  │──►│ • 推送到    │                          │   │  │
-│   │  │  │ • 流式输出  │  │   教师前端  │                          │   │  │
+│   │  │  │  本地Kokoro │  │  WebSocket  │                          │   │  │
+│   │  │  │ • 条件合成  │──►│ • 推送到    │                          │   │  │
+│   │  │  │   (仅当LLM  │  │   教师前端  │                          │   │  │
+│   │  │  │   指定TTS)  │  │             │                          │   │  │
 │   │  │  └─────────────┘  └─────────────┘                          │   │  │
 │   │  │                                                             │   │  │
-│   │  │  【注意】所有输出仅返回给教师，学生端无感知                 │   │  │
+│   │  │  【注意】默认静默显示，声音打断需 LLM 显式授权               │   │  │
 │   │  └─────────────────────────────────────────────────────────────┘   │  │
 │   │                                                                     │  │
 │   └─────────────────────────────────────────────────────────────────────┘  │
@@ -1009,7 +1236,7 @@ while True:
 │  │                              │                                     │   │
 │  │                              ▼                                     │   │
 │  │   ┌─────────────────────────────────────────────────────────────┐  │   │
-│  │   │              XTTS语音合成 → 教师本地播放                     │  │   │
+│  │   │              Kokoro语音合成 → 教师本地播放                   │  │   │
 │  │   └─────────────────────────────────────────────────────────────┘  │   │
 │  │                                                                     │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
@@ -1999,7 +2226,7 @@ class ProactiveSuggestionEngine:
     
     async def _generate_tts(self, text: str) -> bytes:
         """生成TTS音频"""
-        # 调用XTTS或其他TTS服务
+        # 调用 Kokoro / Edge-TTS / silence 兜底链
         return b""
 
 # 使用示例
@@ -2080,8 +2307,8 @@ async def simulate():
 │  │                     本地AI服务 (5080 GPU)                            │   │
 │  │  ┌──────────┐  ┌──────────┐  ┌──────────┐                          │   │
 │  │  │  ASR     │  │  TTS     │  │ 小LLM   │                          │   │
-│  │  │(faster-  │  │ (XTTS)   │  │(9B模型) │                          │   │
-│  │  │ whisper) │  │          │  │         │                          │   │
+│  │  │(Seamless │  │(Kokoro/  │  │(9B模型) │                          │   │
+│  │  │   M4T)   │  │ Edge兜底)│  │         │                          │   │
 │  │  └──────────┘  └──────────┘  └──────────┘                          │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                    │                                        │
@@ -2089,8 +2316,9 @@ async def simulate():
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
 │  │                     云端AI服务 (Kimi API)                            │   │
 │  │  ┌─────────────────────────────────────────────────────────────┐   │   │
-│  │  │  Kimi K2.5 (多模态)                                         │   │   │
-│  │  │  • 词库生成  • 作文分析  • 对话回复  • 课件理解(VLM)        │   │   │
+│  │  │  Kimi K2.5 / OpenAI兼容云模型                               │   │   │
+│  │  │  • 词库生成  • 作文分析  • 场景扩写                         │   │   │
+│  │  │  • 教师端纵向总结/周报/班级分析（按路由选择）              │   │   │
 │  │  └─────────────────────────────────────────────────────────────┘   │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
@@ -2101,31 +2329,66 @@ async def simulate():
 
 ## 七、平台级能力深化（工程落地）
 
-### 7.1 模型路由（Model Routing）
+### 7.1 模型路由（Model Routing）✅ 已落地
 
-#### 目标
-- 在成本、时延、质量三者之间动态平衡。
-- 将请求按任务类型路由到最优模型：本地小模型优先，复杂任务走云端大模型。
+#### 7.1.1 实现概览
 
-#### 路由矩阵
+**核心文件**：`backend_fastapi/app/model_router.py` (~900行)
 
-| 任务类型 | 默认模型 | 回退模型 | 触发条件 |
-|---|---|---|---|
-| 场景扩写 | 本地小LLM (9B) | Kimi K2.5 | 本地超时或质量评分低 |
-| 实时口语纠错 | 本地小LLM + 规则引擎 | Kimi K2.5 | 连续2轮纠错置信度低 |
-| 作文深度分析 | OCR文本 + Kimi K2.5 | 本地规则评分 | OCR置信度达标且外部API可用 |
-| 课件理解 | Kimi K2.5 | OCR + 规则问答 | Token预算不足或限流 |
-| 词库批量生成 | Kimi K2.5 | 本地模板生成 | 夜间离线任务失败重试 |
+**已实现的场景类型**：
 
-#### 路由流程图
+| 场景 | 枚举值 | 默认模型 | Temperature | 说明 |
+|------|--------|----------|-------------|------|
+| 对话执行 | `chat` | 本地Qwen3.5-9B | 0.7 | 实时低延迟 |
+| 词汇生成 | `vocab` | Kimi API | 0.7 | 结构化JSON输出 |
+| 作文批改 | `essay` | Kimi API | 0.5 | 稳定评分 |
+| 场景扩写 | `scenario_expansion` | Kimi API | 0.9 | 高创造性 |
+
+#### 7.1.2 路由决策与故障切换
+
+```python
+class ModelRouter:
+    SCENE_PROVIDER_MAP = {
+        SceneType.CHAT: ModelProvider.LOCAL,      # → 本地Qwen
+        SceneType.VOCAB: ModelProvider.KIMI,      # → Kimi API
+        SceneType.ESSAY: ModelProvider.KIMI,      # → Kimi API
+        SceneType.SCENARIO_EXPANSION: ModelProvider.KIMI,  # → Kimi API
+    }
+```
+
+**故障切换机制**：
+- 主端点失败 → 自动尝试fallback端点列表
+- 指数退避重试：3次重试，延迟序列 1s → 2s → 4s + 随机抖动
+- 全部失败时抛出 `RuntimeError`
+
+#### 7.1.3 场景扩写标准化（已落地）
+
+```python
+async def expand_scenario(user_description: str, language: str = "en") -> str:
+    # 1. 匹配场景库文化语境
+    scenario_library_context = _match_scenario_library(user_description, language)
+    # 2. Jinja2模板渲染扩写任务
+    prompt = render_prompt("scenario_expand_system_prompt.j2", ...)
+    # 3. Kimi API扩写
+    # 4. 标准化清理 + 强制追加场景锚定规则
+    normalized = _normalize_expanded_system_prompt(result, append_anchor_rule=True)
+    return normalized
+```
+
+**标准化处理**：
+- 提取 `<SYSTEM_PROMPT>` 标签内容
+- 清理代码块包裹和AI常见前导话术
+- 删除英文安抚短语（如 "I see what you mean", "Good try" 等）
+- 强制追加场景锚定强制规则（防止对话偏离场景）
+
+#### 7.1.4 路由流程图（已落地）
 
 ```mermaid
 flowchart TD
     A[请求进入 Router] --> B{任务类型}
-    B -->|实时低延迟| C[本地模型池]
-    B -->|深度推理| D[云端 Kimi K2.5]
-    B -->|视觉理解| E[云端 VLM]
-    C --> F{质量达标?}
+    B -->|chat| C[本地Qwen3.5-9B INT4]
+    B -->|vocab/essay/scenario_expansion| D[云端 Kimi API]
+    C --> F{成功?}
     F -->|是| G[返回结果]
     F -->|否| D
     D --> H{成功?}
@@ -2134,16 +2397,75 @@ flowchart TD
     I --> G
 ```
 
-#### 核心实现要点
-- 路由器输入特征：任务标签、上下文长度、预算、历史质量分、SLA等级。
-- 路由器输出：`model_id`、`max_tokens`、`timeout_ms`、`fallback_plan`。
-- 质量门控：通过自动评分器（格式合规率、事实一致性、语法改进率）判定是否升级模型。
-
 ---
 
-### 7.2 上下文管理（Context Management）
+### 7.2 上下文管理（Context Management）✅ 已落地
 
-#### 分层记忆设计
+#### 7.2.1 实现概览
+
+**核心文件**：`backend_fastapi/app/model_router.py` + `backend_fastapi/app/context_store.py`
+
+**ConversationContext 核心参数**：
+- `max_messages = 20`：对话链路的**次级保护上限**
+- `max_tokens = 4000`：上下文Token上限
+- `token_threshold = 0.8`：**主触发条件**，超过后自动压缩
+
+> **实现现状说明**：
+> - 当前 `model_router.py` 里并不是“到了20轮才压缩”，而是**优先按 token 阈值压缩**
+> - `20轮` 只是防止极端长对话导致消息对象无限增长的附加边界
+> - 这套 `ConversationContext` 目前主要服务于**语音/对话主链**
+> - 教师端 analytics 已先落成一套独立的 `orchestration + facade`，还**没有**和语音主链完全合并成单一全局 context layer
+
+#### 7.2.2 滑动窗口与自动压缩
+
+```python
+class ConversationContext:
+    def add_message(self, role: str, content: str, token_count: int = 0):
+        # 自动计算token数
+        if token_count == 0 and content:
+            token_count = count_tokens(content)
+        # 保留system消息 + 最近N轮
+        max_total = self.max_messages * 2
+        if len(self.messages) > max_total:
+            system_msgs = [m for m in self.messages if m.role == "system"]
+            other_msgs = [m for m in self.messages if m.role != "system"]
+            other_msgs = other_msgs[-(max_total - len(system_msgs)):]
+            self.messages = system_msgs + other_msgs
+
+    def compress_if_needed(self) -> bool:
+        if self.get_total_tokens() > self.max_tokens * self.token_threshold:
+            compressed = compress_messages(self.to_openai_messages(), self.max_tokens)
+            # 重建消息列表
+            self.messages = []
+            for msg in compressed:
+                self.add_message(msg["role"], msg["content"])
+            return True
+        return False
+```
+
+#### 7.2.3 持久化存储（已落地）
+
+| 存储后端 | 优先级 | TTL | 说明 |
+|----------|--------|-----|------|
+| Redis | 优先 | 7天 | 快速读写，服务重启后恢复 |
+| SQLite (ConversationEvent表) | 回退 | 长期 | 现有表结构复用 |
+
+**自动恢复**：服务重启后 `get_or_create_context(load_from_store=True)` 自动从存储加载历史对话。
+
+#### 7.2.4 当前边界与下一步统一方向
+
+- **已落地**：
+  - 对话链路：`model_router.py` 的 `ConversationContext`
+  - analytics 链路：`backend_fastapi/app/application/analytics/orchestration.py`
+  - analytics 聚合入口：`backend_fastapi/app/application/analytics/facade.py`
+- **尚未完全统一**：
+  - prompt 模板管理
+  - 用户请求整合
+  - memory patch
+  - RAG 注入
+  - 语音链路与 analytics 链路共享的单一 orchestration/context layer
+
+#### 7.2.5 分层记忆设计（规划）
 
 | 层级 | 保存内容 | 存储介质 | TTL |
 |---|---|---|---|
@@ -2151,78 +2473,77 @@ flowchart TD
 | 任务记忆 | 当前课次任务目标、评分中间结果 | PostgreSQL JSONB | 7天 |
 | 长期学习记忆 | 用户画像、薄弱点趋势 | PostgreSQL + 向量库 | 长期 |
 
-#### 窗口压缩策略
-- 滑动窗口：固定保留最近 $k$ 轮。
-- 摘要压缩：每满 $m$ 轮生成结构化摘要并替换历史明细。
-- 关键事实锚点：把用户目标、禁忌词、水平等级作为不可丢失字段。
-
-#### 上下文组装顺序
-1. 系统策略与安全约束。
-2. 当前任务配置（场景、难度、目标）。
-3. 最近对话窗口。
-4. 历史摘要。
-5. RAG检索片段。
-
 ---
 
-### 7.3 Prompt管理（Prompt Management）
+### 7.3 Prompt管理（Prompt Management）✅ 部分落地
 
-#### Prompt资产化
-- 使用`prompt_registry`表管理版本：`prompt_key`、`version`、`owner`、`ab_bucket`。
-- 按能力拆模板：查词、作文批改、场景扩写、实时助教提示。
-- 禁止硬编码：服务只读取已发布版本。
+#### 7.3.1 已落地实现
 
-#### 生命周期
-```mermaid
-flowchart LR
-    A[草稿] --> B[评审]
-    B --> C[离线评测]
-    C --> D[A/B灰度]
-    D --> E[全量发布]
-    E --> F[监控回收]
+**模板引擎**：Jinja2（`backend_fastapi/app/prompts.py`）
+
+**已配置的Prompt模板**：
+- `scenario_expand_system_prompt.j2`：场景扩写任务（支持文化语境注入）
+- 词汇生成、作文批改Prompt：当前仍主要在 `model_router.py`/相关调用链内联
+- analytics 纵向总结、班级近况分析、周报 Prompt：当前位于 `backend_fastapi/app/application/analytics/orchestration.py` 与 `weekly_report.py`
+
+**场景扩写Prompt结构**：
+```
+System: "你是有着对于各种场景广泛且深入理解的AI人机场景对话提示词工程专家"
+User: [Jinja2渲染的扩写任务，含用户描述+语言+场景库文化语境]
+Output: 标准化System Prompt（经 _normalize_expanded_system_prompt 处理）
 ```
 
-#### 质量指标
-- 结构化输出通过率。
-- 用户二次追问率（越低越好）。
-- 作文建议采纳率。
-- 对话中断率。
+#### 7.3.2 Prompt资产化（已落地）
+
+- **模型**：`PromptRegistry`（`backend_fastapi/app/domain/prompt_management/models.py`）
+- **表字段**：`prompt_key`、`version`、`owner`、`ab_bucket`、`system_prompt`、`user_template`、`variables`、`scene_type`、`temperature`、`max_tokens`、`metrics`、`is_published`、`is_deprecated`
+- **服务层**：`PromptManager` 提供 CRUD + 版本自动递增 + 发布/废弃（`backend_fastapi/app/domain/prompt_management/service.py`）
+- **API**：`POST/GET /api/v1/prompts` 等路由已注册（`backend_fastapi/app/interfaces/prompt_registry_router.py`）
+- **原则**：业务层禁止硬编码 Prompt，优先读取已发布版本。
+
+#### 7.3.3 质量指标（已预留字段）
+- `PromptRegistry.metrics` 支持回填：结构化输出通过率、用户二次追问率、作文建议采纳率、对话中断率。
 
 ---
 
 ### 7.4 前后端实时通信与状态同步
 
-#### 实时通信协议
-- 首选：WebSocket（Socket.io）。
-- 回退：SSE（只读推送）。
-- 音频通道：WebRTC（课堂低延迟语音）。
+#### 实时通信协议（按当前代码真实情况）
+- 主链路：原生 WebSocket `GET /ws/v1`
+- 消息形态：事件流 + 序号 + `request_id`
+- HTTP 辅助接口：登录、词汇、作文、teacher analytics、模型路由配置等
+- 当前代码中**没有** Socket.io 主链、也没有落地 WebRTC 音频通道
 
 #### 事件模型
 
 | 事件 | 方向 | 说明 |
 |---|---|---|
-| `lesson.join` | 前端->后端 | 进入课堂 |
-| `asr.partial` | 后端->前端 | 实时转写片段 |
-| `assistant.hint` | 后端->前端 | 助教提示 |
-| `essay.done` | 后端->前端 | 作文批改完成 |
-| `state.patch` | 双向 | 增量状态同步 |
+| `TASK_STARTED` | 后端->前端 | 请求开始 / 连接建立 |
+| `CONTEXT_SET` | 双向 | 设置会话级 system prompt / language |
+| `CONTEXT_PATCH` / `CONTEXT_PATCHED` | 双向 | 增量更新上下文 |
+| `ASR_PARTIAL` / `ASR_FINAL` | 后端->前端 | 实时/最终转写 |
+| `LLM_TOKEN` / `LLM_RESULT` | 后端->前端 | 流式 token / 最终文本 |
+| `TTS_CHUNK` / `TTS_RESULT` | 后端->前端 | TTS 分块 / 最终音频结果 |
+| `TASK_FINISHED` | 后端->前端 | 单次任务完成 |
+| `TEXT` | 前端->后端 | 文本回合输入 |
 
 #### 状态同步策略
-- 前端状态机：`idle -> connecting -> synced -> degraded -> recovering`。
-- 后端采用事件溯源（Event Sourcing）+ 幂等补丁（Patch ID）。
-- 断线恢复：客户端携带`last_event_id`请求补发。
+- 后端通过 `ConversationEvent` 持久化关键事件，按 `conversation_id + seq` 做恢复
+- 客户端可携带 `last_seq` 重连，服务端补发缺失事件
+- `CONTEXT_SET`/`CONTEXT_PATCH` 用于会话状态同步
+- `USER_MESSAGE` / `AI_MESSAGE` 为新主记录；若历史缺失，恢复逻辑会兼容旧 `ASR_FINAL` / `LLM_RESULT`
 
 ```mermaid
 sequenceDiagram
-    participant FE as Frontend
-    participant RT as Realtime Gateway
-    participant BE as Backend
-    FE->>RT: connect(jwt, nonce, client_version)
-    RT->>BE: validate session
-    BE-->>RT: ok + session_state_version
-    RT-->>FE: connected + snapshot
-    FE->>RT: ack(last_event_id)
-    RT-->>FE: patch events delta
+    participant FE as Frontend/Electron
+    participant WS as /ws/v1
+    participant DB as ConversationEvent
+    FE->>WS: connect(session_id, conversation_id, last_seq)
+    WS->>DB: load missed events if last_seq exists
+    WS-->>FE: TASK_STARTED + replay delta
+    FE->>WS: CONTEXT_SET / TEXT / AUDIO
+    WS-->>FE: ASR_* / LLM_* / TTS_* / TASK_FINISHED
+    WS->>DB: persist key events
 ```
 
 ---
@@ -2503,10 +2824,10 @@ sequenceDiagram
 |----------|--------|----------|----------|------------|----------|
 | BERT-Base | 110M | ~15ms | ~8ms | 32样本/批 | CPU |
 | BERT-Large | 340M | ~45ms | ~22ms | 16样本/批 | CPU |
-| Whisper-Base | 74M | ~80ms | ~45ms | 音频分段 | **CPU** |
-| Whisper-Small | 244M | ~200ms | ~120ms | 音频分段 | CPU/GPU |
+| SeamlessM4T-Small | - | ~200ms | ~120ms | 音频分段 | **CPU** |
+| SeamlessM4T-Medium | - | ~350-500ms | ~200ms | 音频分段 | **CPU** |
 | PaddleOCR | - | ~100ms | - | 单图 | **CPU** |
-| Silero VAD | - | ~10ms | - | 流式 | **CPU** |
+| webrtcvad + 能量阈值 | - | ~10ms | - | 流式 | **CPU** |
 | YOLOv8n | 3.2M | ~5ms | ~3ms | 16帧/批 | CPU |
 
 **关键优化点**:
@@ -2788,14 +3109,13 @@ sequenceDiagram
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
 │  ┌─────────────────────────────────────────────────────────────────────┐   │
-│  │  XTTS (语音合成)          8GB (50%)    FP16    常驻                 │   │
 │  │  Qwen3.5-9B (LLM/VLM)     7GB (43.75%) INT4    常驻                 │   │
-│  │  预留/KV Cache            1GB (6.25%)          工作空间             │   │
+│  │  预留/KV Cache            9GB (56.25%)          工作空间/峰值缓冲    │   │
 │  └─────────────────────────────────────────────────────────────────────┘   │
 │                                                                             │
 │  关键策略:                                                                  │
 │  • OCR/ASR/VAD 全部走CPU，不占用GPU显存                                    │
-│  • XTTS与LLM串行使用GPU，避免显存溢出                                      │
+│  • TTS 默认走 Kokoro CPU，本地 GPU 专注 LLM/VLM 推理                        │
 │  • 作文批改、查词补全、对话、实时助教统一使用Qwen3.5-9B                     │
 │                                                                             │
 └─────────────────────────────────────────────────────────────────────────────┘
@@ -2806,8 +3126,8 @@ sequenceDiagram
 | 任务 | 模型 | 延迟 | 线程占用 | 3D V-Cache利用 |
 |------|------|------|----------|----------------|
 | **OCR** | PaddleOCR | ~100ms | 4-8线程 | 缓存热数据 |
-| **ASR** | faster-whisper base | ~200ms | 8-16线程 | 缓存模型权重 |
-| **VAD** | Silero VAD | ~10ms | 2-4线程 | - |
+| **ASR** | SeamlessM4T small/medium | ~200-500ms | 8-16线程 | 缓存模型权重 |
+| **VAD** | webrtcvad + 能量阈值兜底 | ~10ms | 2-4线程 | - |
 | **图像处理** | 哈希/ROI检测 | ~20ms | 2-4线程 | - |
 | **ES/Neo4j** | 搜索查询 | ~10ms | 4-8线程 | - |
 | **语料库** | LanguageTool | ~50ms | 2-4线程 | - |
@@ -2818,25 +3138,24 @@ sequenceDiagram
 
 | 任务 | 模型 | 显存 | 算力占用 | 延迟 |
 |------|------|------|----------|------|
-| **TTS** | XTTS v2 | 8GB | ~30% | 首句1.0-1.3s |
+| **TTS** | 无常驻 GPU TTS | 0GB | ~0% | 由 CPU Kokoro 承担 |
 | **LLM/VLM** | Qwen3.5-9B INT4 | 7GB | ~40% | TTFT 130ms |
-| **峰值** | 串行使用 | 15GB | ~70% | - |
+| **峰值** | 单模型常驻 | 7GB | ~40% | 余量充足 |
 
-**注意**: TTS(8G) + LLM(7G) = 15GB < 16GB，可稳定运行
+**注意**: 当前主链路不再依赖 XTTS 常驻 GPU，16GB 显存压力显著下降，GPU 主要服务于 LLM/VLM。
 
-#### 8.6.4 XTTS在RTX 5080上的合成速度
+#### 8.6.4 Kokoro 在 CPU 主链路中的语音合成特性
 
 | 模式 | 实时率(RTF) | 首句延迟 | 质量 | 显存 |
 |------|-------------|----------|------|------|
-| 流式(句子级) | 0.5 | 1.0-1.3s | 高 | **8GB** |
-| 批量 | 0.3 | N/A | 高 | 8GB |
-| 低延迟模式 | 0.8 | 0.5s | 中 | 6GB |
+| 分块回放 | 接近实时 | 取决于整句先合成 | 高 | **0GB(GPU)** |
+| Edge 回退 | 受网络影响 | 中等 | 中高 | 0GB |
+| Silence 兜底 | 极快 | 极低 | 无语音内容 | 0GB |
 
 **实测数据**:
-- XTTS v2 Streaming Mode:
-  - Chinese: 1.17s 首句延迟
-  - English: 1.35s 首句延迟
-  - Japanese: 1.02s 首句延迟
+- Kokoro 优先本地 CPU 合成，适合对话主链路常驻运行
+- 当前瓶颈不是 GPU 显存，而是“整句先合成再分块发送”的首包等待
+- 后续若要继续优化，应优先做真流式 TTS，而不是回到 XTTS 高显存方案
 
 #### 8.6.5 Qwen3.5-9B在RTX 5080上的性能
 
@@ -2859,7 +3178,7 @@ sequenceDiagram
 | **查词(命中)** | ES查询 | - | - | <10ms |
 | **查词(未命中)** | - | 7GB | 40% | ~500ms |
 | **作文批改** | OCR+语料库 | 7GB | 40% | ~2-3s |
-| **对话** | ASR+VAD | 8GB→7GB | 30%→40% | ~500ms |
+| **对话** | ASR+VAD+TTS | 主要走CPU，GPU维持7GB | 约40% | ~500ms 到 1.2s |
 | **实时助教** | 筛选+OCR | 7GB→8GB | 40%→30% | ~800ms |
 
 ---
@@ -2873,7 +3192,7 @@ sequenceDiagram
 │                        优化决策树                                           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                             │
-│  问题: 16GB显存无法同时容纳 XTTS(8G) + Qwen2.5-7B(6G) + MiniCPM-V(4G)       │
+│  旧问题: 16GB显存无法同时容纳 XTTS(8G) + Qwen3.5-9B(7G) + MiniCPM-V(4G)      │
 │                                                                             │
 │  方案A: 动态加载 (切换模型)                                                  │
 │    ❌ 延迟高: 加载4-6GB模型需要2-3秒                                         │
@@ -2883,7 +3202,7 @@ sequenceDiagram
 │    ✅ Qwen3.5-9B INT4: 7GB显存                                               │
 │    ✅ 同时支持LLM和VLM功能                                                   │
 │    ✅ 无需切换，常驻显存                                                     │
-│    ✅ 与XTTS串行使用: 8GB + 7GB = 15GB < 16GB                               │
+│    ✅ 当前主链路已去除 XTTS 常驻依赖，GPU 压力进一步降低                     │
 │                                                                             │
 │  问题: ASR/OCR放哪里？                                                       │
 │                                                                             │
@@ -2892,7 +3211,7 @@ sequenceDiagram
 │                                                                             │
 │  方案B: CPU (推荐)                                                           │
 │    ✅ 9950X3D 128MB 3D V-Cache缓存模型                                       │
-│    ✅ faster-whisper base: ~200ms延迟可接受                                  │
+│    ✅ SeamlessM4T small/medium: ~200-500ms 延迟可接受                        │
 │    ✅ PaddleOCR: ~100ms延迟可接受                                            │
 │    ✅ GPU专注LLM/TTS，避免显存碎片                                           │
 │                                                                             │
@@ -2910,8 +3229,8 @@ sequenceDiagram
 | **PyTorch** | PyTorch | 2.5.0+ | CUDA 12.8 | - |
 | **TensorRT** | TensorRT | 10.5+ | Blackwell支持 | - |
 | **vLLM** | vLLM | 0.6.0+ | 推荐0.6.3 | Qwen3.5-9B |
-| **ASR** | **faster-whisper base** | 1.0.0+ | **CPU运行** | 不占用GPU |
-| **TTS** | **XTTS v2** | 2.0.0+ | 流式模式 | **8GB显存** |
+| **ASR** | **SeamlessM4T** | transformers 4.5x+ | **CPU运行** | 默认后端 |
+| **TTS** | **Kokoro** | 0.9.2+ | 本地优先/CPU实时 | **0GB显存** |
 | **OCR** | **PaddleOCR** | 2.7+ | **CPU运行** | 不占用GPU |
 | **LLM/VLM** | **Qwen3.5-9B INT4** | - | **常驻显存** | **7GB显存** |
 
@@ -2945,17 +3264,18 @@ sequenceDiagram
 | 环节 | 延迟上限 | 优化手段 | 运行位置 |
 |------|----------|----------|----------|
 | **音频采集** | 32ms | 16kHz, 512样本缓冲 | 设备 |
-| **VAD检测** | 10ms | Silero VAD | **CPU** |
-| **ASR推理** | 200ms | faster-whisper base | **CPU** |
+| **VAD检测** | 10ms | webrtcvad + 能量阈值兜底 | **CPU** |
+| **ASR推理** | 200-500ms | SeamlessM4T | **CPU** |
 | **文本处理** | 20ms | 并行处理 | CPU |
 | **LLM推理** | 300ms | Qwen3.5-9B INT4, 50 tokens | **GPU** |
-| **TTS合成** | 500ms | XTTS v2 流式首句 | **GPU** |
+| **TTS合成** | 500-1200ms | Kokoro 整句合成 + 分块回放 | **CPU** |
 | **音频播放** | 20ms | 低延迟输出 | 设备 |
-| **总计** | **< 800ms (端到端)** | - | - |
+| **总计** | **约 0.8s - 1.8s (语音端到端)** | - | - |
 
 **优化说明**:
-- ASR移至CPU: 节省2.5GB显存，延迟从150ms→200ms (可接受)
+- ASR维持CPU: 节省GPU显存，延迟保持在可接受区间
 - OCR移至CPU: 节省4GB显存，延迟从180ms→100ms (更快)
+- TTS维持CPU(Kokoro): 避免 XTTS 占用 8GB 显存
 - 统一LLM/VLM模型: 减少显存切换开销，避免2-3秒加载延迟
 
 #### 8.8.2 边云协同延迟预算
@@ -2967,17 +3287,17 @@ sequenceDiagram
 | **云端排队** | 50ms | 负载均衡 |
 | **云端推理** | 500ms | VLM深度理解 |
 | **响应返回** | 50ms | 流式输出 |
-| **总计** | **< 800ms** | 感知延迟优化 |
+| **总计** | **< 800ms（教师端文本建议）** | 感知延迟优化 |
 
 #### 8.8.3 各场景延迟目标
 
 | 场景 | 目标延迟 | 技术方案 |
 |------|----------|----------|
-| **实时对话** | < 500ms | 边侧全处理 |
+| **实时对话** | < 1.5s | 边侧全处理 |
 | **课件理解** | < 1s | 边云协同 |
 | **作文批改** | < 3s | 云端处理 |
-| **语音识别** | < 200ms | 边侧ASR |
-| **语音合成** | < 300ms | 流式TTS |
+| **语音识别** | < 500ms | 边侧 SeamlessM4T |
+| **语音合成** | < 1.2s | Kokoro 整句合成 + 分块回放 |
 | **实时助教** | < 800ms | 边云协同 (教师端→边侧→学生端) |
 
 ---
@@ -3047,16 +3367,19 @@ sequenceDiagram
     │──────────────────────────►│                           │
     │                           │  3.视频解码               │
     │                           │  4.三级筛选(哈希→ROI→OCR) │
-    │                           │  5.ASR (faster-whisper)   │
+│                           │  5.ASR (SeamlessM4T)      │
     │                           │                           │
     │                           │  6.触发条件满足? ────────► │
     │                           │                           │ 7.Kimi K2.5推理
     │                           │ ◄──────────────────────── │   统一处理
-    │                           │  8.助教建议文本           │
-    │                           │  9.XTTS语音合成           │
-    │  10.音频流                │                           │
+    │                           │  8.JSON决策(介入?/TTS?)  │
+    │                           │  9a. should_intervene=false│
+    │                           │      → 静默丢弃，前端无感知 │
+    │                           │  9b. should_intervene=true │
+    │                           │      & use_tts=true → Kokoro│
+    │  10.音频流(条件)          │      & use_tts=false→ 仅文本│
     │◄──────────────────────────│                           │
-    │  (教师本地播放)           │                           │
+    │  (教师本地播放/显示)      │                           │
     │                           │                           │
     │  【学生端无感知】          │                           │
 ```
@@ -3069,28 +3392,56 @@ sequenceDiagram
 | UI动画/鼠标移动 | 本地忽略 | - | - |
 | 课件变化(通过筛选) | **Kimi API** | Kimi K2.5 | <800ms |
 | 教师语音触发 | **Kimi API** | Kimi K2.5 LLM | <800ms |
-| 网络异常 | 本地规则引擎兜底 | - | <100ms |
+| 网络异常(非唤醒) | **静默失败** | - | <100ms |
+| 网络异常(唤醒请求) | 本地兜底TTS | - | <100ms |
 
 **设计原则**: 不区分简单/复杂场景，统一使用Kimi API保证助教质量，通过三级筛选减少无效调用。
+**新增原则**: LLM 拥有最终决策权——是否介入、是否TTS；默认静默，声音打断需LLM显式授权。
 
 ---
 
 ### 8.11 基于ASR的智能唤醒与主动服务机制
 
-#### 8.11.1 研究目标
+#### 8.11.1 唤醒词检测 — "Hi Helix / Hey Helix"
 
-基于ASR结果+关键词实现智能唤醒Kimi API，并在合适的时机无感地主动提供课堂服务建议。
+唤醒词定为 **"Hi Helix"** / **"Hey Helix"**，采用四层智能兜底策略，确保即使在 ASR 识别不完美时也能被唤醒：
 
-**核心问题**:
-1. 如何从连续的ASR流中识别"需要AI介入"的关键时刻
-2. 如何设计"无感"的主动服务，避免打断教学节奏
-3. 如何平衡响应及时性与服务相关性
+| 层级 | 匹配策略 | 示例 | 说明 |
+|------|----------|------|------|
+| L1 | 精确包含 | `hi helix` / `hey helix` | 不区分大小写，空格分隔 |
+| L2 | 音似容错 | `high helix` / `hay helix` / `hi heliks` | 编辑距离 ≤2 |
+| L3 | 分离匹配 | 同时包含 `helix` + `hi/hey/high/hay` | 容忍 ASR 断句偏差 |
+| L4 | 终极兜底 | 只要包含 `helix` | 防止 ASR 漏掉前半部分导致彻底无法唤醒 |
 
-**研究方向**:
-- ASR实时流处理与意图识别
-- 教学场景关键词库构建
-- 上下文感知的触发决策
-- 渐进式服务呈现策略
+**实现位置**: `RealtimeAssistantSession._detect_wake_word()` + `ProactiveSuggestionEngine._detect_explicit_wakeup()` 双层校验。
+
+#### 8.11.2 LLM 结构化决策协议
+
+所有触发事件（屏幕变化、语音、框选、唤醒）统一进入 `_generate_suggestion()` 链路，由 LLM 返回 JSON 做最终决策：
+
+```json
+{
+  "should_intervene": true/false,      // 是否介入
+  "intervention_type": "hint|correction|answer|encouragement|none",
+  "content": "简短口语化建议（150字内）",
+  "use_tts": true/false,               // 是否声音打断
+  "urgency": "high|medium|low"         // 优先级
+}
+```
+
+**行为规则**:
+- `should_intervene=false` → 后端返回 `None`，前端完全无感知（静默丢弃）
+- `should_intervene=true, use_tts=false` → 只弹 overlay 文本，不合成音频
+- `should_intervene=true, use_tts=true` → 弹 overlay + 合成 Kokoro TTS 推送给教师
+- LLM 不可用时（非唤醒）→ 静默失败，不打扰课堂
+- LLM 不可用时（唤醒请求）→ 兜底响应 `"我在，请说。"` + TTS
+
+#### 8.11.3 无感介入原则
+
+1. **默认静默**: 绝大多数情况下 RTA 只观察、不介入
+2. **LLM 拥有最终决策权**: 前置引擎（suggestion_engine / trigger_engine）只做预筛选，最终是否介入由 LLM 根据课件+对话上下文判断
+3. **声音打断需授权**: TTS 默认关闭，只有 LLM 在 Prompt 指引下明确判断需要声音打断时才启用
+4. **唤醒必响应**: 无论上下文如何，检测到唤醒词后强制触发高优先级 LLM 请求
 
 ---
 
@@ -3099,33 +3450,23 @@ sequenceDiagram
 #### 8.11.1 边侧推理优化配置
 
 ```python
-# faster-whisper 优化配置 (RTX 5080)
-from faster_whisper import WhisperModel
+# SeamlessM4T CPU 配置示意（当前主链路）
+from app.voice_stream import VoiceStreamConfig, try_create_seamless_transcriber
 
-model = WhisperModel(
-    "medium",  # 或 "large-v3"
-    device="cuda",
-    compute_type="int8_float16",  # 混合精度
-    cpu_threads=0,  # GPU模式忽略
-    num_workers=1,
+transcriber = try_create_seamless_transcriber(
+    model_name="small",      # 可切换 medium
+    device="cpu",
+    compute_type="int8",
 )
 
-# 转录配置优化
-segments, info = model.transcribe(
-    audio_path,
-    beam_size=2,  # 降低延迟
-    best_of=2,
-    patience=1.0,
-    temperature=0.0,
-    compression_ratio_threshold=2.4,
-    condition_on_previous_text=True,
-    initial_prompt="以下是普通话的句子。",
-    vad_filter=True,  # 启用VAD
-    vad_parameters=dict(
-        min_silence_duration_ms=400,
-        speech_pad_ms=160,
-    ),
+cfg = VoiceStreamConfig(
+    sample_rate=16000,
+    channels=1,
+    encoding="pcm_s16le",
+    language="en",
 )
+
+text = transcriber(audio_bytes, cfg)
 ```
 
 #### 8.11.2 vLLM高性能配置
@@ -3253,13 +3594,72 @@ class ImportanceScorer:
 
 ---
 
-*文档版本: v1.5*  
-*更新日期: 2026年3月30日*
+## 九、系统启动检查清单
+
+### 9.1 后端启动前检查
+
+| 检查项 | 命令 | 预期结果 |
+|--------|------|----------|
+| Python 版本 | `python --version` | >= 3.10 |
+| 虚拟环境 | `.\.venv\Scripts\Activate.ps1` | 激活成功 |
+| 核心依赖 | `pip install -e ".[dev]"` | 无报错 |
+| 数据库目录 | `ls data/` | 存在（SQLite自动创建） |
+
+### 9.2 后端启动验证
+
+```powershell
+cd backend_fastapi
+C:\Python314\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8012
+```
+
+| 验证端点 | 命令 | 预期结果 |
+|----------|------|----------|
+| 健康检查 | `GET /health` | `{"ok":true,"env":"development"}` |
+| 词汇查询 | `POST /v1/vocab/lookup` | 返回词汇定义（LLM降级时返回默认值） |
+| 作文批改(文本) | `POST /v1/essays/grade` | 返回 submission_id 和评分 |
+| 作文批改(图片) | `POST /v1/essays/grade` + image | OCR → 文本 → 评分 |
+| 语音场景生成 | `POST /api/voice/generate-prompt` | 返回 systemPrompt |
+| WebSocket | `ws://127.0.0.1:8012/ws/v1` | 连接成功，支持事件回放 |
+
+### 9.3 前端启动验证
+
+```bash
+cd app/v5
+npm install
+npm run dev
+```
+
+| 检查项 | 预期结果 |
+|--------|----------|
+| Vite 开发服务器 | `http://localhost:5173` |
+| API 连接 | 自动读取 `localStorage.app_config.backend.url` |
+| WebSocket 连接 | 支持 `last_seq` 断线重连 |
+
+### 9.4 已知限制与降级行为
+
+| 模块 | 限制 | 降级行为 |
+|------|------|----------|
+| **词汇** | LLM 不可用时 | 返回 `"释义：暂无（服务暂时不可用）"` |
+| **作文** | LLM 不可用时 | 所有维度默认 60 分，标注"降级" |
+| **语音 ASR** | 依赖未安装时 | 返回 `"ASR 已启用，但当前环境未安装依赖"` |
+| **语音 TTS** | Kokoro 不可用时 | 回退 Edge-TTS → Silence |
+| **ES 搜索** | 未安装 elasticsearch | 静默降级，不报错 |
+| **Celery** | Redis 未运行时 | 回退本地同步执行 (`_DummyCelery`) |
+| **PaddleOCR** | 未安装时 | `grade-ocr` 返回 400 错误 |
+| **LanguageTool** | 未安装时 | 拼写检查返回空列表，不影响主流程 |
+
+---
+
+*文档版本: v1.8*  
+*更新日期: 2026年4月19日*
 
 ### 更新记录
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
+| v1.8 | 2026-04-19 | **系统启动检查与修复**：修复 `python-jose` 依赖缺失；修复 SQLModel 表重复定义（添加 `extend_existing=True`）；统一作文 `/grade` 端点支持 text/image 双输入；修正 `compat_legacy.py` 字段名 |
+| v1.7 | 2026-04-19 | **RTA 架构升级**：LLM 结构化决策(should_intervene/use_tts/urgency)；默认静默无侵入；TTS 条件触发；唤醒词"Hi Helix/Hey Helix"四层兜底；LLM 不可用时唤醒兜底响应 |
+| v1.6 | 2026-04-18 | **大规模补充已落实细节**：词汇模块SM-2/知识图谱A*/ES搜索/Celery任务；对话模块LLM竞速/Barge-in打断/ws-v1协议/前端架构；学情分析20维度/三层Agent/干预任务/数据可视化；模型路由/上下文管理/Prompt模板等 |
 | v1.5 | 2026-03-30 | 统一Kimi K2.5模型描述(VLM/LLM合一)，本地LLM更新为Qwen3.5-9B |
 | v1.4 | 2026-03-25 | 修正实时助教模块：统一使用Kimi API，输出仅教师收听，与学生端完全隔离 |
 | v1.3 | 2026-03-25 | 修正实时助教模块架构：明确前后端分离、教师端专属 |

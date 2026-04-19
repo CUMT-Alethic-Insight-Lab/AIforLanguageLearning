@@ -21,17 +21,21 @@
     }
   },
   "models": {
-    "primary": "qwen/qwen3.5-35b-a3b",
+    "primary": "qwen/qwen3.5-9b",
     "available": [
+      "qwen3.5-9b",
+      "qwen/qwen3.5-9b",
+      "nanbeige4.1-3b",
       "qwen/qwen3.5-35b-a3b",
-      "qwen/qwen3-vl-8b",
       "qwen/qwen3-4b-thinking-2507",
       "qwen/qwen3-coder-next"
     ],
     "scene": {
-      "chat": "qwen/qwen3.5-35b-a3b",
+      "chat": "qwen/qwen3.5-9b",
       "vocab": "",
-      "essay": ""
+      "essay": "",
+      "analytics": "",
+      "class_analysis": ""
     }
   },
   "prompts": {

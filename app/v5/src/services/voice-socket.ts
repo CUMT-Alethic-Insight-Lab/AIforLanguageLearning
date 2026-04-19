@@ -15,6 +15,7 @@ type WsV1ConnectOptions = {
   backendUrl: string; // e.g. "127.0.0.1:8012" or "localhost:8012"
   sessionId: string;
   conversationId: string;
+  userId?: number;
 };
 
 /**
@@ -229,8 +230,12 @@ class VoiceSocketService {
     const backendUrl = normalizeBackendHost(String(this.wsV1.backendUrl || '').trim());
     const sessionId = encodeURIComponent(String(this.wsV1.sessionId || 'anonymous'));
     const conversationId = encodeURIComponent(String(this.wsV1.conversationId || 'conv'));
+    const userId =
+      typeof this.wsV1.userId === 'number' && this.wsV1.userId > 0
+        ? `&user_id=${encodeURIComponent(String(this.wsV1.userId))}`
+        : '';
     const lastSeq = this.lastSeq == null ? '' : `&last_seq=${encodeURIComponent(String(this.lastSeq))}`;
-    return `ws://${backendUrl}/ws/v1?session_id=${sessionId}&conversation_id=${conversationId}${lastSeq}`;
+    return `ws://${backendUrl}/ws/v1?session_id=${sessionId}&conversation_id=${conversationId}${userId}${lastSeq}`;
   }
 }
 

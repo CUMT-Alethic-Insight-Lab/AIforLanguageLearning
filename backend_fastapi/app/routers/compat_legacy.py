@@ -79,7 +79,7 @@ async def compat_query_vocabulary(req: CompatVocabRequest, session: Session = De
     if not term:
         return {"success": False, "error": "word is required"}
 
-    await lookup_vocab(VocabLookupRequest(term=term, source="manual"), session)
+    await lookup_vocab(VocabLookupRequest(term=term, source="manual"), session, current_user=None)
     fields = await generate_vocab_fields(term)
     return {"success": True, "data": _to_compat_vocab_data(term, fields)}
 
@@ -94,7 +94,7 @@ async def compat_query_ocr(req: CompatOCRRequest, session: Session = Depends(get
     if not term:
         return {"success": False, "error": "OCR text is empty"}
 
-    await lookup_vocab(VocabLookupRequest(term=term, source="ocr"), session)
+    await lookup_vocab(VocabLookupRequest(term=term, source="ocr"), session, current_user=None)
     fields = await generate_vocab_fields(term)
     return {"success": True, "data": _to_compat_vocab_data(term, fields, ocr_text=ocr_text)}
 
@@ -110,7 +110,7 @@ async def compat_essay_correct(req: CompatEssayRequest, session: Session = Depen
 
     result = await grade(
         EssayGradeRequest(
-            ocr_text=text,
+            text=text,
             language=(req.language or "english"),
             session_id="",
         ),

@@ -36,6 +36,9 @@ const isGenerating = ref(false);
 /** 是否正在启动会话 */
 const isStarting = ref(false);
 
+/** 是否处于开发模式 (用于显示调试面板) */
+const isDev = import.meta.env.DEV;
+
 // --- 步骤 1: 生成提示词 ---
 
 /**
@@ -79,7 +82,8 @@ const handleStart = async () => {
       systemPrompt: generatedPrompt.value,
       openingText: result.openingText,
       openingAudio: result.openingAudio,
-      language: targetLanguage.value
+      language: targetLanguage.value,
+      scenario: scenarioInput.value
     });
     
     step.value = 'active';
@@ -158,6 +162,81 @@ onUnmounted(() => {
           <span v-if="isGenerating" class="animate-spin mr-2">⚡</span>
           {{ isGenerating ? 'Analyzing Scenario...' : 'Generate Prompt' }}
         </button>
+
+        <!-- Local ASR Debug Panel (development only) -->
+        <div v-if="isDev" class="mt-8 p-4 bg-gray-800/60 border border-gray-700 rounded-xl">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-gray-300">🎙 本地 ASR 调试（无需后端）</h3>
+            <button
+              @click="voiceStore.isRecording ? voiceStore.stopLocalAsrTest() : voiceStore.startLocalAsrTest()"
+              class="px-3 py-1.5 text-xs rounded-lg font-medium transition-colors"
+              :class="voiceStore.isRecording ? 'bg-red-500/20 text-red-300 hover:bg-red-500/30' : 'bg-green-500/20 text-green-300 hover:bg-green-500/30'"
+            >
+              {{ voiceStore.isRecording ? '停止测试' : '开始测试' }}
+            </button>
+          </div>
+
+          <div class="grid grid-cols-3 gap-3 text-xs">
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">识别结果</div>
+              <div class="text-white font-medium min-h-[1.25rem]">{{ voiceStore.localAsrText || '—' }}</div>
+            </div>
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">VAD 状态</div>
+              <div class="font-medium" :class="voiceStore.localVadSpeaking ? 'text-green-400' : 'text-gray-400'">
+                {{ voiceStore.localVadSpeaking ? '正在说话' : '静音' }}
+              </div>
+            </div>
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">打断次数</div>
+              <div class="text-white font-medium">{{ voiceStore.localBargeInCount }}</div>
+            </div>
+          </div>
+
+          <div class="mt-2 text-[10px] text-gray-500">
+            状态: {{ voiceStore.statusText }}
+          </div>
+        </div>
+
+        <!-- ASR+LLM+TTS 端到端测试（development only） -->
+        <div v-if="isDev" class="mt-6 p-4 bg-gray-800/60 border border-indigo-500/30 rounded-xl">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-indigo-300">🧪 ASR+LLM+TTS 端到端测试（需后端）</h3>
+            <button
+              @click="voiceStore.testIsRunning ? voiceStore.stopAsrLlmTest() : voiceStore.startAsrLlmTest()"
+              class="px-3 py-1.5 text-xs rounded-lg font-medium transition-colors"
+              :class="voiceStore.testIsRunning ? 'bg-red-500/20 text-red-300 hover:bg-red-500/30' : 'bg-indigo-500/20 text-indigo-300 hover:bg-indigo-500/30'"
+            >
+              {{ voiceStore.testIsRunning ? '停止测试' : '开始测试' }}
+            </button>
+          </div>
+
+          <div class="grid grid-cols-2 gap-3 text-xs">
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">🎤 ASR 识别结果</div>
+              <div class="text-white font-medium min-h-[3rem] whitespace-pre-wrap">{{ voiceStore.testAsrText || '—' }}</div>
+            </div>
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">🤖 LLM 回复结果</div>
+              <div class="text-white font-medium min-h-[3rem] whitespace-pre-wrap">{{ voiceStore.testLlmText || '—' }}</div>
+            </div>
+          </div>
+
+          <div class="grid grid-cols-2 md:grid-cols-3 gap-3 text-xs mt-3">
+            <div class="bg-gray-900/60 rounded-lg p-3">
+              <div class="text-gray-500 mb-1">🔊 TTS 状态</div>
+              <div class="text-white font-medium min-h-[1.25rem]">{{ voiceStore.testTtsState || '等待音频输出' }}</div>
+            </div>
+            <div class="bg-gray-900/60 rounded-lg p-3" v-for="(val, key) in voiceStore.testMetrics" :key="key">
+              <div class="text-gray-500 mb-1">{{ key }}</div>
+              <div class="text-white font-medium">{{ val ?? '—' }}</div>
+            </div>
+          </div>
+
+          <div class="mt-3 text-[10px] text-gray-500">
+            说明：测试面板会完整走 ASR → LLM 流式输出 → TTS 播放，不会抑制语音。请同时核对 ASR 识别准确度、LLM 回复质量、TTS 听感，以及 ASR/LLM/TTS/总链路延迟。
+          </div>
+        </div>
       </div>
     </div>
 

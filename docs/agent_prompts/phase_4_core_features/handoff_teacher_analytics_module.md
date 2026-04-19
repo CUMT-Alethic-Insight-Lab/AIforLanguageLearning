@@ -298,15 +298,130 @@
 
 1. **数据冷启动**: 新用户前7天数据不足，纵向维度可能为 null。建议用默认值或"数据收集中"状态占位。
 2. **计算性能**: 20个维度 × 全班学生 × 每日计算，数据量大时可能慢。建议用 Redis 缓存中间结果，PostgreSQL 只存最终摘要。
-3. **LLM 成本**: 班级周报生成消耗 Token。建议周报模板固定，只填充变量数据，减少 Prompt 长度。
-4. **隐私合规**: 学生画像数据敏感，API 必须加 RBAC 权限检查（`require_role("teacher")` 或 `require_role("admin")`）。
-5. **Neo4j 降级**: 若 Neo4j 未启动，构词法迁移、知识图谱连通性等维度应返回 null 而非报错。
+## LLM 分层策略（修订版）
+
+| 功能 | 数据聚合 | LLM 使用 | 模型选择 |
+|------|----------|----------|----------|
+| 班级总览/学生列表/个人画像 | SQL + Python 计算 | ❌ 零 Token（默认） | — |
+| 20维雷达图 | SQL + 数值标准化 | ❌ 零 Token | — |
+| 趋势折线图 | SQL 时间序列 | ❌ 零 Token | — |
+| 分层分析报告（Agent-1/2/3） | 规则引擎 | ⚠️ 可选本地 LLM 润色（`llm_enhance=true`） | `scene="analytics"` → 本地模型 |
+| 个人画像 LLM 摘要 | SQL + 本地 LLM | ✅ 本地 LLM 生成教师友好摘要 | `scene="analytics"` → 本地模型 |
+| 深度个人分析报告 | SQL + 本地 LLM | ✅ 本地 LLM 读取时间序列生成深度报告 | `scene="analytics"` → 本地模型 |
+| 班级周报 | SQL 聚合 + 本地 LLM 润色 | ✅ 仅自然语言润色 | `scene="analytics"` → 本地模型 |
+| 复杂班级分析（未来） | SQL + 云端 LLM | ✅ 数据庞杂需云端模型 | `scene="class_analysis"` → 云端模型 |
+
+**设计原则**：
+1. **数值指标优先自动化**：所有可数值化的指标（20维度）由 SQL/Python 计算，不依赖 LLM
+2. **LLM 仅做翻译官**：将机器数据翻译成教师能听懂的自然语言，不生成虚假数据
+3. **本地优先**：个人分析、周报等数据量小的场景使用本地 LLM（成本低、延迟低）
+4. **云端备用**：复杂班级分析（多班级对比、跨学期趋势）使用云端模型
+5. **降级保护**：所有 LLM 调用都有 try-except，失败时返回原始数据，不影响功能
+6. **教师友好输出**：不使用行业黑话，客观总结 + 谨慎建议，语气平和有温度
 
 ---
 
-## 9. 参考文档
+## 前端渲染引擎修复记录
+
+### 修复项
+1. **BaseChart.vue**: `setOption` 增加 `{ notMerge: true }`，避免旧配置残留
+2. **TeacherDashboardView.vue**: 增加 `watch(() => route.params.class_id, ...)`，修复班级切换时数据不更新问题
+3. **StudentProfileView.vue**: 修复趋势图键名匹配（后端返回 `trend_0`~`trend_3`，前端正确解析）
+
+### 已知问题
+- 雷达图 `maxVal` 仍使用动态最大值，建议后端统一标准化到 0-100 范围
+- 饼图颜色硬编码为 3 类，若增加分类需扩展
+
+---
+
+## 10. 用户画像融合设计（2026-04-18 新增）
+
+### 10.1 设计目标
+
+将静态用户画像（`StudentProfile`）与动态学情分析（`StudentDailySummary`）深度融合，使：
+- **纵向分析**（Agent-0）能结合学生目标/兴趣生成个性化摘要
+- **横向分析**（Agent-1/2/3）能基于画像生成针对性干预建议
+- **所有分析结果持久化存库**，供后续查询和周报生成直接读取
+
+### 10.2 数据流
+
+```
+StudentProfile (静态画像: level, goals, interests)
+      ↓
+Agent-0 daily_summary.py ──→ StudentDailySummary (纵向存库)
+    [读取画像]                    [level/goals/interests/llm_narrative/profile_snapshot]
+                                      ↓
+                              Agent-1/2/3 横向分析
+                              [直接从summary读画像，无需再查Profile表]
+                                      ↓
+                              API 返回教师端
+```
+
+### 10.3 `StudentDailySummary` 新增字段
+
+| 字段 | 类型 | 来源 | 用途 |
+|------|------|------|------|
+| `level` | `str` | `StudentProfile.level` | 英语水平分层基准 |
+| `goals` | `list[str]` | `StudentProfile.goals` | 学习目标上下文 |
+| `interests` | `list[str]` | `StudentProfile.interests` | 兴趣个性化推荐 |
+| `llm_narrative` | `str` | 本地 LLM 生成 | 教师友好日度摘要 |
+| `profile_snapshot` | `JSON` | 画像+LLM+指标快照 | 横向分析直接读取 |
+
+### 10.4 LLM 个性化 Prompt 示例
+
+**输入上下文**：
+- 英语水平: intermediate
+- 学习目标: ["雅思写作", "学术英语"]
+- 兴趣爱好: ["科幻", "电影"]
+- 当日数据: 词汇增长 3.2, 语法收敛 0.8, 逻辑连贯 72
+
+**LLM 输出示例**：
+> 该生今日词汇掌握稳步提升，语法错误持续收敛。建议结合其"雅思写作"目标，尝试用学术英语写一篇科幻影评，既练习论证结构又贴合兴趣。
+
+### 10.5 干预任务个性化
+
+Agent-1/3 生成干预任务时，`suggestion.actions` 自动结合画像：
+- 有 `interests` → 增加 "结合兴趣(X)设计情境练习"
+- 有 `goals` → 增加 "结合目标(Y)设计高阶挑战"
+
+---
+
+## 11. 实现状态汇总（2026-04-18）
+
+### ✅ 已完成
+
+| 模块 | 文件 | 状态 |
+|------|------|------|
+| 数据模型 | `domain/analytics/models.py` | ✅ `StudentDailySummary` + `ClassDailySnapshot` + `InterventionTask` |
+| Alembic 迁移 | `alembic/versions/98ed1e32bf23` | ✅ 已执行，表已创建 |
+| Agent-0 日度摘要 | `application/analytics/daily_summary.py` | ✅ 20维度计算 + 画像融合 + LLM摘要 |
+| Agent-1/2/3 分层分析 | `application/analytics/agents.py` | ✅ 异步化 + 可选LLM润色 + 画像注入 |
+| 教师端 API | `interfaces/analytics_router.py` | ✅ 8个接口 + llm_enhance参数 + 画像返回 |
+| 班级周报 | `application/analytics/weekly_report.py` | ✅ SQL聚合 + 本地LLM润色 |
+| 前端图表 | `views/TeacherDashboardView.vue` | ✅ 饼图/折线图 + 路由监听修复 |
+| 前端画像 | `views/StudentProfileView.vue` | ✅ 雷达图/趋势图/报告 + 键名修复 |
+| 前端组件 | `components/BaseChart.vue` | ✅ ECharts封装 + notMerge修复 |
+| 测试覆盖 | `tests/test_analytics_module.py` | ✅ 18测试全绿 |
+| LLM 路由配置 | `runtime_config.py` | ✅ `analytics`/`class_analysis` 场景 |
+
+### ⚠️ 已知问题 / 待优化
+
+1. **雷达图刻度**: 仍使用动态 `maxVal`，建议后端统一标准化到 0-100
+2. **饼图颜色**: 硬编码3类，增加分类需扩展
+3. **class_id 关联**: `StudentProfile` 尚未增加 `class_id`，班级查询目前全表遍历
+4. **Celery 定时任务**: Agent-0 的日度批处理尚未配置 Celery 定时触发
+5. **Neo4j 维度**: A4/A7/A8/B7 等依赖 Neo4j 的维度目前返回 null
+
+---
+
+## 12. 参考文档
 
 - `docs/Detailed_System_Architecture.md` 第 4 章（教师端模块详细架构）
+- `backend_fastapi/app/models.py`（`EssayResult`, `ConversationEvent`, `VocabularyItem`）
+- `backend_fastapi/app/domain/models.py`（`User`, `StudentProfile`, `LearningPath`）
+- `backend_fastapi/app/infrastructure/messaging/celery_app.py`（定时任务配置参考）
+- `backend_fastapi/app/llm.py`（LLM 调用封装）
+- `backend_fastapi/app/infrastructure/rbac.py`（角色权限检查）
 - `backend_fastapi/app/models.py`（`EssayResult`, `ConversationEvent`, `VocabularyItem`）
 - `backend_fastapi/app/domain/models.py`（`User`, `StudentProfile`, `LearningPath`）
 - `backend_fastapi/app/infrastructure/messaging/celery_app.py`（定时任务配置参考）

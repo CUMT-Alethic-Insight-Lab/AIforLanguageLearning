@@ -4,6 +4,16 @@ import type { VocabularyResult } from '../types/vocabulary';
 defineProps<{
   data: VocabularyResult;
 }>();
+
+const emit = defineEmits<{
+  (e: 'lookup-recommendation', word: string): void;
+}>();
+
+const handleRecommendationClick = (word: string) => {
+  const term = String(word || '').trim();
+  if (!term) return;
+  emit('lookup-recommendation', term);
+};
 </script>
 
 <template>
@@ -17,6 +27,36 @@ defineProps<{
         
         <span v-if="data.pos && Array.isArray(data.pos)" class="italic">{{ data.pos.join(', ') }}</span>
         <span v-else-if="data.pos" class="italic">{{ data.pos }}</span>
+      </div>
+      <div
+        v-if="data.cefrLevel || data.difficultyLevel || data.schoolStage || (data.examTags && data.examTags.length)"
+        class="mt-4 flex flex-wrap items-center gap-2"
+      >
+        <span
+          v-if="data.cefrLevel"
+          class="px-2 py-1 rounded bg-indigo-900/40 border border-indigo-700 text-xs text-indigo-200"
+        >
+          CEFR: {{ data.cefrLevel }}
+        </span>
+        <span
+          v-if="typeof data.difficultyLevel === 'number'"
+          class="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-xs text-gray-200"
+        >
+          难度级别: L{{ data.difficultyLevel }}
+        </span>
+        <span
+          v-if="data.schoolStage"
+          class="px-2 py-1 rounded bg-gray-800 border border-gray-700 text-xs text-gray-200"
+        >
+          学段: {{ data.schoolStage }}
+        </span>
+        <span
+          v-for="tag in (data.examTags || [])"
+          :key="tag"
+          class="px-2 py-1 rounded bg-teal-900/30 border border-teal-700 text-xs text-teal-200"
+        >
+          {{ tag }}
+        </span>
       </div>
     </div>
 
@@ -45,16 +85,6 @@ defineProps<{
         <div v-for="(ex, i) in data.examples" :key="i" class="mb-2 pl-4 border-l-2 border-gray-700">
            <!-- Handle both string[] and object[] -->
           <p class="text-gray-300 italic text-sm">{{ typeof ex === 'string' ? ex : (ex.en || ex) }}</p>
-        </div>
-      </div>
-
-      <!-- Synonyms (Simple/Legacy) -->
-      <div v-if="data.synonyms && data.synonyms.length">
-        <h3 class="text-white font-bold mb-2 uppercase tracking-wider text-xs">Synonyms</h3>
-        <div class="flex flex-wrap gap-2">
-            <span v-for="(syn, i) in data.synonyms" :key="i" class="px-2 py-1 bg-gray-700 rounded text-xs text-gray-300">
-                {{ typeof syn === 'string' ? syn : syn.word }}
-            </span>
         </div>
       </div>
 
@@ -119,6 +149,37 @@ defineProps<{
             <p class="text-indigo-200">{{ ph.phrase }}</p>
             <p class="text-xs text-gray-400">{{ ph.meaning }}</p>
             <p class="text-xs text-gray-500 italic mt-1">"{{ ph.example }}"</p>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recommendations -->
+      <div v-if="data.recommendations && data.recommendations.length">
+        <h3 class="text-white font-bold mb-2 uppercase tracking-wider text-xs">Recommended Next Words</h3>
+        <div class="pl-4 space-y-2">
+          <div
+            v-for="item in data.recommendations"
+            :key="`${item.word}-${item.relation_type || 'none'}`"
+            class="text-sm"
+          >
+            <div class="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                class="text-indigo-300 font-bold hover:text-indigo-200 underline underline-offset-2"
+                @click="handleRecommendationClick(item.word)"
+              >
+                {{ item.word }}
+              </button>
+              <span v-if="item.relation_type" class="text-[10px] px-2 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-400">
+                {{ item.relation_type }}
+              </span>
+              <span v-if="typeof item.score === 'number'" class="text-[10px] text-gray-500">
+                score: {{ item.score.toFixed(2) }}
+              </span>
+            </div>
+            <p v-if="item.reason" class="text-xs text-gray-500 mt-0.5 ml-1">
+              {{ item.reason }}
+            </p>
           </div>
         </div>
       </div>

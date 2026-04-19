@@ -3,11 +3,31 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "main": "dist-electron/main/main.js",
   "scripts": {
     "dev": "vite",
     "build": "vue-tsc -b && vite build",
     "build:electron": "tsc -p electron/tsconfig.json",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "dist": "npm run build && npm run build:electron && electron-builder"
+  },
+  "build": {
+    "appId": "com.aifl.v5",
+    "productName": "AIFL-V5",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "dist-electron/**/*",
+      "resources/**/*"
+    ],
+    "asarUnpack": [
+      "resources/whisper/**/*"
+    ],
+    "win": {
+      "target": "portable"
+    }
   },
   "dependencies": {
     "animejs": "^3.2.2",
@@ -23,12 +43,13 @@
     "zeromq": "^6.5.0"
   },
   "devDependencies": {
-    "electron": "^31.6.0",
     "@types/animejs": "^3.1.12",
     "@types/node": "^20.10.0",
     "@types/three": "^0.160.0",
     "@vitejs/plugin-vue": "^5.0.0",
     "autoprefixer": "^10.4.16",
+    "electron": "^31.6.0",
+    "electron-builder": "^26.8.1",
     "postcss": "^8.4.31",
     "tailwindcss": "^3.3.5",
     "typescript": "^5.2.2",

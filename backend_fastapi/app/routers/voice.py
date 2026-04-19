@@ -47,12 +47,22 @@ class StartSessionResponse(BaseModel):
 async def start_session(req: StartSessionRequest) -> StartSessionResponse:
     system_prompt = (req.systemPrompt or "").strip()
 
-    # 为了兼容现有前端流程，返回固定开场白；同时生成可播放的 openingAudio。
-    # openingAudio: base64(wav bytes)。默认 TTS 后端是 silence（仍是“真实音频”，只是静音）。
+    # 从 system prompt 中推断场景，生成对应的开场白
+    scenario_hints = {
+        "restaurant": "欢迎来到餐厅场景，让我们一起练习点餐吧。",
+        "airport": "欢迎来到机场场景，让我们一起练习登机手续吧。",
+        "hotel": "欢迎来到酒店场景，让我们一起练习入住登记吧。",
+        "shopping": "欢迎来到购物场景，让我们一起练习选购商品吧。",
+        "interview": "欢迎来到面试场景，让我们一起练习自我介绍吧。",
+    }
+
+    opening_text = "好的，我们开始练习吧。你可以先说一句话。"
     if system_prompt:
-        opening_text = "好的，我们开始练习吧。你可以先说一句话。"
-    else:
-        opening_text = "我们开始吧。你可以先说一句话。"
+        lower_sp = system_prompt.lower()
+        for key, hint in scenario_hints.items():
+            if key in lower_sp:
+                opening_text = hint
+                break
 
     wav = synthesize_tts_wav(opening_text)
     opening_audio_b64 = base64.b64encode(wav).decode("utf-8") if wav else ""

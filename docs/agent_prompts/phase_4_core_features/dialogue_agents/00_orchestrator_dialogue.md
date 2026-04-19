@@ -129,9 +129,6 @@ graph TD
   "success": true,
   "data": {
     "conversation_id": "conv-uuid-123",
-    "scene_setting": { /* 结构化场景设定 */ },
-    "opening_line": "Hi, welcome...",
-    "opening_audio": "base64..."
   }
 }
 ```
@@ -143,12 +140,8 @@ graph TD
   "success": true,
   "data": {
     "conversation_id": "conv-uuid-123",
-    "status": "active|ended",
-    "events": [
-      {"seq": 1, "type": "SCENE_SET", "payload": {...}},
-      {"seq": 2, "type": "AI_MESSAGE", "payload": {"text": "..."}},
-      {"seq": 3, "type": "USER_MESSAGE", "payload": {"text": "..."}}
-    ]
+    "status": "active|ended"
+    // 不再向前端透传实际对话文本，由模型静默控制
   }
 }
 ```

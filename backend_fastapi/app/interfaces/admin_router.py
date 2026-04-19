@@ -140,14 +140,57 @@ async def update_prompt(
 
 @router.get("/services", response_model=ConfigResponse)
 async def get_services(_: Any = Depends(_require_admin)) -> ConfigResponse:
+    """返回各核心服务的真实健康状态。"""
+    import importlib
+
+    from app.llm import list_available_llm_models
+
+    # LLM: 尝试拉取可用模型列表
+    llm_status = "unknown"
+    try:
+        models = await list_available_llm_models()
+        llm_status = "ready" if models else "degraded"
+    except Exception:
+        llm_status = "down"
+
+    # ASR: 检查模块可用性和配置
+    asr_status = "unknown"
+    try:
+        has_transformers = bool(importlib.import_module("transformers"))
+        asr_status = "ready" if (settings.enable_asr and has_transformers) else "disabled"
+    except Exception:
+        asr_status = "down" if settings.enable_asr else "disabled"
+
+    # TTS: 尝试合成一个短文本探测后端
+    tts_status = "unknown"
+    try:
+        from app.tts import synthesize_tts_wav
+
+        wav = synthesize_tts_wav("hello")
+        tts_status = "ready" if wav else "degraded"
+    except Exception:
+        tts_status = "down"
+
+    # OCR: 检查后端依赖
+    ocr_status = "unknown"
+    try:
+        has_paddle = bool(importlib.import_module("paddleocr"))
+        ocr_status = "ready" if has_paddle else "degraded"
+    except Exception:
+        try:
+            has_rapid = bool(importlib.import_module("rapidocr"))
+            ocr_status = "ready" if has_rapid else "down"
+        except Exception:
+            ocr_status = "down"
+
     return ConfigResponse(
         success=True,
         data={
             "status": {
-                "llm": "unknown",
-                "asr": "unknown",
-                "tts": "unknown",
-                "ocr": "unknown",
+                "llm": llm_status,
+                "asr": asr_status,
+                "tts": tts_status,
+                "ocr": ocr_status,
             },
             "config": {
                 "llm_base_url": settings.llm_base_url,

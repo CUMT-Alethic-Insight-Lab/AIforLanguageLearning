@@ -11,8 +11,22 @@
  *              - 响应式布局 (Flexbox)。
  *              - 路由视图 (Router View) 的过渡动画 (Fade)。
  *              - 全局样式定义 (如过渡效果)。
+ *              - 实时助教系统事件监听与悬浮窗集成。
  */
+import { onMounted, onUnmounted } from 'vue';
 import Sidebar from './components/Sidebar.vue';
+import { useAssistantStore } from './stores/assistant';
+
+const assistant = useAssistantStore();
+
+onMounted(() => {
+  // 初始化实时助教：注册系统事件监听（截图、划词）、建立 RTA WebSocket
+  assistant.init();
+});
+
+onUnmounted(() => {
+  assistant.cleanup();
+});
 </script>
 
 <template>

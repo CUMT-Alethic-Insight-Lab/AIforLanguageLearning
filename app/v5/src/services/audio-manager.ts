@@ -41,7 +41,7 @@ export class AudioManager {
           echoCancellation: true, // 开启回声消除
           noiseSuppression: true, // 开启降噪
           autoGainControl: true, // 开启自动增益
-          sampleRate: 16000 // 录音采样率设置为 16kHz (Whisper 模型推荐)
+          sampleRate: 16000 // 录音采样率设置为 16kHz (ASR 模型推荐)
         }
       });
 
@@ -211,7 +211,7 @@ export class AudioManager {
 
   /**
    * 停止播放
-   * 
+   *
    * 立即停止当前正在播放的音频，并重置时间戳。
    */
   stopPlayback() {
@@ -226,6 +226,185 @@ export class AudioManager {
       this.playbackContext.suspend();
     }
   }
+
+  // ========== 本地 ASR + VAD 相关状态 ==========
+  private asrBuffers: Int16Array[] = [];
+  private asrActive: boolean = false;
+  private asrSilenceFrames: number = 0;
+  private asrSpeechDetected: boolean = false;
+  private asrOptions: AsrRecordingOptions | null = null;
+  private asrProcessing: boolean = false;
+
+  /**
+   * 开始录音并集成本地 ASR（基于能量阈值 VAD）。
+   *
+   * 流程：
+   * 1. 持续录音，累积音频到缓冲区。
+   * 2. 实时计算 RMS，判断是否处于语音段。
+   * 3. 当静音持续超过阈值时，将缓冲区导出为 WAV 并调用本地 ASR。
+   * 4. ASR 返回文本后，通过 onResult 回调通知调用方。
+   *
+   * @param options - ASR 录音配置
+   */
+  async startRecordingWithAsr(options: AsrRecordingOptions) {
+    this.asrOptions = options;
+    this.asrBuffers = [];
+    this.asrActive = true;
+    this.asrSilenceFrames = 0;
+    this.asrSpeechDetected = false;
+    this.asrProcessing = false;
+
+    const threshold = options.speechThreshold ?? 420;
+    const silenceMs = options.silenceMs ?? 700;
+    const minSpeechMs = options.minSpeechMs ?? 300;
+
+    await this.startRecording((data) => {
+      if (!this.asrActive) return;
+
+      this.asrBuffers.push(data);
+      const rms = calcRms(data);
+      const frameMs = (data.length / 16000) * 1000; // 16kHz sample rate
+
+      if (rms >= threshold) {
+        if (!this.asrSpeechDetected) {
+          this.asrSpeechDetected = true;
+          options.onVadChange?.(true);
+        }
+        this.asrSilenceFrames = 0;
+      } else if (this.asrSpeechDetected) {
+        this.asrSilenceFrames += frameMs;
+      }
+
+      const speechDurationMs = this.asrBuffers.length * frameMs - this.asrSilenceFrames;
+      const shouldFinalize =
+        this.asrSpeechDetected &&
+        this.asrSilenceFrames >= silenceMs &&
+        speechDurationMs >= minSpeechMs &&
+        !this.asrProcessing;
+
+      if (shouldFinalize) {
+        this.asrProcessing = true;
+        void this.finalizeAsr().then((text) => {
+          if (text) {
+            options.onResult?.(text);
+          }
+          // 清空缓冲区，准备下一轮
+          this.asrBuffers = [];
+          this.asrSpeechDetected = false;
+          this.asrSilenceFrames = 0;
+          this.asrProcessing = false;
+          options.onVadChange?.(false);
+        });
+      }
+    });
+  }
+
+  /**
+   * 停止 ASR 录音。
+   */
+  stopRecordingWithAsr() {
+    this.asrActive = false;
+    this.stopRecording();
+    this.asrBuffers = [];
+    this.asrSpeechDetected = false;
+    this.asrSilenceFrames = 0;
+    this.asrProcessing = false;
+  }
+
+  // ========== 后端音频流式上传相关状态 ==========
+  private backendAudioActive: boolean = false;
+
+  /**
+   * 开始录音并向后端 WebSocket 流式发送音频数据。
+   *
+   * 流程：
+   * 1. 发送 AUDIO_START 建立请求上下文。
+   * 2. 持续录音，通过 onChunk 回调将 Int16 PCM 数据发送给调用方。
+   * 3. 调用方负责通过 voiceSocket 发送到后端。
+   *
+   * @param options - 后端音频流配置
+   */
+  async startRecordingForBackend(options: BackendAudioOptions) {
+    this.backendAudioActive = true;
+
+    await this.startRecording((data) => {
+      if (!this.backendAudioActive) return;
+      options.onChunk(data);
+    });
+  }
+
+  /**
+   * 停止向后端发送音频。
+   */
+  stopRecordingForBackend() {
+    this.backendAudioActive = false;
+    this.stopRecording();
+  }
+
+  /**
+   * 将当前缓冲区导出为 WAV，调用 Electron 本地辅助 ASR。
+   * 当前主语音对话链路仍以后端 ws-v1 + SeamlessM4T 为准。
+   */
+  private async finalizeAsr(): Promise<string> {
+    if (!this.asrOptions || this.asrBuffers.length === 0) return '';
+
+    const totalLen = this.asrBuffers.reduce((sum, b) => sum + b.length, 0);
+    const pcm = new Int16Array(totalLen);
+    let offset = 0;
+    for (const b of this.asrBuffers) {
+      pcm.set(b, offset);
+      offset += b.length;
+    }
+
+    const wavBytes = pcm16ToWav(pcm, 16000);
+    const base64Wav = arrayBufferToBase64(wavBytes.buffer as ArrayBuffer);
+    console.log('[ASR] finalizeAsr called, pcm length:', pcm.length, 'base64 length:', base64Wav.length);
+
+    try {
+      const api = (window as any).api;
+      if (!api?.asr?.transcribeFromBase64) {
+        console.error('ASR API not available in window.api');
+        return '';
+      }
+      const langMap: Record<string, string> = {
+        'English': 'en',
+        'Japanese': 'ja',
+        'Chinese': 'zh',
+        'French': 'fr',
+      };
+      const lang = langMap[this.asrOptions.language || ''] || this.asrOptions.language || 'auto';
+      console.log('[ASR] calling transcribeFromBase64, lang:', lang);
+      const res = await api.asr.transcribeFromBase64(base64Wav, {
+        language: lang,
+        threads: 4,
+      });
+      console.log('[ASR] transcribeFromBase64 result:', res);
+      if (res?.ok) {
+        return res.result?.text || '';
+      } else {
+        console.error('ASR error:', res?.error);
+        return '';
+      }
+    } catch (e) {
+      console.error('ASR finalize error:', e);
+      return '';
+    }
+  }
+}
+
+export interface AsrRecordingOptions {
+  language?: string;
+  speechThreshold?: number;
+  silenceMs?: number;
+  minSpeechMs?: number;
+  onVadChange?: (speaking: boolean) => void;
+  onResult?: (text: string) => void;
+  onError?: (err: string) => void;
+}
+
+export interface BackendAudioOptions {
+  requestId: string;
+  onChunk: (data: Int16Array) => void;
 }
 
 export const audioManager = new AudioManager();
@@ -238,4 +417,54 @@ function base64ToUint8Array(base64Data: string): Uint8Array {
     bytes[i] = binaryString.charCodeAt(i);
   }
   return bytes;
+}
+
+function arrayBufferToBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i++) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
+}
+
+function pcm16ToWav(pcmData: Int16Array, sampleRate: number): Uint8Array {
+  const buffer = new ArrayBuffer(44 + pcmData.length * 2);
+  const view = new DataView(buffer);
+
+  function writeString(offset: number, str: string) {
+    for (let i = 0; i < str.length; i++) {
+      view.setUint8(offset + i, str.charCodeAt(i));
+    }
+  }
+
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + pcmData.length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true); // PCM
+  view.setUint16(22, 1, true); // mono
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, pcmData.length * 2, true);
+
+  for (let i = 0; i < pcmData.length; i++) {
+    view.setInt16(44 + i * 2, pcmData[i], true);
+  }
+
+  return new Uint8Array(buffer);
+}
+
+function calcRms(pcm: Int16Array): number {
+  if (!pcm || pcm.length === 0) return 0;
+  let sum = 0;
+  for (let i = 0; i < pcm.length; i++) {
+    const v = pcm[i];
+    sum += v * v;
+  }
+  return Math.sqrt(sum / pcm.length);
 }

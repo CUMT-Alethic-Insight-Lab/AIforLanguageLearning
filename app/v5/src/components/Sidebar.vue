@@ -8,6 +8,7 @@ const navItems = [
   { name: '作文批改', path: '/essay', icon: '📝' },
   { name: '语音对话', path: '/voice', icon: '🎤' },
   { name: '学习分析', path: '/analysis', icon: '📊' },
+  { name: '教师仪表盘', path: '/teacher', icon: '🎓' },
   { name: '设置', path: '/settings', icon: '⚙️' },
 ];
 </script>

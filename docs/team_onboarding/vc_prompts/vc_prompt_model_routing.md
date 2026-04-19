@@ -6,7 +6,7 @@
 ## 技术栈
 - Python + FastAPI + httpx
 - Redis (对话上下文存储)
-- 对接模型: Kimi API + 本地Qwen2.5-7B (Ollama/vLLM)
+- 对接模型: Kimi API + 本地Qwen3.5-9B (Ollama/vLLM)
 
 ## 核心架构
 ```
@@ -19,7 +19,7 @@
 
 ### 模型路由
 - [ ] 场景扩写路由 → Kimi API (thinking模式)
-- [ ] 对话执行路由 → Qwen2.5-7B本地
+- [ ] 对话执行路由 → Qwen3.5-9B本地
 - [ ] 作文批改路由 → Kimi API
 - [ ] 词汇生成路由 → Kimi API
 - [ ] 故障自动切换 (主模型失败→备用模型)
@@ -38,7 +38,7 @@
 ## 关键约束
 ⚠️ 对话场景扩写: 用户描述 → Kimi API扩写 → 作为Qwen的System Prompt
 ⚠️ 上下文窗口管理: 超过80%时触发自动摘要
-⚠️ 本地模型Qwen2.5-7B通过Ollama/vLLM部署，确保<200ms首Token延迟
+⚠️ 本地模型Qwen3.5-9B通过Ollama/vLLM部署，确保<200ms首Token延迟
 ⚠️ Kimi API必须设置超时: 连接5s, 读取30s
 
 ## 路由决策逻辑
@@ -62,6 +62,6 @@
 "实现Kimi API调用带重试和超时控制"
 "设计场景扩写Prompt模板输出JSON格式"
 "实现对话上下文滑动窗口管理"
-"使用vLLM部署Qwen2.5-7B本地模型"
+"使用vLLM部署Qwen3.5-9B本地模型"
 "实现流式输出的SSE接口"
 ```

@@ -15,6 +15,7 @@ def get_profile(user_id: int) -> StudentProfile | None:
 
 def upsert_profile(
     user_id: int,
+    class_id: str | None = None,
     level: str | None = None,
     goals: list[str] | None = None,
     interests: list[str] | None = None,
@@ -25,6 +26,8 @@ def upsert_profile(
         ).first()
         now = datetime.utcnow()
         if existing:
+            if class_id is not None:
+                existing.class_id = class_id
             if level is not None:
                 existing.level = level
             if goals is not None:
@@ -38,6 +41,7 @@ def upsert_profile(
             return existing
         profile = StudentProfile(
             user_id=user_id,
+            class_id=class_id,
             level=level or "beginner",
             goals=goals or [],
             interests=interests or [],

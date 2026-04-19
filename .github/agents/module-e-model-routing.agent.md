@@ -20,9 +20,11 @@ description: "Use when: 需要实现或咨询模型路由、上下文管理、LL
 
 ### 1. 模型路由
 - 场景扩写路由 → Kimi API (thinking模式)
-- 对话执行路由 → Qwen2.5-7B本地
-- 作文批改路由 → Kimi API
-- 词汇生成路由 → Kimi API
+- 对话执行路由 → Qwen3.5-9B本地（语音对话额外启用云端/本地竞速）
+- 作文批改路由 → Kimi API，1s 无响应 fallback 本地
+- 词汇生成路由 → 本地模型（必须本地）
+- 实时助教路由 → Kimi API 云端优先，1s 无响应 fallback 本地
+- 学情分析/班级周报路由 → Kimi API 云端优先，10s 无响应 fallback 本地
 - 故障自动切换 (主模型失败→备用模型)
 
 ### 2. 上下文管理
@@ -39,16 +41,18 @@ description: "Use when: 需要实现或咨询模型路由、上下文管理、LL
 ## 关键约束
 ⚠️ 对话场景扩写: 用户描述 → Kimi API扩写 → 作为Qwen的System Prompt
 ⚠️ 上下文窗口管理: 超过80%时触发自动摘要
-⚠️ 本地模型Qwen2.5-7B通过Ollama/vLLM部署，确保<200ms首Token延迟
+⚠️ 本地模型Qwen3.5-9B通过Ollama/vLLM部署，确保<200ms首Token延迟
 ⚠️ Kimi API必须设置超时: 连接5s, 读取30s
 
 ## 路由决策逻辑
-| 场景 | 模型 | 原因 |
-|------|------|------|
-| 场景扩写 | Kimi API | 需要强推理能力 |
-| 对话执行 | Qwen本地 | 低成本+低延迟 |
-| 作文批改 | Kimi API | 需要多维度分析 |
-| 词汇生成 | Kimi API | 需要丰富知识 |
+| 场景 | 模型 | 机制 | 原因 |
+|------|------|------|------|
+| 场景扩写 | Kimi API | 直接调用 | 需要强推理能力，延迟不敏感 |
+| 对话执行 | Qwen本地 + Kimi | 竞速（谁先回用谁） | 低成本+低延迟，兼顾能力上限 |
+| 作文批改 | Kimi API → 本地 | 云端优先，1s 超时 fallback | 需要多维度分析 |
+| 词汇生成 | 本地模型 | 直接调用 | 必须本地，确保离线可用 |
+| 实时助教 | Kimi API → 本地 | 云端优先，1s 超时 fallback | 能力上限要求高 |
+| 学情分析/班级周报 | Kimi API → 本地 | 云端优先，10s 超时 fallback | 质量要求高，延迟极不敏感 |
 
 ## 核心代码模式
 
@@ -81,7 +85,7 @@ from app.runtime_config import update_runtime_config
 update_runtime_config({
     "models": {
         "scene": {
-            "chat": "qwen2.5-7b",
+            "chat": "qwen3.5-9b",
             "essay": "kimi-api"
         }
     }

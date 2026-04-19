@@ -12,6 +12,7 @@ from app.model_router import (
     ModelRouter,
     RoutingDecision,
     SceneType,
+    _normalize_expanded_system_prompt,
     get_model_router,
 )
 from app.token_utils import (
@@ -288,6 +289,23 @@ class TestIntegration:
         # 压缩后消息数应该减少
         after_count = len(ctx.messages)
         assert after_count < before_count
+
+
+class TestScenarioExpansionNormalization:
+    """扩写结果规范化测试"""
+
+    def test_strip_system_prompt_tags(self):
+        raw = """<SYSTEM_PROMPT>
+你是日语口语陪练。
+每次回复 2-4 句。
+</SYSTEM_PROMPT>"""
+        normalized = _normalize_expanded_system_prompt(raw)
+        assert normalized == "你是日语口语陪练。\n每次回复 2-4 句。"
+
+    def test_strip_lead_in_prefix(self):
+        raw = "以下是可直接使用的System Prompt：你是法语口语陪练。"
+        normalized = _normalize_expanded_system_prompt(raw)
+        assert normalized == "你是法语口语陪练。"
 
 
 if __name__ == "__main__":

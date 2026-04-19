@@ -30,6 +30,16 @@ export interface VocabularyResult {
   examples?: Array<{ en: string; zh: string }>;
   antonyms?: string[];
   etymology?: string;
+  cefrLevel?: string;
+  difficultyLevel?: number;
+  examTags?: string[];
+  schoolStage?: string;
+  recommendations?: Array<{
+    word: string;
+    reason?: string;
+    score?: number;
+    relation_type?: string | null;
+  }>;
 }
 
 export interface OCRResult {

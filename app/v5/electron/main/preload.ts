@@ -5,9 +5,11 @@
  * 通过 `contextBridge` 暴露 `window.api` 对象，实现隔离环境下的 IPC 通信。
  * 
  * 主要暴露的 API 包括：
- * 1. 事件订阅 (Event Subscriptions)：
+ * 1. 事件订阅 (Event Subscriptions)：`
  *    - 服务状态更新 (onServiceUpdate)
  *    - 快捷键触发 (onVocabularyHotkey, onTriggerLookup)
+ *    - 系统截图/划词事件 (onSystemScreenshot, onSystemTextSelect)
+ *    - 悬浮窗操作事件 (onSmartOverlayAction)
  *    - 软总线事件 (onSoftbusConnected, onSoftbusMessage, etc.)
  * 
  * 2. 配置管理 (Configuration Management)：
@@ -18,19 +20,18 @@
  *    - 启动/停止服务 (startService, stopService)
  *    - 探测服务状态 (probeServices, getServiceState)
  * 
- * 4. 软总线接口 (Softbus API)：
- *    - 发布/订阅 (publish, subscribe)
- *    - RPC 调用 (rpc)
- *    - 流式传输 (streamOpen, streamSend)
+ * 4. 剪贴板与悬浮窗 (Clipboard & Overlay)：
+ *    - 读取剪贴板 (clipboardReadText, clipboardReadImage)
+ *    - 显示智能悬浮窗 (smartOverlayShow, smartOverlayClose)
+ *    - 悬浮窗内容更新/关闭回调 (onOverlayUpdate, overlayResize, overlayClose, overlayAction)
  * 
- * 5. 编排器接口 (Orchestrator API)：
- *    - 执行流水线 (executePipeline)
- *    - 获取服务和指标 (getServices, getMetrics)
+ * 5. 软总线接口 (Softbus API) / 编排器接口 (Orchestrator API)
  * 
  * @author AI for Foreign Language Learning Team
  * @lastModified 2025-01
  */
 import { contextBridge, ipcRenderer } from 'electron';
+import type { AsrOptions } from './managers/asr-manager.js';
 
 // 预加载脚本：用 contextBridge 安全地把主进程能力暴露给渲染器
 // 暴露的 API 需谨慎设计，只暴露必要的异步方法与事件订阅
@@ -51,6 +52,26 @@ contextBridge.exposeInMainWorld('api', {
   ipcRenderer.on('trigger-lookup', listener);
   return () => ipcRenderer.removeListener('trigger-lookup', listener);
  },
+
+ // 系统级截图/划词事件（由全局快捷键触发）
+ onSystemScreenshot: (cb: (data: { imageBase64: string; timestamp: number; source: string }) => void) => {
+  const listener = (_e: any, data: any) => cb(data);
+  ipcRenderer.on('system-screenshot', listener);
+  return () => ipcRenderer.removeListener('system-screenshot', listener);
+ },
+ onSystemTextSelect: (cb: (data: { text: string; timestamp: number; source: string }) => void) => {
+  const listener = (_e: any, data: any) => cb(data);
+  ipcRenderer.on('system-text-select', listener);
+  return () => ipcRenderer.removeListener('system-text-select', listener);
+ },
+
+ // 悬浮窗操作事件（overlay 中的按钮点击会转发到主窗口）
+ onSmartOverlayAction: (cb: (data: any) => void) => {
+  const listener = (_e: any, data: any) => cb(data);
+  ipcRenderer.on('smart-overlay-action', listener);
+  return () => ipcRenderer.removeListener('smart-overlay-action', listener);
+ },
+
  // Softbus 事件
  onSoftbusConnected: (cb: () => void) => {
   const listener = () => cb();
@@ -97,6 +118,25 @@ contextBridge.exposeInMainWorld('api', {
  // 悬浮层控制（无需 HTTP）
  overlayShow: (title: string, text: string) => ipcRenderer.invoke('overlay:show', { title, text }),
  
+ // ── 智能悬浮窗 API ──
+ smartOverlayShow: (payload: any) => ipcRenderer.invoke('smart-overlay:show', payload),
+ smartOverlayClose: () => ipcRenderer.invoke('smart-overlay:close'),
+ smartOverlayResize: (bounds: { width: number; height: number }) => ipcRenderer.invoke('smart-overlay:resize', bounds),
+ 
+ // 悬浮窗内部页面使用的 API（通过同一 preload 加载）
+ onOverlayUpdate: (cb: (data: any) => void) => {
+  const listener = (_e: any, data: any) => cb(data);
+  ipcRenderer.on('overlay:update', listener);
+  return () => ipcRenderer.removeListener('overlay:update', listener);
+ },
+ overlayResize: (bounds: { width: number; height: number }) => ipcRenderer.send('smart-overlay:resize', bounds),
+ overlayClose: () => ipcRenderer.send('smart-overlay:close'),
+ overlayAction: (data: any) => ipcRenderer.send('smart-overlay:action', data),
+
+ // ── 剪贴板 API ──
+ clipboardReadText: () => ipcRenderer.invoke('clipboard:read-text'),
+ clipboardReadImage: () => ipcRenderer.invoke('clipboard:read-image'),
+ 
  // Softbus API (软总线接口)
  softbus: {
   status: () => ipcRenderer.invoke('softbus:status'),
@@ -124,6 +164,14 @@ contextBridge.exposeInMainWorld('api', {
     ipcRenderer.invoke('orchestrator:execute-pipeline', { name, data }),
   send: (topic: string, data: any, contentType?: string) => 
     ipcRenderer.invoke('orchestrator:send', { topic, data, contentType }),
+ },
+
+ // ASR API（桌面端本地辅助链路，当前主语音链路以后台 SeamlessM4T 为准）
+ asr: {
+  transcribeFromBase64: (base64Wav: string, options?: AsrOptions) =>
+    ipcRenderer.invoke('asr:transcribe-from-base64', base64Wav, options),
+  status: () => ipcRenderer.invoke('asr:status'),
+  stopServer: () => ipcRenderer.invoke('asr:stop-server'),
  }
 });
 

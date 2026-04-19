@@ -10,6 +10,7 @@ from sqlmodel import Field, SQLModel
 
 class User(SQLModel, table=True):
     __tablename__ = "users"
+    __table_args__ = {"extend_existing": True}
 
     id: int | None = Field(default=None, primary_key=True)
     username: str = Field(index=True, unique=True, max_length=128)
@@ -22,9 +23,11 @@ class User(SQLModel, table=True):
 
 class StudentProfile(SQLModel, table=True):
     __tablename__ = "students"
+    __table_args__ = {"extend_existing": True}
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id", unique=True, index=True)
+    class_id: str | None = Field(default=None, index=True, max_length=64)
     level: str = Field(default="beginner", max_length=32)
     goals: list[str] = Field(default_factory=list, sa_column=Column(JSON))
     interests: list[str] = Field(default_factory=list, sa_column=Column(JSON))
@@ -34,6 +37,7 @@ class StudentProfile(SQLModel, table=True):
 
 class VocabularyItem(SQLModel, table=True):
     __tablename__ = "vocabulary"
+    __table_args__ = {"extend_existing": True}
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id", index=True)
@@ -49,6 +53,7 @@ class VocabularyItem(SQLModel, table=True):
 
 class LearningRecord(SQLModel, table=True):
     __tablename__ = "learning_records"
+    __table_args__ = {"extend_existing": True}
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id", index=True)
@@ -60,6 +65,7 @@ class LearningRecord(SQLModel, table=True):
 
 class LearningPath(SQLModel, table=True):
     __tablename__ = "learning_paths"
+    __table_args__ = {"extend_existing": True}
 
     id: int | None = Field(default=None, primary_key=True)
     user_id: int = Field(foreign_key="users.id", index=True)

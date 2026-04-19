@@ -17,7 +17,7 @@ const initChart = () => {
 
 watch(() => props.options, (newOptions) => {
   if (chartInstance) {
-    chartInstance.setOption(newOptions);
+    chartInstance.setOption(newOptions, { notMerge: true });
   }
 }, { deep: true });
 

@@ -52,6 +52,8 @@ _DEFAULT_RUNTIME_CONFIG: dict[str, Any] = {
             "chat": "",
             "vocab": "",
             "essay": "",
+            "analytics": "",  # 本地模型：学情分析、个人画像、周报润色
+            "class_analysis": "",  # 云端模型：复杂班级数据分析
         },
     },
     "prompts": {

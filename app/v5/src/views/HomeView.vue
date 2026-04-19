@@ -24,34 +24,35 @@ const searchResult = ref<VocabularyResult | null>(null);
 /** 错误提示信息 */
 const errorMsg = ref('');
 
-// --- 方法定义 ---
+const runLookup = async (term: string, options?: { updateInput?: boolean }) => {
+  const normalized = String(term || '').trim();
+  if (!normalized) return;
 
-/**
- * 处理文本搜索
- * 
- * 当用户点击查询按钮或按下回车键时触发。
- * 调用 VocabularyService.query 获取单词详情。
- */
-const handleSearch = async () => {
-  console.log('Search triggered');
-  const term = searchQuery.value.trim();
-  if (!term) return;
-  
+  if (options?.updateInput !== false) {
+    searchQuery.value = normalized;
+  }
+
   isSearching.value = true;
   errorMsg.value = '';
   searchResult.value = null;
 
   try {
-    console.log('Calling VocabularyService.query with:', term);
-    const result = await VocabularyService.query(term);
-    console.log('Query result:', result);
+    const result = await VocabularyService.query(normalized);
     searchResult.value = result;
   } catch (err: any) {
     console.error('Search error:', err);
-    errorMsg.value = err.message || '查询失败，请稍后重试';
+    errorMsg.value = err?.message || '查询失败，请稍后重试。';
   } finally {
     isSearching.value = false;
   }
+};
+
+const handleSearch = async () => {
+  await runLookup(searchQuery.value, { updateInput: true });
+};
+
+const handleRecommendationLookup = async (word: string) => {
+  await runLookup(word, { updateInput: true });
 };
 
 /**
@@ -82,13 +83,12 @@ const handlePaste = async (event: ClipboardEvent) => {
       reader.onload = async (e) => {
         const base64 = e.target?.result as string;
         try {
-          // 调用 OCR 服务
           const result = await VocabularyService.queryOCR(base64);
           searchResult.value = result;
-          searchQuery.value = result.word; // 识别成功后更新输入框为识别到的单词
+          searchQuery.value = result.word;
         } catch (err: any) {
-          console.error(err);
-          errorMsg.value = err.message || 'OCR 识别失败';
+          console.error('OCR error:', err);
+          errorMsg.value = err?.message || '识图失败，请重试。';
           searchQuery.value = '';
         } finally {
           isSearching.value = false;
@@ -145,7 +145,11 @@ onUnmounted(() => {
     <!-- Result Area (Minimalist Text Box) -->
     <div class="flex-1 bg-gray-900 rounded-xl border border-gray-700 shadow-inner overflow-hidden flex flex-col">
       <div class="flex-1 overflow-y-auto p-6 custom-scrollbar">
-        <VocabularyCard v-if="searchResult" :data="searchResult" />
+        <VocabularyCard
+          v-if="searchResult"
+          :data="searchResult"
+          @lookup-recommendation="handleRecommendationLookup"
+        />
         <div v-else class="h-full flex flex-col items-center justify-center text-gray-600 space-y-4">
           <div class="text-6xl opacity-20">⌨️</div>
           <p>等待输入...</p>

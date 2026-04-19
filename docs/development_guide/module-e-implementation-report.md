@@ -32,7 +32,7 @@
 
 #### 模型路由
 - [x] 场景扩写路由 → Kimi API (thinking模式)
-- [x] 对话执行路由 → Qwen2.5-7B本地
+- [x] 对话执行路由 → Qwen3.5-9B本地
 - [x] 作文批改路由 → Kimi API
 - [x] 词汇生成路由 → Kimi API
 - [x] 故障自动切换 (主模型失败→备用模型)
@@ -62,7 +62,7 @@
 
 - ⚠️ 对话场景扩写: 用户描述 → Kimi API扩写 → 作为Qwen的System Prompt
 - ⚠️ 上下文窗口管理: 超过80%时触发自动摘要
-- ⚠️ 本地模型Qwen2.5-7B通过Ollama/vLLM部署
+- ⚠️ 本地模型Qwen3.5-9B通过Ollama/vLLM部署
 - ⚠️ Kimi API必须设置超时: 连接5s, 读取30s
 
 ---

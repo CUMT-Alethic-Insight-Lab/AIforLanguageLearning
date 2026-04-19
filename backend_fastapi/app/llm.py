@@ -41,6 +41,11 @@ def _score_llm_model(model_id: str) -> tuple[int, str] | None:
         size += 200
     if "thinking" in low:
         size += 300
+    if "coder" in low:
+        size += 150
+    # MoE 大总参数量模型（如 35B-A3B）虽然激活参数小，但加载/切换成本高
+    if "a3b" in low or "a2b" in low or "moe" in low:
+        size += 50
 
     return (size, mid)
 
@@ -93,9 +98,9 @@ async def list_available_llm_models() -> list[str]:
                 ids.append(model_id.strip())
 
     ranked = _rank_models(ids)
-    current = get_runtime_config()
-    current_primary = str(((current.get("models") or {}).get("primary") or "")).strip()
-    primary = current_primary if current_primary in ranked else (ranked[0] if ranked else "")
+    # 始终使用排序后的最优模型作为 primary，不保留旧缓存。
+    # 原因：本地 LM Studio 可能切换模型，旧缓存会导致错误调用大模型（如 35B）。
+    primary = ranked[0] if ranked else ""
 
     update_runtime_config(
         {
@@ -151,7 +156,39 @@ def _extract_chat_response_text(data: Any) -> str:
     return ""
 
 
-async def _resolve_llm_model(client: httpx.AsyncClient, *, scene: str = "chat") -> str:
+async def _list_models_from_client(client: httpx.AsyncClient, *, api_key: str) -> list[str]:
+    """List available chat-capable models from the provided client endpoint."""
+
+    try:
+        resp = await client.get(
+            "/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception:
+        return []
+
+    raw = data.get("data")
+    ids: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            model_id = item.get("id")
+            if isinstance(model_id, str) and model_id.strip():
+                ids.append(model_id.strip())
+
+    return _rank_models(ids)
+
+
+async def _resolve_llm_model(
+    client: httpx.AsyncClient,
+    *,
+    scene: str = "chat",
+    api_key: str | None = None,
+    use_global_cache: bool = True,
+) -> str:
     """Resolve a usable model id for OpenAI-compatible servers.
 
     Problem:
@@ -178,6 +215,17 @@ async def _resolve_llm_model(client: httpx.AsyncClient, *, scene: str = "chat") 
     configured = str(getattr(settings, "llm_model", "") or "").strip()
     if configured and (not _is_placeholder_model(configured)):
         return configured
+
+    resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
+
+    if not use_global_cache:
+        try:
+            models = await _list_models_from_client(client, api_key=resolved_api_key)
+            if models:
+                return models[0]
+        except Exception:
+            pass
+        return configured or primary or scene_model or "local-model"
 
     global _LLM_MODEL_CACHE
     if _LLM_MODEL_CACHE:
@@ -602,7 +650,7 @@ async def generate_vocab_fields(term: str) -> dict[str, Any]:
                 }
     except Exception:
         return {
-            "meaning": "暂无（LLM 未连接或超时）",
+            "meaning": "暂无（服务暂时不可用，请稍后再试）",
             "example": "暂无",
             "example_translation": "暂无",
             "definitions": [],
@@ -652,7 +700,7 @@ async def generate_definition(term: str) -> str:
                 return text
     except Exception:
         # 降级：不抛出，保持服务可用
-        return "释义：暂无（LLM 未连接或超时）\n例句：暂无"
+        return "释义：暂无（服务暂时不可用，请稍后再试）\n例句：暂无"
 
     return "释义：暂无\n例句：暂无"
 
@@ -683,6 +731,10 @@ async def chat_complete(
     system_prompt: str,
     user_text: str,
     history: list[dict[str, str]] | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float = 0.7,
 ) -> str:
     """Generate a single-turn chat completion using an explicit system prompt.
 
@@ -696,18 +748,28 @@ async def chat_complete(
 
     effective = min(float(settings.llm_timeout_seconds), 15.0)
     timeout = httpx.Timeout(effective, connect=min(2.0, effective))
+    resolved_base_url = str(base_url or "").strip() or settings.llm_base_url
+    resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
-            model = await _resolve_llm_model(client, scene="chat")
+        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+            resolved_model = str(model or "").strip()
+            if not resolved_model:
+                custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
+                resolved_model = await _resolve_llm_model(
+                    client,
+                    scene="chat",
+                    api_key=resolved_api_key,
+                    use_global_cache=not custom_endpoint,
+                )
             payload: dict[str, Any] = {
-                "model": model,
+                "model": resolved_model,
                 "messages": _build_chat_messages(system_prompt=sp, user_text=ut, history=history),
-                "temperature": 0.4,
+                "temperature": temperature,
             }
             resp = await client.post(
                 "/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                headers={"Authorization": f"Bearer {resolved_api_key}"},
                 json=payload,
             )
             resp.raise_for_status()
@@ -716,7 +778,162 @@ async def chat_complete(
             if text:
                 return text
     except Exception:
-        return "（LLM 未连接或超时）"
+        return "（网络不太稳定，请稍后再试）"
+
+    return "（LLM 输出为空）"
+
+
+async def chat_complete_race(
+    *,
+    system_prompt: str,
+    user_text: str,
+    history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
+) -> str:
+    """同时调用云端（Kimi）和本地模型，谁先成功返回用谁。
+
+    适用于实时助教等对能力上限要求高、且延迟敏感的场景。
+    若 Kimi 未配置，直接回退到本地。
+    """
+    sp = (system_prompt or "").strip() or "You are a helpful assistant."
+    ut = (user_text or "").strip()
+    if not ut:
+        return "（未检测到输入内容）"
+
+    messages = _build_chat_messages(system_prompt=sp, user_text=ut, history=history)
+
+    try:
+        from .model_router import get_model_router
+
+        router = get_model_router()
+        return await router.call_cloud_local_race(messages, temperature=temperature)
+    except Exception:
+        return "（网络不太稳定，请稍后再试）"
+
+
+async def chat_complete_cloud_first(
+    *,
+    system_prompt: str,
+    user_text: str,
+    history: list[dict[str, str]] | None = None,
+    temperature: float = 0.7,
+    timeout_seconds: float = 10.0,
+) -> str:
+    """云端（Kimi）优先，超过 timeout_seconds 无响应则 fallback 到本地模型。
+
+    适用于学情分析、周报等对质量要求高、但延迟不敏感的后台场景。
+    """
+    sp = (system_prompt or "").strip() or "You are a helpful assistant."
+    ut = (user_text or "").strip()
+    if not ut:
+        return "（未检测到输入内容）"
+
+    messages = _build_chat_messages(system_prompt=sp, user_text=ut, history=history)
+
+    try:
+        from .model_router import get_model_router
+
+        router = get_model_router()
+        return await router.call_cloud_first_timeout(
+            messages,
+            temperature=temperature,
+            timeout=timeout_seconds,
+        )
+    except Exception:
+        # 全部失败时回退到纯本地调用
+        return await chat_complete(
+            system_prompt=system_prompt,
+            user_text=user_text,
+            history=history,
+            temperature=temperature,
+        )
+
+
+async def chat_complete_multimodal(
+    *,
+    system_prompt: str,
+    user_text: str,
+    image_base64: str | None = None,
+    history: list[dict[str, Any]] | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    timeout_seconds: float | None = None,
+    temperature: float = 0.7,
+    max_tokens: int = 700,
+) -> str:
+    """多模态对话补全（支持文本+单张图片）。
+
+    采用 OpenAI vision 兼容格式：
+    ```
+    content: [
+        {"type": "text", "text": "..."},
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,..."}}
+    ]
+    ```
+
+    失败时返回降级文本，不抛异常。
+    """
+    sp = (system_prompt or "").strip() or "You are a helpful assistant."
+    ut = (user_text or "").strip()
+    if not ut:
+        return "（未检测到输入内容）"
+
+    effective = min(float(timeout_seconds or settings.llm_timeout_seconds), 20.0)
+    timeout = httpx.Timeout(effective, connect=min(2.0, effective))
+    resolved_base_url = str(base_url or "").strip() or settings.llm_base_url
+    resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
+
+    # 构建 user message content
+    user_content: list[dict[str, Any]] = [{"type": "text", "text": ut}]
+    if image_base64:
+        # 确保前缀正确
+        if not image_base64.startswith("data:"):
+            image_base64 = f"data:image/jpeg;base64,{image_base64}"
+        user_content.append({
+            "type": "image_url",
+            "image_url": {"url": image_base64, "detail": "low"},
+        })
+
+    messages: list[dict[str, Any]] = [{"role": "system", "content": sp}]
+    if history:
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            role = str(item.get("role") or "").strip().lower()
+            content = item.get("content")
+            if role in ("user", "assistant") and content:
+                messages.append({"role": role, "content": content})
+    messages.append({"role": "user", "content": user_content})
+
+    try:
+        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+            resolved_model = str(model or "").strip()
+            if not resolved_model:
+                resolved_model = await _resolve_llm_model(
+                    client,
+                    scene="chat",
+                    api_key=resolved_api_key,
+                    use_global_cache=True,
+                )
+            payload: dict[str, Any] = {
+                "model": resolved_model,
+                "messages": messages,
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            resp = await client.post(
+                "/chat/completions",
+                headers={"Authorization": f"Bearer {resolved_api_key}"},
+                json=payload,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            text = _extract_chat_response_text(data)
+            if text:
+                return text
+    except Exception:
+        return "（网络不太稳定，请稍后再试）"
 
     return "（LLM 输出为空）"
 
@@ -837,6 +1054,10 @@ async def stream_chat(
     system_prompt: str,
     user_text: str,
     history: list[dict[str, str]] | None = None,
+    model: str | None = None,
+    base_url: str | None = None,
+    api_key: str | None = None,
+    temperature: float = 0.7,
 ) -> AsyncIterator[str]:
     """Stream a single-turn chat completion with an explicit system prompt.
 
@@ -849,20 +1070,30 @@ async def stream_chat(
         return
 
     timeout = httpx.Timeout(settings.llm_timeout_seconds)
+    resolved_base_url = str(base_url or "").strip() or settings.llm_base_url
+    resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
-            model = await _resolve_llm_model(client, scene="chat")
+        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+            resolved_model = str(model or "").strip()
+            if not resolved_model:
+                custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
+                resolved_model = await _resolve_llm_model(
+                    client,
+                    scene="chat",
+                    api_key=resolved_api_key,
+                    use_global_cache=not custom_endpoint,
+                )
             payload: dict[str, Any] = {
-                "model": model,
+                "model": resolved_model,
                 "messages": _build_chat_messages(system_prompt=sp, user_text=ut, history=history),
-                "temperature": 0.4,
+                "temperature": temperature,
                 "stream": True,
             }
             async with client.stream(
                 "POST",
                 "/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
+                headers={"Authorization": f"Bearer {resolved_api_key}"},
                 json=payload,
             ) as resp:
                 resp.raise_for_status()
@@ -1007,56 +1238,55 @@ def _normalize_essay_result(obj: Any, *, ocr_text: str, language: str) -> dict[s
 
 
 async def grade_essay(*, ocr_text: str, language: str) -> dict[str, Any]:
-    """作文批改：尽力调用 LLM；失败则返回可用的降级 JSON。"""
+    """作文批改：尽力调用 LLM；失败则返回可用的降级 JSON。
+
+    路由策略：云端优先，1s 内无响应则自动 fallback 到本地模型。
+    temperature = 0.5（评分稳定性优先）。
+    """
 
     prompt = render_prompt("essay_grade.j2", language=language, ocr_text=ocr_text)
 
-    payload: dict[str, Any] = {
-        "model": settings.llm_model,
-        "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": prompt},
-        ],
-        "temperature": 0.2,
-    }
-
-    timeout = httpx.Timeout(settings.llm_timeout_seconds)
+    messages = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": prompt},
+    ]
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
-            payload["model"] = await _resolve_llm_model(client, scene="essay")
-            resp = await client.post(
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json=payload,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            content = _extract_chat_response_text(data)
-            if isinstance(content, str) and content.strip():
-                raw = content.strip()
-                obj: Any | None = None
-                try:
-                    obj = json.loads(raw)
-                except Exception:
-                    json_text = _extract_json_object(raw)
-                    if json_text:
-                        try:
-                            obj = json.loads(json_text)
-                        except Exception:
-                            obj = None
+        from .model_router import get_model_router
 
-                # Double-decode if model returned a JSON string.
-                if isinstance(obj, str):
-                    try:
-                        obj2 = json.loads(obj)
-                        obj = obj2
-                    except Exception:
-                        pass
-
-                if obj is not None:
-                    return _normalize_essay_result(obj, ocr_text=ocr_text, language=language)
+        router = get_model_router()
+        content = await router.call_cloud_first_timeout(
+            messages,
+            temperature=0.5,
+            timeout=1.0,
+        )
     except Exception:
         return _fallback_essay_result(ocr_text=ocr_text, language=language)
+
+    if not content:
+        return _fallback_essay_result(ocr_text=ocr_text, language=language)
+
+    raw = content.strip()
+    obj: Any | None = None
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        json_text = _extract_json_object(raw)
+        if json_text:
+            try:
+                obj = json.loads(json_text)
+            except Exception:
+                obj = None
+
+    # Double-decode if model returned a JSON string.
+    if isinstance(obj, str):
+        try:
+            obj2 = json.loads(obj)
+            obj = obj2
+        except Exception:
+            pass
+
+    if obj is not None:
+        return _normalize_essay_result(obj, ocr_text=ocr_text, language=language)
 
     return _fallback_essay_result(ocr_text=ocr_text, language=language)

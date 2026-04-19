@@ -1,9 +1,9 @@
 <#
-AI 外语学习系统 - 快速启动脚本
+AI 外语学习系统 - 快速启动脚本 (v2.0)
 
-目标：启动“既定技术路线”的开发组合：
-- 后端：backend_fastapi (FastAPI) 监听 8012
-- 前端：app/v5 (Vite) 监听 5173
+支持两种模式：
+1. 开发模式（默认）：启动 FastAPI + Vite 开发服务器
+2. Portable 模式（-Portable）：启动 FastAPI + 已打包的 Electron Portable 版本
 
 原则：控制台输出必须与实际状态一致。
 - 只有在端口监听 / HTTP 健康检查通过后才打印 ✓
@@ -17,7 +17,8 @@ param(
     [switch]$EnableAsr,
     [switch]$DisableAsr,
     [string]$AsrCondaEnv = 'asr',
-    [switch]$ForceRestartBackend
+    [switch]$ForceRestartBackend,
+    [switch]$Portable          # 使用已打包的 Electron Portable 版本（不启动 Vite 开发服务器）
 )
 
 $ErrorActionPreference = 'Stop'
@@ -212,9 +213,11 @@ Write-Host ("=" * 60) -ForegroundColor Cyan
 Write-Host "AI 外语学习系统 - 启动中..." -ForegroundColor Cyan
 Write-Host ("=" * 60) -ForegroundColor Cyan
 
-# ASR 策略：默认 auto（能用就启用，不满足依赖则降级）；
-# -EnableAsr：强制启用（依赖不满足则报错）；
-# -DisableAsr：显式禁用。
+# 模式说明：
+# -Portable：使用已打包的 Electron Portable 版本（不启动 Vite 开发服务器）
+# -EnableAsr：强制启用 ASR（依赖不满足则报错）
+# -DisableAsr：显式禁用 ASR
+# 默认：开发模式（Vite热重载），ASR auto（能用就启用，不满足则降级）
 $asrMode = 'auto'
 if ($DisableAsr) { $asrMode = 'off' }
 elseif ($EnableAsr) { $asrMode = 'on' }
@@ -268,8 +271,10 @@ if ($asrMode -ne 'off') {
         $asrMode = 'off'
     }
 }
-if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
-    throw "未找到 npm。请先安装 Node.js（含 npm），或确保 npm 在 PATH。"
+if (-not $Portable) {
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw "未找到 npm。请先安装 Node.js（含 npm），或确保 npm 在 PATH。"
+    }
 }
 
 if (Test-PortListening -port $BackendPort) {
@@ -374,34 +379,71 @@ try {
     Write-Warn "无法读取后端运行态配置（/api/system/config）。"
 }
 
-Write-Step "[3/3] 启动前端 (Vite / app/v5)"
-if (-not (Test-PortListening -port $FrontendPort)) {
-    $frontendCmd = "cd '$frontendV5Path'; Write-Host 'Vite 前端启动中...' -ForegroundColor Cyan; npm run dev"
-    $frontendProc = Start-Process pwsh -PassThru -ArgumentList "-NoExit", "-Command", $frontendCmd
-    Set-Content -Path $frontendPidFile -Value $frontendProc.Id
-    Write-Host "已启动前端窗口（PID=$($frontendProc.Id)），等待连通性检查..." -ForegroundColor Gray
+# 查找已打包的 Portable 版本
+$portableExe = $null
+$releaseDir = Join-Path $frontendV5Path "release"
+if (Test-Path $releaseDir) {
+    $portableCandidates = Get-ChildItem -Path $releaseDir -Filter "*.exe" -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "AIFL-V5*.exe" }
+    if ($portableCandidates) {
+        $portableExe = $portableCandidates | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    }
 }
 
-$frontendUrl = "http://127.0.0.1:$FrontendPort"
-$frontendCandidates = @(
-    "http://localhost:$FrontendPort",
-    "http://127.0.0.1:$FrontendPort",
-    "http://[::1]:$FrontendPort"
-)
-$frontendReadyUrl = Wait-HttpOkAny -urls $frontendCandidates -timeoutSeconds 75
-if ($frontendReadyUrl) {
-    $frontendUrl = $frontendReadyUrl
+if ($Portable) {
+    Write-Step "[3/3] 启动前端 (Electron Portable)"
+    if (-not $portableExe) {
+        Write-Fail "未找到已打包的 Portable 版本（app/v5/release/AIFL-V5*.exe）"
+        Write-Host "建议：先执行 'cd app/v5 && npm run dist' 打包，或去掉 -Portable 参数使用开发模式。" -ForegroundColor Gray
+        throw "Portable 版本未找到。"
+    }
+    
+    # 检查 portable 是否已在运行
+    $portableRunning = $false
+    try {
+        $portableProcs = Get-Process | Where-Object { $_.ProcessName -like "*AIFL-V5*" -or $_.ProcessName -like "*AIFL*" }
+        if ($portableProcs) { $portableRunning = $true }
+    } catch { }
+    
+    if (-not $portableRunning) {
+        $frontendProc = Start-Process -FilePath $portableExe.FullName -PassThru -WorkingDirectory $releaseDir
+        Set-Content -Path $frontendPidFile -Value $frontendProc.Id
+        Write-Ok "已启动 Portable 前端：$($portableExe.Name) (PID=$($frontendProc.Id))"
+    } else {
+        Write-Warn "Portable 前端已在运行，跳过启动"
+    }
+    
+    $frontendUrl = "Electron Portable (独立窗口)"
     Write-Ok "前端可用：$frontendUrl"
 } else {
-    Write-Fail "前端连通性检查失败：$frontendUrl"
-    Write-Host "建议：查看前端窗口输出；首次启动需要在 app/v5 下执行 npm install。" -ForegroundColor Gray
-    throw "前端未就绪。"
-}
+    Write-Step "[3/3] 启动前端 (Vite / app/v5)"
+    if (-not (Test-PortListening -port $FrontendPort)) {
+        $frontendCmd = "cd '$frontendV5Path'; Write-Host 'Vite 前端启动中...' -ForegroundColor Cyan; npm run dev"
+        $frontendProc = Start-Process pwsh -PassThru -ArgumentList "-NoExit", "-Command", $frontendCmd
+        Set-Content -Path $frontendPidFile -Value $frontendProc.Id
+        Write-Host "已启动前端窗口（PID=$($frontendProc.Id)），等待连通性检查..." -ForegroundColor Gray
+    }
 
-if (-not $SkipBrowser) {
-    Write-Step "[完成] 打开浏览器"
-    Start-Process $frontendUrl
-    Write-Ok "已打开：$frontendUrl"
+    $frontendUrl = "http://127.0.0.1:$FrontendPort"
+    $frontendCandidates = @(
+        "http://localhost:$FrontendPort",
+        "http://127.0.0.1:$FrontendPort",
+        "http://[::1]:$FrontendPort"
+    )
+    $frontendReadyUrl = Wait-HttpOkAny -urls $frontendCandidates -timeoutSeconds 75
+    if ($frontendReadyUrl) {
+        $frontendUrl = $frontendReadyUrl
+        Write-Ok "前端可用：$frontendUrl"
+    } else {
+        Write-Fail "前端连通性检查失败：$frontendUrl"
+        Write-Host "建议：查看前端窗口输出；首次启动需要在 app/v5 下执行 npm install。" -ForegroundColor Gray
+        throw "前端未就绪。"
+    }
+
+    if (-not $SkipBrowser) {
+        Write-Step "[完成] 打开浏览器"
+        Start-Process $frontendUrl
+        Write-Ok "已打开：$frontendUrl"
+    }
 }
 
 Write-Host ("`n" + "=" * 60) -ForegroundColor Cyan

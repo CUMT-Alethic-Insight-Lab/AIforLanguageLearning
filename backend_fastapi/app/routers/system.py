@@ -102,8 +102,7 @@ async def get_config() -> SystemConfigResponse:
     prompt_dir = Path(__file__).resolve().parent.parent / "prompts"
     prompt_templates = sorted([p.name for p in prompt_dir.glob("*.j2")])
 
-    has_faster_whisper = _has_module("faster_whisper")
-    has_openai_whisper = _has_module("whisper")
+    has_seamless = _has_module("transformers")
     has_paddleocr = _has_module("paddleocr")
 
     runtime = get_runtime_config()
@@ -141,11 +140,16 @@ async def get_config() -> SystemConfigResponse:
         },
         tts={
             "backend": str(settings.tts_backend),
-            "xtts": {
-                "model": str(settings.xtts_model_name),
-                "language": str(settings.xtts_language),
-                "promptWav": str(settings.xtts_prompt_wav),
+            "kokoro": {
+                "langCode": str(settings.kokoro_lang_code),
+                "voice": str(settings.kokoro_voice),
+                "speed": float(settings.kokoro_speed),
             },
+            "edge": {
+                "voice": str(settings.edge_tts_voice),
+                "speed": str(settings.edge_tts_speed),
+            },
+
         },
         asr={
             "enabled": bool(settings.enable_asr),
@@ -159,9 +163,8 @@ async def get_config() -> SystemConfigResponse:
                 "silenceMs": int(settings.vad_silence_ms),
             },
             "runtime": {
-                "available": bool(has_faster_whisper or has_openai_whisper),
-                "hasFasterWhisper": bool(has_faster_whisper),
-                "hasOpenAIWhisper": bool(has_openai_whisper),
+                "available": bool(has_seamless),
+                "hasSeamless": bool(has_seamless),
             },
         },
         python={
@@ -212,12 +215,11 @@ async def update_config(payload: dict[str, Any]) -> dict[str, Any]:
 
     asr = patch.get("asr")
     if isinstance(asr, dict):
-        allowed_asr_backends = {"faster-whisper", "openai-whisper"}
         if "enabled" in asr:
             settings.enable_asr = bool(asr.get("enabled"))
         if isinstance(asr.get("backend"), str):
             backend = str(asr.get("backend") or "").strip()
-            if backend in allowed_asr_backends:
+            if backend:
                 settings.asr_backend = backend
         if isinstance(asr.get("model"), str):
             settings.asr_model = str(asr.get("model")).strip() or settings.asr_model
@@ -249,15 +251,6 @@ async def update_config(payload: dict[str, Any]) -> dict[str, Any]:
     if isinstance(tts, dict):
         if isinstance(tts.get("backend"), str):
             settings.tts_backend = str(tts.get("backend")).strip() or settings.tts_backend
-        xtts = tts.get("xtts")
-        if isinstance(xtts, dict):
-            if isinstance(xtts.get("model"), str):
-                settings.xtts_model_name = str(xtts.get("model")).strip() or settings.xtts_model_name
-            if isinstance(xtts.get("language"), str):
-                settings.xtts_language = str(xtts.get("language")).strip() or settings.xtts_language
-            if isinstance(xtts.get("promptWav"), str):
-                settings.xtts_prompt_wav = str(xtts.get("promptWav")).strip()
-
     # 2) 运行时可持久化部分（场景模型 / Prompt 覆盖）
     runtime_patch: dict[str, Any] = {}
     if isinstance(models, dict):

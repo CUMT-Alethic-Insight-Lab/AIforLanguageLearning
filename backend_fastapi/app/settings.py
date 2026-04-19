@@ -83,7 +83,7 @@ class Settings(BaseSettings):
         default=True, validation_alias=AliasChoices("AIFL_ENABLE_ASR", "ENABLE_ASR")
     )
     asr_backend: str = Field(
-        default="faster-whisper",
+        default="seamless",
         validation_alias=AliasChoices("AIFL_ASR_BACKEND", "ASR_BACKEND"),
     )
     asr_model: str = Field(
@@ -108,9 +108,9 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AIFL_VAD_SILENCE_MS", "VAD_SILENCE_MS"),
     )
 
-    # TTS（P1）：默认使用 XTTS；若依赖/模型不可用，代码层会自动回退到静音 wav。
+    # TTS（P1）：默认使用 Kokoro（轻量 CPU real-time）；若依赖不可用，代码层自动回退到静音 wav。
     tts_backend: str = Field(
-        default="xtts",
+        default="kokoro",
         validation_alias=AliasChoices("AIFL_TTS_BACKEND", "TTS_BACKEND"),
     )
     tts_chunk_size_bytes: int = Field(
@@ -118,18 +118,66 @@ class Settings(BaseSettings):
         validation_alias=AliasChoices("AIFL_TTS_CHUNK_SIZE_BYTES", "TTS_CHUNK_SIZE_BYTES"),
     )
 
-    # XTTS v2 (optional)
-    xtts_model_name: str = Field(
-        default="tts_models/multilingual/multi-dataset/xtts_v2",
-        validation_alias=AliasChoices("AIFL_XTTS_MODEL_NAME", "XTTS_MODEL_NAME"),
+    # Kokoro TTS (lightweight, CPU, recommended)
+    kokoro_lang_code: str = Field(
+        default="a",
+        validation_alias=AliasChoices("AIFL_KOKORO_LANG_CODE", "KOKORO_LANG_CODE"),
     )
-    xtts_prompt_wav: str = Field(
+    kokoro_voice: str = Field(
+        default="af_bella",
+        validation_alias=AliasChoices("AIFL_KOKORO_VOICE", "KOKORO_VOICE"),
+    )
+    kokoro_speed: float = Field(
+        default=1.0,
+        validation_alias=AliasChoices("AIFL_KOKORO_SPEED", "KOKORO_SPEED"),
+    )
+
+    # Edge TTS (online, free, multilingual fallback)
+    edge_tts_voice: str = Field(
+        default="en-US-AriaNeural",
+        validation_alias=AliasChoices("AIFL_EDGE_TTS_VOICE", "EDGE_TTS_VOICE"),
+    )
+    edge_tts_speed: str = Field(
+        default="+0%",
+        validation_alias=AliasChoices("AIFL_EDGE_TTS_SPEED", "EDGE_TTS_SPEED"),
+    )
+
+    # Real-time Teaching Assistant
+    rta_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AIFL_RTA_ENABLED", "RTA_ENABLED"),
+    )
+    rta_llm_model: str = Field(
+        default="moonshot-v1-auto",
+        validation_alias=AliasChoices("AIFL_RTA_LLM_MODEL", "RTA_LLM_MODEL"),
+    )
+    rta_llm_base_url: str = Field(
         default="",
-        validation_alias=AliasChoices("AIFL_XTTS_PROMPT_WAV", "XTTS_PROMPT_WAV"),
+        validation_alias=AliasChoices("AIFL_RTA_LLM_BASE_URL", "RTA_LLM_BASE_URL"),
     )
-    xtts_language: str = Field(
-        default="en",
-        validation_alias=AliasChoices("AIFL_XTTS_LANGUAGE", "XTTS_LANGUAGE"),
+    rta_llm_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("AIFL_RTA_LLM_API_KEY", "RTA_LLM_API_KEY"),
+    )
+    rta_llm_timeout_seconds: float = Field(
+        default=15.0,
+        validation_alias=AliasChoices("AIFL_RTA_LLM_TIMEOUT", "RTA_LLM_TIMEOUT"),
+    )
+    rta_cooldown_seconds: float = Field(
+        default=5.0,
+        validation_alias=AliasChoices("AIFL_RTA_COOLDOWN", "RTA_COOLDOWN"),
+    )
+    rta_max_context_turns: int = Field(
+        default=6,
+        validation_alias=AliasChoices("AIFL_RTA_MAX_CONTEXT", "RTA_MAX_CONTEXT"),
+    )
+    rta_tts_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AIFL_RTA_TTS_ENABLED", "RTA_TTS_ENABLED"),
+    )
+    rta_ocr_language: str = Field(
+        default="english",
+        validation_alias=AliasChoices("AIFL_RTA_OCR_LANG", "RTA_OCR_LANG"),
     )
 
 
