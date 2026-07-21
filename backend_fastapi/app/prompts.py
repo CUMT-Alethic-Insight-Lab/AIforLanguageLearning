@@ -6,7 +6,6 @@ from jinja2 import Environment, FileSystemLoader, StrictUndefined, Template
 
 from .runtime_config import get_prompt_override
 
-
 _PROMPTS_DIR = Path(__file__).resolve().parent / "prompts"
 
 

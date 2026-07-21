@@ -24,6 +24,12 @@ def test_ws_voice_barge_in_aborts_previous(tmp_path: Path, monkeypatch) -> None:
         yield "token2"
 
     monkeypatch.setattr("app.main.stream_chat", fake_stream_chat)
+    monkeypatch.setattr(
+        "app.main.try_create_seamless_transcriber",
+        lambda **_: (lambda _audio, _cfg: "hello from asr"),
+    )
+    monkeypatch.setattr("app.main.settings.enable_asr", True)
+    monkeypatch.setattr("app.main.settings.asr_backend", "seamless")
 
     client = TestClient(app)
     with client.websocket_connect("/ws/v1?session_id=test&conversation_id=conv_voice_barge") as ws:

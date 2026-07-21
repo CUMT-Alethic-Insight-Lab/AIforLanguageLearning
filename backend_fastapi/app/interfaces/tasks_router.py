@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.domain.models import User
+from app.infrastructure.dependencies import get_current_user
 from app.infrastructure.messaging.celery_app import app as celery_app
 from app.infrastructure.messaging.tasks import generate_daily_vocab_task, grade_essay_task
 
@@ -17,7 +19,10 @@ class EssayTaskRequest(BaseModel):
 
 
 class VocabTaskRequest(BaseModel):
-    user_id: str
+    user_id: str | None = None
+    theme: str = "daily life"
+    difficulty: str = "intermediate"
+    count: int = 20
 
 
 class TaskResponse(BaseModel):
@@ -26,7 +31,10 @@ class TaskResponse(BaseModel):
 
 
 @router.post("/essay", response_model=TaskResponse)
-async def submit_essay_task(req: EssayTaskRequest) -> TaskResponse:
+async def submit_essay_task(
+    req: EssayTaskRequest,
+    current_user: User = Depends(get_current_user),
+) -> TaskResponse:
     if celery_app is None:
         raise HTTPException(status_code=503, detail="Celery not available")
     result = grade_essay_task.delay(req.essay_id, req.content)
@@ -34,8 +42,12 @@ async def submit_essay_task(req: EssayTaskRequest) -> TaskResponse:
 
 
 @router.post("/vocab", response_model=TaskResponse)
-async def submit_vocab_task(req: VocabTaskRequest) -> TaskResponse:
+async def submit_vocab_task(
+    req: VocabTaskRequest,
+    current_user: User = Depends(get_current_user),
+) -> TaskResponse:
     if celery_app is None:
         raise HTTPException(status_code=503, detail="Celery not available")
-    result = generate_daily_vocab_task.delay(req.user_id)
+    target_user_id = str(req.user_id or current_user.id or 0)
+    result = generate_daily_vocab_task.delay(target_user_id, req.theme, req.difficulty, req.count)
     return TaskResponse(task_id=result.id, status="submitted")

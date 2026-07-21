@@ -5,6 +5,7 @@
  */
 
 import { ref } from 'vue';
+import { buildWsUrl } from './backend-url';
 
 /** 消息处理回调函数类型定义 */
 type MessageHandler = (msg: any) => void;
@@ -15,6 +16,7 @@ type WsV1ConnectOptions = {
   backendUrl: string; // e.g. "127.0.0.1:8012" or "localhost:8012"
   sessionId: string;
   conversationId: string;
+  classroomSessionId?: number | string | null;
   userId?: number;
 };
 
@@ -225,23 +227,40 @@ class VoiceSocketService {
     }
   }
 
+  /**
+   * Force-reconnect with new WsV1 options (e.g. new conversationId).
+   * Clears all callbacks on the old socket to prevent spurious handleReconnect,
+   * then immediately opens a fresh connection with the new options.
+   */
+  public reconnectWsV1(options: WsV1ConnectOptions) {
+    if (this.ws) {
+      this.ws.onclose = null;
+      this.ws.onerror = null;
+      this.ws.onopen = null;
+      this.ws.onmessage = null;
+      this.ws.close();
+      this.ws = null;
+    }
+    this.isConnected.value = false;
+    this.reconnectAttempts = 0;
+    this.lastSeq = null;
+    this.connectWsV1(options);
+  }
+
   private buildWsV1Url(): string {
     if (!this.wsV1) return this.url;
-    const backendUrl = normalizeBackendHost(String(this.wsV1.backendUrl || '').trim());
     const sessionId = encodeURIComponent(String(this.wsV1.sessionId || 'anonymous'));
     const conversationId = encodeURIComponent(String(this.wsV1.conversationId || 'conv'));
-    const userId =
-      typeof this.wsV1.userId === 'number' && this.wsV1.userId > 0
-        ? `&user_id=${encodeURIComponent(String(this.wsV1.userId))}`
-        : '';
+    const token = localStorage.getItem('auth_token');
+    const tokenParam = token ? `&token=${encodeURIComponent(token)}` : '';
     const lastSeq = this.lastSeq == null ? '' : `&last_seq=${encodeURIComponent(String(this.lastSeq))}`;
-    return `ws://${backendUrl}/ws/v1?session_id=${sessionId}&conversation_id=${conversationId}${userId}${lastSeq}`;
+    const classroomSessionId = this.wsV1.classroomSessionId;
+    const classroomParam = classroomSessionId ? `&classroom_session_id=${encodeURIComponent(String(classroomSessionId))}` : '';
+    return buildWsUrl(
+      this.wsV1.backendUrl,
+      `/ws/v1?session_id=${sessionId}&conversation_id=${conversationId}${tokenParam}${lastSeq}${classroomParam}`
+    );
   }
-}
-
-function normalizeBackendHost(input: string): string {
-  // Accept "host:port" or a full URL like "http://host:port" / "ws://host:port".
-  return input.replace(/^https?:\/\//, '').replace(/^wss?:\/\//, '').replace(/\/$/, '');
 }
 
 function arrayBufferToBase64(bytes: Uint8Array): string {

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import importlib
 import sys
-from typing import Any
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlparse
 
 from fastapi import APIRouter
@@ -183,7 +183,7 @@ async def get_config() -> SystemConfigResponse:
                 "volume": int(_clamp_int(((app_cfg.get("audio") or {}).get("volume")), low=0, high=100, default=80)),
             },
             "ai": {
-                "model": str(((app_cfg.get("ai") or {}).get("model") or "local-model")),
+                "model": str(((app_cfg.get("ai") or {}).get("model") or "qwen/qwen3.5-9b")),
                 "temperature": float(((app_cfg.get("ai") or {}).get("temperature") or 0.7),),
                 "voice": str(((app_cfg.get("ai") or {}).get("voice") or "alloy")),
             },
@@ -314,7 +314,7 @@ async def update_config(payload: dict[str, Any]) -> dict[str, Any]:
             if temp > 2:
                 temp = 2
 
-            model = str(ai.get("model") or "").strip() or "local-model"
+            model = str(ai.get("model") or "").strip() or "qwen/qwen3.5-9b"
             voice = str(ai.get("voice") or "alloy").strip() or "alloy"
             next_app_cfg["ai"] = {
                 "model": model,

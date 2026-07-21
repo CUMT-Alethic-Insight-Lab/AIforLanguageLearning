@@ -7,11 +7,12 @@ from pydantic import BaseModel
 from sqlmodel import Session
 
 from ..db import get_session
-from ..llm import generate_vocab_fields
+from ..domain.models import User
+from ..infrastructure.dependencies import get_current_user
 from ..ocr import ocr_image_base64
 from .essays import EssayGradeRequest, grade
 from .learning import LearningAnalyzeRequest, learning_analyze, learning_stats
-from .vocab import VocabLookupRequest, lookup_vocab
+from .vocab import VocabLookupRequest, VocabLookupResponse, lookup_vocab
 
 router = APIRouter(tags=["compat-legacy"])
 
@@ -73,15 +74,85 @@ def _to_compat_vocab_data(term: str, fields: dict[str, Any], *, ocr_text: str = 
     return data
 
 
+def _to_compat_vocab_data_from_lookup(
+    response: VocabLookupResponse,
+    *,
+    ocr_text: str = "",
+) -> dict[str, Any]:
+    definitions = [
+        {
+            "meaning": item.meaning,
+            "example": item.example,
+            "exampleTranslation": item.example_translation,
+        }
+        for item in response.definitions
+    ]
+    data: dict[str, Any] = {
+        "word": response.term,
+        "definitions": definitions
+        if definitions
+        else [
+            {
+                "meaning": response.meaning or response.definition or "暂无",
+                "example": response.example,
+                "exampleTranslation": response.example_translation,
+            }
+        ],
+        "meaning": response.meaning or response.definition or "暂无",
+        "example": response.example,
+        "exampleTranslation": response.example_translation,
+        "cefrLevel": response.cefr_level,
+        "difficultyLevel": response.difficulty_level,
+        "examTags": response.exam_tags,
+        "schoolStage": response.school_stage,
+        "recommendations": [
+            {
+                "word": item.word,
+                "reason": item.reason,
+                "score": item.score,
+                "relationType": item.relation_type,
+            }
+            for item in response.recommendations
+        ],
+        "cached": response.cached,
+        "fromPublicVocab": response.from_public_vocab,
+    }
+    if ocr_text:
+        data["ocrText"] = ocr_text
+    return data
+
+
+def _legacy_essay_scores(result: dict[str, Any], total_score: int) -> dict[str, int]:
+    dims = result.get("dimensions") if isinstance(result.get("dimensions"), dict) else {}
+
+    def _scaled(name: str) -> int:
+        raw = dims.get(name, {}) if isinstance(dims.get(name), dict) else {}
+        score = raw.get("score")
+        if not isinstance(score, (int, float)):
+            return total_score
+        return max(0, min(100, int(round(float(score) * 10))))
+
+    language_score = _scaled("language")
+    structure_score = _scaled("structure")
+    return {
+        "vocabulary": language_score,
+        "grammar": _scaled("grammar"),
+        "fluency": language_score,
+        "logic": structure_score,
+        "content": _scaled("content"),
+        "structure": structure_score,
+        "total": total_score,
+    }
+
+
 @router.post("/api/query/vocabulary")
 async def compat_query_vocabulary(req: CompatVocabRequest, session: Session = Depends(get_session)) -> dict:
     term = str(req.word or "").strip()
     if not term:
         return {"success": False, "error": "word is required"}
 
-    await lookup_vocab(VocabLookupRequest(term=term, source="manual"), session, current_user=None)
-    fields = await generate_vocab_fields(term)
-    return {"success": True, "data": _to_compat_vocab_data(term, fields)}
+    response = await lookup_vocab(VocabLookupRequest(term=term, source="manual"), session, current_user=None)
+    return {"success": True, "data": _to_compat_vocab_data_from_lookup(response)}
 
 
 @router.post("/api/query/ocr")
@@ -94,13 +165,16 @@ async def compat_query_ocr(req: CompatOCRRequest, session: Session = Depends(get
     if not term:
         return {"success": False, "error": "OCR text is empty"}
 
-    await lookup_vocab(VocabLookupRequest(term=term, source="ocr"), session, current_user=None)
-    fields = await generate_vocab_fields(term)
-    return {"success": True, "data": _to_compat_vocab_data(term, fields, ocr_text=ocr_text)}
+    response = await lookup_vocab(VocabLookupRequest(term=term, source="ocr"), session, current_user=None)
+    return {"success": True, "data": _to_compat_vocab_data_from_lookup(response, ocr_text=ocr_text)}
 
 
 @router.post("/api/essay/correct")
-async def compat_essay_correct(req: CompatEssayRequest, session: Session = Depends(get_session)) -> dict:
+async def compat_essay_correct(
+    req: CompatEssayRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_current_user),
+) -> dict:
     text = str(req.text or "").strip()
     if (not text) and req.image:
         text = ocr_image_base64(req.image, language=req.language)
@@ -115,37 +189,33 @@ async def compat_essay_correct(req: CompatEssayRequest, session: Session = Depen
             session_id="",
         ),
         session,
+        current_user,
     )
     out = result.result
     score = int(out.get("score") or 0)
-
-    scores_obj = out.get("scores") if isinstance(out.get("scores"), dict) else {}
-    scores = {
-        "vocabulary": int(scores_obj.get("vocabulary", score)),
-        "grammar": int(scores_obj.get("grammar", score)),
-        "fluency": int(scores_obj.get("fluency", score)),
-        "logic": int(scores_obj.get("logic", score)),
-        "content": int(scores_obj.get("content", score)),
-        "structure": int(scores_obj.get("structure", score)),
-        "total": int(scores_obj.get("total", score)),
-    }
+    if not score:
+        score = int(result.score or 0)
+    scores = _legacy_essay_scores(out, score)
 
     data = {
         "original": text,
-        "correction": str(out.get("rewritten") or ""),
+        "correction": str(out.get("corrected_text") or out.get("rewritten") or text),
         "scores": scores,
         "feedback": str(out.get("feedback") or ""),
         "suggestions": [x for x in (out.get("suggestions") or []) if isinstance(x, str)],
         "questions": [x for x in (out.get("questions") or []) if isinstance(x, str)],
         "improvements": [x for x in (out.get("improvements") or []) if isinstance(x, str)],
-        "evaluation": str(out.get("evaluation") or ""),
+        "evaluation": str(out.get("evaluation") or out.get("grade") or out.get("feedback") or ""),
     }
     return {"success": True, "data": data}
 
 
 @router.get("/api/learning/stats")
-async def compat_learning_stats(session: Session = Depends(get_session)) -> dict:
-    stats = await learning_stats(session)
+async def compat_learning_stats(
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    stats = await learning_stats(session, current_user)
     return {
         "success": True,
         "data": {
@@ -158,8 +228,12 @@ async def compat_learning_stats(session: Session = Depends(get_session)) -> dict
 
 
 @router.post("/api/learning/analyze")
-async def compat_learning_analyze(req: CompatAnalyzeRequest, session: Session = Depends(get_session)) -> dict:
-    out = await learning_analyze(LearningAnalyzeRequest(dimension=req.dimension), session)
+async def compat_learning_analyze(
+    req: CompatAnalyzeRequest,
+    session: Session = Depends(get_session),
+    current_user: User = Depends(get_current_user),
+) -> dict:
+    out = await learning_analyze(LearningAnalyzeRequest(dimension=req.dimension), session, current_user)
     return {
         "success": True,
         "data": {

@@ -73,9 +73,8 @@
                                           │
                                           ▼
                                  ┌─────────────────┐
-                                 │  PostgreSQL     │
+                                 │  SQLite/本地DB  │
                                  │  查询详细信息    │
-                                 │ - 拼写问题: [列表]    │  
                                  │ • 释义/例句     │
                                  │ • 发音数据      │
                                  │ • 难度分级      │
@@ -125,7 +124,7 @@
 │  │  │ • 学术      │  │ • 高级      │  │ • 形容词     │      │   │
 │  │  └─────────────┘  └─────────────┘  └─────────────┘      │   │
 │  │                                                         │   │
-│  │  LLM标签生成 + 规则校验 + NLP分类模型                    │   │
+│  │  LLM标签生成 + 规则校验                               │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │    │                                                            │
 │    ▼                                                            │
@@ -133,13 +132,13 @@
 │  │              知识图谱关联 (Neo4j)                        │   │
 │  │                                                         │   │
 │  │  • 同根词关联 (LLM提取 + 词根词缀规则验证)               │   │
-│  │  • 同义词关联 (LLM提取 + WordNet/语义相似度校验)         │   │
+│  │  • 同义词关联 (LLM提取 + 统计阈值校验)                  │   │
 │  │  • 反义词关联 (LLM提取 + 对立语义规则校验)               │   │
 │  │  • 搭配词关联 (LLM提取 + 语料频次阈值校验)               │   │
 │  └─────────────────────────────────────────────────────────┘   │
 │    │                                                            │
 │    ▼                                                            │
-│  存储到PostgreSQL + 同步到Elasticsearch                         │
+│  存储到SQLite + 同步到Elasticsearch（建议启用）               │
 │                                                                 │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -323,7 +322,7 @@ async def generate_learning_path(start_word, target_word, max_depth=5):
 │  │  结构+拼写补充   │    │  LLM综合批改     │    │  评分标准化      │         │
 │  │ • 连接词检测    │    │ (Kimi API/Qwen) │    │ • 0-100 → 0-10  │         │
 │  │ • 段落分析      │◄───│ • 6维度评分     │───►│ • 加权总分计算   │         │
-│  │ • 拼写检查(LT)  │    │ • 错误映射      │    │ • A+/A/B+/B/C/D │         │
+│  │ • 拼写检查      │    │ • 错误映射      │    │ • A+/A/B+/B/C/D │         │
 │  └────────┬────────┘    └─────────────────┘    └─────────────────┘         │
 │           │                                                                 │
 │           ▼                                                                 │
@@ -372,7 +371,7 @@ async def generate_learning_path(start_word, target_word, max_depth=5):
 │  │                                                         │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
 │  │  │  维度1: 内容 (Content) - 权重30%                │   │   │
-│  │  │  • 主题契合度 (BERT分类)        得分 × 0.10     │   │   │
+│  │  │  • 主题契合度 (LLM评估)          得分 × 0.10     │   │   │
 │  │  │  • 观点深度 (LLM评估)           得分 × 0.10     │   │   │
 │  │  │  • 论证充分性 (论据数量/质量)    得分 × 0.10    │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
@@ -393,8 +392,8 @@ async def generate_learning_path(start_word, target_word, max_depth=5):
 │  │                                                         │   │
 │  │  ┌─────────────────────────────────────────────────┐   │   │
 │  │  │  维度4: 语法 (Grammar) - 权重20%                │   │   │
-│  │  │  • 语法错误密度 (GEC结果)        得分 × 0.10    │   │   │
-│  │  │  • 拼写准确性 (拼写检查)         得分 × 0.05    │   │   │
+│  │  │  • 语法错误密度 (LLM语法分析)    得分 × 0.10    │   │   │
+│  │  │  • 拼写准确性 (LLM校验)          得分 × 0.05    │   │   │
 │  │  │  • 标点规范 (规则检查)          得分 × 0.05     │   │   │
 │  │  └─────────────────────────────────────────────────┘   │   │
 │  │                                                         │   │
@@ -468,7 +467,7 @@ async def generate_learning_path(start_word, target_word, max_depth=5):
 │  │  3. LLM竞速 (双路并发)                                              │  │
 │  │     ├─► 云端: moonshot-v1-auto (Kimi API)                           │  │
 │  │     └─► 本地: qwen3.5-9b (vLLM, INT4, ~7GB显存)                    │  │
-│  │     └── 1.2s宽限期: 先到先用，后到丢弃                               │  │
+│  │     └── 先到先用: 同时并发调用，第一个成功返回的胜出，其余自动cancel  │  │
 │  │                                                                     │  │
 │  │  4. TTS多后端降级链                                                 │  │
 │  │     ├─► Kokoro (82M, CPU, 首选)                                    │  │
@@ -485,14 +484,30 @@ async def generate_learning_path(start_word, target_word, max_depth=5):
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 3.1.3 Barge-in 打断续接（已落地）
+#### 3.1.3 Barge-in 打断续接（已落地，v1.8 优化）
 
-**机制**：用户在AI播报过程中可随时打断，系统按TTS字节比例计算已播报位置，将未播报内容作为上下文记忆注入下一轮对话。
+**机制**：用户在AI播报过程中可随时打断。系统将**已播报内容**作为 `AI_MESSAGE` 持久化到对话历史，**未播报内容**标记为"打断而未表达"注入上下文记忆，让 LLM 充分了解打断位置。
 
 **关键实现**：
 - 已播报位置计算：`played_ratio = bytes_sent / total_bytes`
-- 上下文记忆注入：未播报文本截断至2400字符硬上限
+- 已播报内容 → `AI_MESSAGE` 持久化（LLM 知道已表达的部分）
+- 未播报内容 → `CONTEXT_MEMORY` 标记为"打断而未表达"
+- 上下文记忆注入：截断至2400字符硬上限
 - 前端状态：`isSpeaking` → `TASK_ABORTED` → `audioManager.stopPlayback()`
+
+**LLM 指导原则**：
+1. 不要重复已播报的内容
+2. 基于未播报内容的意图继续表达
+3. 自然衔接，可简要回顾已说要点但避免机械重复
+
+**同步模块**：
+- **场景对话** (`/ws/v1`)：已实现（`main.py` `abort_voice_request()`）
+- **智能助教** (`/api/v1/realtime-assistant/ws`)：已实现（`session.py` `on_barge_in()`）
+  - 前端事件：`{"type": "barge_in", "spoken_bytes": N, "total_bytes": M}`
+  - 前端事件：`{"type": "tts_progress", "sent_bytes": N, "total_bytes": M}`
+  - 已播报内容 → `SessionContext.turns` 标记 `{"interrupted": true, "part": "spoken"}`
+  - 未播报内容 → `SessionContext._interrupted_buffer`
+  - 下一轮 `_build_user_prompt()` 自动注入打断上下文到 user prompt
 
 #### 3.1.4 ws-v1 事件协议（已落地）
 
@@ -1160,13 +1175,13 @@ while True:
 
 #### 5.2.1 架构说明
 
-实时助教系统**统一使用 Kimi API** 进行AI推理，本地仅做预处理和筛选：
+实时助教系统采用**云端优先、1s超时fallback本地**的模型路由策略：
 
 | 层级 | 处理方式 | 职责 |
 |------|----------|------|
 | **前端** | 教师端浏览器/Electron | 屏幕采集、麦克风采集、音频播放 |
-| **后端** | 本地服务 | 视频解码、三级筛选、调用Kimi API、TTS合成 |
-| **AI推理** | **Kimi API统一处理** | 无论简单/复杂场景，一律使用Kimi K2.5 |
+| **后端** | 本地服务 | 视频解码、三级筛选、LLM路由、TTS合成 |
+| **AI推理** | **Kimi API优先** → 本地Qwen fallback | 优先使用Kimi API获取高上限能力；1s无响应自动fallback本地Qwen |
 | **输出** | 语音返回教师 | 仅教师收听，学生端无感知 |
 
 #### 5.2.2 五级智能筛选流程 (最大化利用教师端PC算力)
@@ -2272,7 +2287,7 @@ async def simulate():
                                     ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              API网关层                                       │
-│                    (Kong: 认证/限流/路由/SSL)                                │
+│                  FastAPI 直连（网关层 Kong/Envoy：规划中）                        │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
         ┌───────────────────────────┼───────────────────────────┐
@@ -2282,7 +2297,7 @@ async def simulate():
 │   单词服务    │          │   作文服务    │          │   对话服务    │
 │  ┌────────┐  │          │  ┌────────┐  │          │  ┌────────┐  │
 │  │ES搜索  │  │          │  │OCR提取  │  │          │  │Prompt  │  │
-│  │知识图谱│  │          │  │GEC纠错 │  │          │  │扩写引擎│  │
+│  │知识图谱│  │          │  │LLM批改 │  │          │  │扩写引擎│  │
 │  │推荐算法│  │          │  │LLM评分 │  │          │  │对话LLM │  │
 │  └────────┘  │          │  └────────┘  │          │  └────────┘  │
 └──────┬───────┘          └──────┬───────┘          └──────┬───────┘
@@ -2292,11 +2307,13 @@ async def simulate():
        ▼    ▼                    ▼                    ▼    ▼
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              数据存储层                                      │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
-│  │PostgreSQL│  │  Redis   │  │Elasticsearch│  │  Neo4j  │  │  MinIO   │       │
-│  │ (主数据) │  │ (缓存)   │  │  (搜索)   │  │(知识图谱)│  │ (文件)   │       │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘  └──────────┘       │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐       │
+│  │  SQLite  │  │  Redis*  │  │Elastic* │  │  Neo4j*  │       │
+│  │ (当前DB)  │  │(建议启用)│  │ (必须) │  │(建议启用)│       │
+│  └──────────┘  └──────────┘  └──────────┘  └──────────┘       │
 └─────────────────────────────────────────────────────────────────────────────┘
+
+> *当前可选组件：Redis建议生产环境必开，Elasticsearch是查词流程必须，Neo4j建议启用以支撑知识图谱推荐。当前DB为SQLite，PostgreSQL迁移需要评估数据量和并发需求后再进行。
        │
        │
        ▼
@@ -2337,22 +2354,25 @@ async def simulate():
 
 **已实现的场景类型**：
 
-| 场景 | 枚举值 | 默认模型 | Temperature | 说明 |
-|------|--------|----------|-------------|------|
-| 对话执行 | `chat` | 本地Qwen3.5-9B | 0.7 | 实时低延迟 |
-| 词汇生成 | `vocab` | Kimi API | 0.7 | 结构化JSON输出 |
-| 作文批改 | `essay` | Kimi API | 0.5 | 稳定评分 |
-| 场景扩写 | `scenario_expansion` | Kimi API | 0.9 | 高创造性 |
+| 场景 | 枚举值 | 默认模型 | Temperature | 机制 | 说明 |
+|------|--------|----------|-------------|------|------|
+| 对话执行 | `chat` | 本地Qwen3.5-9B / Kimi | 0.7 | 云端/本地竞速 | 实时低延迟，谁先回用谁 |
+| 词汇生成 | `vocab` | 本地Qwen3.5-9B | 0.2 | 直连本地 | 必须本地，确保离线可用 |
+| 作文批改 | `essay` | Kimi API → 本地 | 0.5 | 云端优先1s fallback | 稳定评分，超时回退本地 |
+| 场景扩写 | `scenario_expansion` | Kimi API | 0.9 | 直连云端 | 高创造性，有缓存机制 |
+| 实时助教 | `rta` | Kimi API → 本地 | 0.7 | 云端优先1s fallback | 能力上限要求高 |
+| 学情分析 | `analytics` | Kimi API → 本地 | 0.7 | 云端优先10s fallback | 延迟极不敏感，断网可后台完成 |
+| 班级周报 | `class_analysis` | Kimi API → 本地 | 0.7 | 云端优先10s fallback | 复杂数据分析，质量优先 |
 
 #### 7.1.2 路由决策与故障切换
 
 ```python
 class ModelRouter:
     SCENE_PROVIDER_MAP = {
-        SceneType.CHAT: ModelProvider.LOCAL,      # → 本地Qwen
-        SceneType.VOCAB: ModelProvider.KIMI,      # → Kimi API
-        SceneType.ESSAY: ModelProvider.KIMI,      # → Kimi API
-        SceneType.SCENARIO_EXPANSION: ModelProvider.KIMI,  # → Kimi API
+        SceneType.CHAT: ModelProvider.LOCAL,               # → 本地Qwen (语音对话额外启用竞速)
+        SceneType.VOCAB: ModelProvider.LOCAL,              # → 本地Qwen (必须本地)
+        SceneType.ESSAY: ModelProvider.KIMI,               # → Kimi API (1s超时fallback本地)
+        SceneType.SCENARIO_EXPANSION: ModelProvider.KIMI,  # → Kimi API (thinking模式)
     }
 ```
 
@@ -2360,6 +2380,14 @@ class ModelRouter:
 - 主端点失败 → 自动尝试fallback端点列表
 - 指数退避重试：3次重试，延迟序列 1s → 2s → 4s + 随机抖动
 - 全部失败时抛出 `RuntimeError`
+
+**多模型竞速与超时Fallback**：
+| 机制 | 函数 | 适用场景 | 行为 |
+|------|------|----------|------|
+| 云端/本地竞速 | `call_cloud_local_race()` | 语音对话 | 同时并发 KIMI + LOCAL，谁先成功返回用谁；pending任务自动cancel |
+| 云端优先超时fallback | `call_cloud_first_timeout(timeout=1.0)` | 作文批改、实时助教 | 优先等KIMI 1s，超时则取LOCAL结果 |
+| 云端优先超时fallback | `call_cloud_first_timeout(timeout=10.0)` | 学情分析、班级周报 | 优先等KIMI 10s，超时则取LOCAL结果；断网时凌晨后台仍可完成 |
+| 故障自动切换 | `call_with_fallback()` | 场景扩写 | 遍历主端点+fallback端点，失败则切换下一个 |
 
 #### 7.1.3 场景扩写标准化（已落地）
 
@@ -2386,8 +2414,9 @@ async def expand_scenario(user_description: str, language: str = "en") -> str:
 ```mermaid
 flowchart TD
     A[请求进入 Router] --> B{任务类型}
-    B -->|chat| C[本地Qwen3.5-9B INT4]
-    B -->|vocab/essay/scenario_expansion| D[云端 Kimi API]
+    B -->|chat / vocab| C[本地Qwen3.5-9B INT4]
+    B -->|essay / scenario_expansion| D[云端 Kimi API]
+    B -->|analytics / class_analysis| D
     C --> F{成功?}
     F -->|是| G[返回结果]
     F -->|否| D
@@ -2470,8 +2499,8 @@ class ConversationContext:
 | 层级 | 保存内容 | 存储介质 | TTL |
 |---|---|---|---|
 | 短期会话记忆 | 最近N轮对话 | Redis | 30分钟 |
-| 任务记忆 | 当前课次任务目标、评分中间结果 | PostgreSQL JSONB | 7天 |
-| 长期学习记忆 | 用户画像、薄弱点趋势 | PostgreSQL + 向量库 | 长期 |
+| 任务记忆 | 当前课次任务目标、评分中间结果 | SQLite（评估PostgreSQL JSONB） | 7天 |
+| 长期学习记忆 | 用户画像、薄弱点趋势 | SQLite + 向量库（规划中） | 长期 |
 
 ---
 
@@ -2571,12 +2600,14 @@ sequenceDiagram
 
 ### 7.6 日志监控系统（Observability）
 
-#### 三大支柱
+> **⚠️ 规划中（暂未落地）**：当前后端使用标准 `logging` 输出结构化 JSON 日志，无 Prometheus/Jaeger 层。以下为目标架构规划。
+
+#### 目标架构（规划中）
 - Metrics：Prometheus（QPS、P95、GPU利用率、队列堆积）。
 - Logs：Loki/ELK（结构化JSON日志，TraceID贯通）。
 - Traces：OpenTelemetry + Jaeger（跨服务链路分析）。
 
-#### SLO建议
+#### SLO建议（供参考）
 
 | 能力 | SLI | SLO |
 |---|---|---|
@@ -2594,16 +2625,24 @@ sequenceDiagram
 
 ### 7.7 推荐引擎（在线+离线）
 
-#### 双通路
+> **⚠️ 暂缓**：当前推荐已通过 Neo4j 三层规则落地（薄弱点扩展/已学扩展/兄底词库）。以下在线+离线 ML 模型方案暂缓，待数据量达标后再缔进。
+
+#### 已落地：Neo4j 规则层
+
+详见 第1.3.3 节。三层推荐策略：薄弱点扩展(0.90) > 已学扩展(0.75) > 兄底词库(0.55)。
+
+#### 规划中：在线+离线 ML 层
+
+##### 双通路
 - 离线训练：每日训练用户向量与词汇向量。
 - 在线重排：结合最新行为进行实时重排。
 
-#### 特征体系
+##### 特征体系
 - 用户侧：水平、目标考试、近期错误模式、停留时长。
 - 内容侧：词汇难度、语域、主题、先修关系。
 - 上下文侧：当前课程、时间段、设备类型。
 
-#### 召回+排序
+##### 召回+排序
 1. 召回：协同过滤、向量近邻、规则召回。
 2. 排序：LTR模型（XGBoost/LightGBM）。
 3. 约束：难度平滑、覆盖度、去重。
@@ -2644,8 +2683,8 @@ flowchart TD
 
 #### 缓存分层
 - L1：进程内缓存（热点配置、Prompt模板）。
-- L2：Redis Cluster（会话、查词结果、RAG短缓存）。
-- L3：CDN（静态资源与音频）。
+- L2：Redis 单节点（建议生产环境必开），服务会话、查词结果、RAG短缓存。Redis Cluster 模式属规模扩张第二阶段装备。
+- L3：CDN 静态资源（规划中）。
 
 #### 一致性策略
 - 读多写少：Cache-Aside。
@@ -2656,6 +2695,8 @@ flowchart TD
 ---
 
 ### 7.10 消息队列与异步编排
+
+> **当前实现**：Celery + Redis（Broker）简单任务队列。以下 Topic 规划对应 Celery task 队列概念，正式 Kafka 接入属规模扩张阶段规划。
 
 #### Topic规划
 
@@ -2693,8 +2734,8 @@ flowchart TD
 ### 7.12 数据库设计（事务与分析分层）
 
 #### 分库分层
-- OLTP（PostgreSQL）：账号、订单、学习记录、会话元数据。
-- OLAP（ClickHouse/TimescaleDB）：行为日志、时序指标、课堂事件。
+- OLTP（**当前SQLite**；适时评估PostgreSQL迁移）：账号、订单、学习记录、会话元数据。
+- OLAP（ClickHouse/TimescaleDB，规划中）：行为日志、时序指标、课堂事件。
 - 图数据库（Neo4j）：知识关联查询。
 
 #### 关键表建议
@@ -3130,7 +3171,6 @@ sequenceDiagram
 | **VAD** | webrtcvad + 能量阈值兜底 | ~10ms | 2-4线程 | - |
 | **图像处理** | 哈希/ROI检测 | ~20ms | 2-4线程 | - |
 | **ES/Neo4j** | 搜索查询 | ~10ms | 4-8线程 | - |
-| **语料库** | LanguageTool | ~50ms | 2-4线程 | - |
 
 **CPU总占用**: ~24线程 / 32线程 (75%)，充足
 
@@ -3240,11 +3280,11 @@ sequenceDiagram
 |------|------|------|------|
 | **容器** | Kubernetes | 1.29+ | GPU Operator |
 | **推理** | vLLM | 0.6.0+ | PagedAttention |
-| **网关** | Kong / Envoy | 3.0+ | 负载均衡 |
-| **消息** | Apache Kafka | 3.6+ | 流处理 |
-| **缓存** | Redis Cluster | 7.2+ | 6主6从 |
-| **数据库** | PostgreSQL | 16+ | 主从复制 |
-| **监控** | Prometheus + Grafana | 最新 | GPU监控 |
+| **网关** | Kong / Envoy（规划中） | 3.0+ | 当前：FastAPI 直连 |
+| **消息** | Apache Kafka（规划中） | 3.6+ | 当前：Celery+Redis |
+| **缓存** | Redis Cluster（规划中） | 7.2+ | 当前：Redis 单节点（建议启用） |
+| **数据库** | PostgreSQL（规划中） | 16+ | 当前：SQLite |
+| **监控** | Prometheus + Grafana（规划中） | 最新 | 当前：标准 logging |
 
 #### 8.7.3 通信协议栈
 
@@ -3391,7 +3431,7 @@ sequenceDiagram
 | 屏幕无变化 | 本地忽略 | - | - |
 | UI动画/鼠标移动 | 本地忽略 | - | - |
 | 课件变化(通过筛选) | **Kimi API** | Kimi K2.5 | <800ms |
-| 教师语音触发 | **Kimi API** | Kimi K2.5 LLM | <800ms |
+| 教师语音触发 | **Kimi API** | Kimi K2.5  | <800ms |
 | 网络异常(非唤醒) | **静默失败** | - | <100ms |
 | 网络异常(唤醒请求) | 本地兜底TTS | - | <100ms |
 
@@ -3646,18 +3686,19 @@ npm run dev
 | **ES 搜索** | 未安装 elasticsearch | 静默降级，不报错 |
 | **Celery** | Redis 未运行时 | 回退本地同步执行 (`_DummyCelery`) |
 | **PaddleOCR** | 未安装时 | `grade-ocr` 返回 400 错误 |
-| **LanguageTool** | 未安装时 | 拼写检查返回空列表，不影响主流程 |
+| **SeamlessM4T** | HuggingFace 不可达时 | WebSocket 连接超时（测试环境需预下载模型或联网） |
 
 ---
 
-*文档版本: v1.8*  
-*更新日期: 2026年4月19日*
+*文档版本: v2.0*
+*更新日期: 2026年5月*
 
 ### 更新记录
 
 | 版本 | 日期 | 更新内容 |
 |------|------|----------|
-| v1.8 | 2026-04-19 | **系统启动检查与修复**：修复 `python-jose` 依赖缺失；修复 SQLModel 表重复定义（添加 `extend_existing=True`）；统一作文 `/grade` 端点支持 text/image 双输入；修正 `compat_legacy.py` 字段名 |
+| v1.9 | 2026-04-19 | **Barge-in 打断续接逻辑优化**：场景对话与智能助教同步支持"已播报内容加入上下文，未播报内容标记为打断而未表达"；RTA 新增 `on_barge_in()` / `on_tts_progress()` / `SessionContext.mark_interrupted()` |
+| v1.8 | 2026-04-19 | **系统启动检查与修复**：修复 `python-jose` 依赖缺失；修复 SQLModel 表重复定义（添加 `extend_existing=True`）；统一作文 `/grade` 端点支持 text/image 双输入；修正 `compat_legacy.py` 字段名；一键启动脚本支持 `-Portable` 模式；前端 Electron 打包可用 |
 | v1.7 | 2026-04-19 | **RTA 架构升级**：LLM 结构化决策(should_intervene/use_tts/urgency)；默认静默无侵入；TTS 条件触发；唤醒词"Hi Helix/Hey Helix"四层兜底；LLM 不可用时唤醒兜底响应 |
 | v1.6 | 2026-04-18 | **大规模补充已落实细节**：词汇模块SM-2/知识图谱A*/ES搜索/Celery任务；对话模块LLM竞速/Barge-in打断/ws-v1协议/前端架构；学情分析20维度/三层Agent/干预任务/数据可视化；模型路由/上下文管理/Prompt模板等 |
 | v1.5 | 2026-03-30 | 统一Kimi K2.5模型描述(VLM/LLM合一)，本地LLM更新为Qwen3.5-9B |

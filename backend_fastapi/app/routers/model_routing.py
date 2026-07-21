@@ -12,9 +12,9 @@ from pydantic import BaseModel, Field
 
 from ..model_router import (
     SceneType,
-    get_model_router,
-    expand_scenario,
     chat_with_context,
+    expand_scenario,
+    get_model_router,
 )
 from ..runtime_config import get_runtime_config, update_runtime_config
 
@@ -59,7 +59,7 @@ class ModelConfigResponse(BaseModel):
 
 class RoutingStatusResponse(BaseModel):
     """路由状态响应"""
-    scenes: dict[str, str] = Field(default_factory=dict, description="场景到模型的映射")
+    scenes: dict[str, dict[str, Any]] = Field(default_factory=dict, description="场景到实际主路由与fallback链的映射")
     endpoints: dict[str, list[dict[str, Any]]] = Field(default_factory=dict, description="可用端点")
 
 
@@ -136,11 +136,6 @@ async def api_routing_status() -> RoutingStatusResponse:
     返回当前场景到模型的映射配置和可用端点信息。
     """
     router = get_model_router()
-    runtime = get_runtime_config()
-    
-    # 获取场景模型映射
-    scene_models = runtime.get("models", {}).get("scene", {})
-    
     # 获取端点信息（脱敏）
     endpoints_info = {}
     for provider, eps in router._endpoints.items():
@@ -153,14 +148,24 @@ async def api_routing_status() -> RoutingStatusResponse:
             }
             for ep in eps
         ]
+
+    scene_status: dict[str, dict[str, Any]] = {}
+    for scene in SceneType:
+        decision = router.route(scene)
+        scene_status[scene.value] = {
+            "provider": decision.primary_endpoint.provider.value,
+            "model_id": decision.primary_endpoint.model_id,
+            "fallbacks": [
+                {
+                    "provider": ep.provider.value,
+                    "model_id": ep.model_id,
+                }
+                for ep in decision.fallback_endpoints
+            ],
+        }
     
     return RoutingStatusResponse(
-        scenes={
-            "chat": scene_models.get("chat", "local"),
-            "vocab": scene_models.get("vocab", "kimi"),
-            "essay": scene_models.get("essay", "kimi"),
-            "scenario_expansion": scene_models.get("scenario_expansion", "kimi"),
-        },
+        scenes=scene_status,
         endpoints=endpoints_info
     )
 

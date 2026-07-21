@@ -21,8 +21,8 @@ def get_user_by_id(user_id: int) -> User | None:
         return session.get(User, user_id)
 
 
-def create_user(username: str, email: str, password_hash: str) -> User:
-    user = User(username=username, email=email, password_hash=password_hash)
+def create_user(username: str, email: str, password_hash: str, role: str = "student") -> User:
+    user = User(username=username, email=email, password_hash=password_hash, role=role)
     with Session(get_engine()) as session:
         session.add(user)
         session.commit()

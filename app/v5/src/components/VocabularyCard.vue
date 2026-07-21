@@ -14,6 +14,18 @@ const handleRecommendationClick = (word: string) => {
   if (!term) return;
   emit('lookup-recommendation', term);
 };
+
+const relationLabel = (type?: string | null) => {
+  if (!type) return '';
+  const labels: Record<string, string> = {
+    synonym: '同义词',
+    antonym: '反义词',
+    cognate: '同根词',
+    similar_form: '形近词',
+    review_due: '待复习'
+  };
+  return labels[type] || type;
+};
 </script>
 
 <template>
@@ -171,7 +183,7 @@ const handleRecommendationClick = (word: string) => {
                 {{ item.word }}
               </button>
               <span v-if="item.relation_type" class="text-[10px] px-2 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-400">
-                {{ item.relation_type }}
+                {{ relationLabel(item.relation_type) }}
               </span>
               <span v-if="typeof item.score === 'number'" class="text-[10px] text-gray-500">
                 score: {{ item.score.toFixed(2) }}

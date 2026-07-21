@@ -11,19 +11,17 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Any
 
 from sqlmodel import Session, select
 
-from ...db import get_engine
 from ...domain.analytics.models import (
     ClassDailySnapshot,
     InterventionTask,
     StudentDailySummary,
 )
-from ...domain.models import User
-from ...llm import chat_complete, chat_complete_cloud_first
+from ...llm import chat_complete_cloud_first
 from .orchestration import (
     generate_student_longitudinal_summary,
     get_class_summaries,

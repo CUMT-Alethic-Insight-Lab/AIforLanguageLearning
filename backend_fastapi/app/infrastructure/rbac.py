@@ -49,17 +49,29 @@ ROLE_PERMISSIONS = {
 }
 
 
-def get_user_role(user: Any) -> Role:
+def get_user_role(user: Any) -> Role | None:
     """Extract role from user data."""
-    role_str = getattr(user, "role", "student")
+    role_str = getattr(user, "role", None)
     try:
         return Role(role_str)
-    except ValueError:
-        return Role.STUDENT
+    except (TypeError, ValueError):
+        return None
+
+
+def is_account_enabled(user: Any) -> bool:
+    """Fail closed for disabled accounts when the backing model exposes status fields."""
+    if getattr(user, "is_active", True) is False:
+        return False
+    account_status = getattr(user, "status", None)
+    if account_status is None:
+        return True
+    return str(account_status).lower() in {"active", "enabled"}
 
 
 def has_permission(user: Any, required_permission: str) -> bool:
     """Check if user has a specific permission."""
+    if not is_account_enabled(user):
+        return False
     role = get_user_role(user)
     if role == Role.ADMIN:
         return True
@@ -69,6 +81,8 @@ def has_permission(user: Any, required_permission: str) -> bool:
 
 def has_role(user: Any, required_role: Role) -> bool:
     """Check if user has at least the required role level."""
+    if not is_account_enabled(user):
+        return False
     user_role = get_user_role(user)
     user_level = ROLE_HIERARCHY.get(user_role, 0)
     required_level = ROLE_HIERARCHY.get(required_role, 0)
@@ -95,7 +109,7 @@ def require_role(required_role: Role) -> Callable[..., Any]:
             if not has_role(current_user, required_role):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Insufficient permissions. Required role: {required_role.value}",
+                    detail="Insufficient permissions",
                 )
             return await func(*args, **kwargs)
 
@@ -124,7 +138,7 @@ def require_permission(required_permission: str) -> Callable[..., Any]:
             if not has_permission(current_user, required_permission):
                 raise HTTPException(
                     status_code=status.HTTP_403_FORBIDDEN,
-                    detail=f"Permission denied: {required_permission}",
+                    detail="Insufficient permissions",
                 )
             return await func(*args, **kwargs)
 

@@ -28,8 +28,8 @@ from ...domain.models import StudentProfile, User
 from .agents import run_and_persist_tiered_analysis
 from .daily_summary import get_metric_methodology
 from .orchestration import (
-    generate_class_window_analysis,
     generate_student_longitudinal_summary,
+    get_class_population_counts,
     get_class_summaries,
     resolve_class_id_for_user,
     upsert_analytics_artifact,
@@ -69,6 +69,91 @@ def _avg(values: list[float | int | None]) -> float | None:
     return round(sum(nums) / len(nums), 4)
 
 
+def _ratio_to_percent(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = float(value)
+    if raw <= 1.0:
+        raw *= 100.0
+    return max(0.0, min(100.0, raw))
+
+
+def _inverse_ratio_to_percent(value: float | int | None) -> float:
+    return max(0.0, min(100.0, 100.0 - _ratio_to_percent(value)))
+
+
+def _count_to_percent(value: float | int | None, *, scale: float = 10.0) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    return max(0.0, min(100.0, float(value) * scale))
+
+
+def _latency_to_percent(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = 100.0 - ((float(value) - 200.0) / 3800.0) * 100.0
+    return max(0.0, min(100.0, raw))
+
+
+def _wpm_to_percent(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = (float(value) - 40.0) / 120.0 * 100.0
+    return max(0.0, min(100.0, raw))
+
+
+def _slope_to_percent(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = float(value) * 10.0 + 50.0
+    return max(0.0, min(100.0, raw))
+
+
+def _stability_to_percent(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = 100.0 - float(value) * 25.0
+    return max(0.0, min(100.0, raw))
+
+
+def _metric_percent(summary: StudentDailySummary, field_name: str) -> float:
+    value = getattr(summary, field_name, None)
+    match field_name:
+        case "vocab_growth_rate":
+            return _count_to_percent(value, scale=20.0)
+        case "sm2_retention_rate" | "active_lookup_conversion" | "morph_transfer_ability":
+            return _ratio_to_percent(value)
+        case "long_term_memory_robustness" | "paraphrase_count" | "topic_coverage_breadth" | "autonomous_drive_count":
+            return _count_to_percent(value, scale=10.0)
+        case "grammar_error_decay_slope":
+            return _slope_to_percent(value)
+        case "advanced_vocab_substitution" | "difficulty_jump_success" | "feedback_response_depth":
+            return _ratio_to_percent(value)
+        case "msl_diversity_index":
+            return _ratio_to_percent(value)
+        case "logical_coherence_trend" | "semantic_accuracy_trend":
+            return max(0.0, min(100.0, float(value))) if isinstance(value, (int, float)) else 0.0
+        case "response_latency_avg_ms":
+            return _latency_to_percent(value)
+        case "speech_wpm":
+            return _wpm_to_percent(value)
+        case "cross_cultural_deviation":
+            return _inverse_ratio_to_percent(value)
+        case "learning_stability_std":
+            return _stability_to_percent(value)
+        case "error_regression_rate":
+            return _inverse_ratio_to_percent(value)
+        case _:
+            return max(0.0, min(100.0, float(value))) if isinstance(value, (int, float)) else 0.0
+
+
+def _avg_metric_percent(summaries: list[StudentDailySummary], field_name: str) -> float:
+    if not summaries:
+        return 0.0
+    values = [_metric_percent(summary, field_name) for summary in summaries]
+    return round(sum(values) / len(values), 2) if values else 0.0
+
+
 def _calc_ability_distribution(summaries: list[StudentDailySummary]) -> dict[str, int]:
     scored = sorted(_summary_score(s) for s in summaries)
     if not scored:
@@ -78,7 +163,7 @@ def _calc_ability_distribution(summaries: list[StudentDailySummary]) -> dict[str
     top_cutoff = scored[max(0, n - n // 5 - 1)]
     bottom = sum(1 for s in scored if s <= bottom_cutoff)
     top = sum(1 for s in scored if s >= top_cutoff)
-    return {"bottom": bottom, "middle": n - bottom - top, "top": top}
+    return {"bottom": bottom, "middle": max(0, n - bottom - top), "top": top}
 
 
 def _risk_tags(summary: StudentDailySummary) -> list[str]:
@@ -157,8 +242,8 @@ def _build_class_charts(
             "title": "近7日班级趋势",
             "labels": dates,
             "datasets": [
-                {"label": "词汇增长", "data": vocab_series},
-                {"label": "语法收敛", "data": grammar_series},
+                {"label": "词汇增长", "data": [max(0.0, min(100.0, value * 20)) for value in vocab_series]},
+                {"label": "语法收敛", "data": [_slope_to_percent(value) for value in grammar_series]},
             ],
         }
 
@@ -171,12 +256,12 @@ def _build_class_charts(
                 {
                     "label": "班级均值",
                     "data": [
-                        min(100, (_avg([s.vocab_growth_rate for s in latest_summaries]) or 0) * 20),
-                        min(100, (_avg([s.grammar_error_decay_slope for s in latest_summaries]) or 0) * 20),
-                        min(100, _avg([s.logical_coherence_trend for s in latest_summaries]) or 0),
-                        min(100, _avg([s.speech_wpm for s in latest_summaries]) or 0),
-                        min(100, 100 - (_avg([s.learning_stability_std for s in latest_summaries]) or 0) * 20),
-                        min(100, (_avg([s.autonomous_drive_count for s in latest_summaries]) or 0) * 20),
+                        _avg_metric_percent(latest_summaries, "vocab_growth_rate"),
+                        _avg_metric_percent(latest_summaries, "grammar_error_decay_slope"),
+                        _avg_metric_percent(latest_summaries, "logical_coherence_trend"),
+                        _avg_metric_percent(latest_summaries, "speech_wpm"),
+                        _avg_metric_percent(latest_summaries, "learning_stability_std"),
+                        _avg_metric_percent(latest_summaries, "autonomous_drive_count"),
                     ],
                 }
             ],
@@ -194,30 +279,20 @@ def _build_student_charts(summaries: list[StudentDailySummary]) -> dict[str, Any
             "响应延迟", "语音速率", "难度跳变", "文化得体", "转述能力",
             "学习稳定", "错误复发", "反馈深度", "主题覆盖", "自主学习",
         ]
-        raw = [
-            latest.vocab_growth_rate, latest.sm2_retention_rate, latest.active_lookup_conversion,
-            latest.morph_transfer_ability, latest.long_term_memory_robustness, latest.grammar_error_decay_slope,
-            latest.advanced_vocab_substitution, latest.msl_diversity_index, latest.logical_coherence_trend,
-            latest.semantic_accuracy_trend, latest.response_latency_avg_ms, latest.speech_wpm,
-            latest.difficulty_jump_success, latest.cross_cultural_deviation, latest.paraphrase_count,
-            latest.learning_stability_std, latest.error_regression_rate, latest.feedback_response_depth,
-            latest.topic_coverage_breadth, latest.autonomous_drive_count,
+        radar_fields = [
+            "vocab_growth_rate", "sm2_retention_rate", "active_lookup_conversion",
+            "morph_transfer_ability", "long_term_memory_robustness", "grammar_error_decay_slope",
+            "advanced_vocab_substitution", "msl_diversity_index", "logical_coherence_trend",
+            "semantic_accuracy_trend", "response_latency_avg_ms", "speech_wpm",
+            "difficulty_jump_success", "cross_cultural_deviation", "paraphrase_count",
+            "learning_stability_std", "error_regression_rate", "feedback_response_depth",
+            "topic_coverage_breadth", "autonomous_drive_count",
         ]
-        normalized: list[float] = []
-        for idx, value in enumerate(raw):
-            if value is None:
-                normalized.append(0)
-            elif idx in (10, 15, 16):
-                normalized.append(max(0, min(100, 100 - float(value))))
-            elif idx in (4, 14, 18, 19):
-                normalized.append(max(0, min(100, float(value) * 10)))
-            else:
-                normalized.append(max(0, min(100, float(value) * 20 if float(value) <= 5 else float(value))))
         charts["radar_20d"] = {
             "type": "radar",
             "title": "20维度能力雷达",
             "labels": radar_labels,
-            "datasets": [{"label": "当天快照", "data": normalized}],
+            "datasets": [{"label": "当天快照", "data": [_metric_percent(latest, field) for field in radar_fields]}],
         }
 
         focus_keys = [
@@ -234,11 +309,11 @@ def _build_student_charts(summaries: list[StudentDailySummary]) -> dict[str, Any
             "datasets": [
                 {
                     "label": "当天",
-                    "data": [float(getattr(latest, key) or 0) for _, key in focus_keys],
+                    "data": [_metric_percent(latest, key) for _, key in focus_keys],
                 },
                 {
                     "label": "窗口均值",
-                    "data": [_avg([getattr(s, key, None) for s in summaries]) or 0.0 for _, key in focus_keys],
+                    "data": [_avg_metric_percent(summaries, key) for _, key in focus_keys],
                 },
             ],
         }
@@ -251,9 +326,9 @@ def _build_student_charts(summaries: list[StudentDailySummary]) -> dict[str, Any
                 "title": "核心趋势",
                 "labels": dates,
                 "datasets": [
-                    {"label": "词汇增长", "data": [float(s.vocab_growth_rate or 0) for s in summaries]},
-                    {"label": "语法收敛", "data": [float(s.grammar_error_decay_slope or 0) for s in summaries]},
-                    {"label": "逻辑连贯", "data": [float(s.logical_coherence_trend or 0) for s in summaries]},
+                    {"label": "词汇增长", "data": [_metric_percent(s, "vocab_growth_rate") for s in summaries]},
+                    {"label": "语法收敛", "data": [_metric_percent(s, "grammar_error_decay_slope") for s in summaries]},
+                    {"label": "逻辑连贯", "data": [_metric_percent(s, "logical_coherence_trend") for s in summaries]},
                 ],
             },
             {
@@ -261,9 +336,9 @@ def _build_student_charts(summaries: list[StudentDailySummary]) -> dict[str, Any
                 "title": "状态趋势",
                 "labels": dates,
                 "datasets": [
-                    {"label": "学习稳定", "data": [float(s.learning_stability_std or 0) for s in summaries]},
-                    {"label": "响应延迟", "data": [float(s.response_latency_avg_ms or 0) for s in summaries]},
-                    {"label": "自主学习", "data": [float(s.autonomous_drive_count or 0) for s in summaries]},
+                    {"label": "学习稳定", "data": [_metric_percent(s, "learning_stability_std") for s in summaries]},
+                    {"label": "响应延迟", "data": [_metric_percent(s, "response_latency_avg_ms") for s in summaries]},
+                    {"label": "自主学习", "data": [_metric_percent(s, "autonomous_drive_count") for s in summaries]},
                 ],
             },
         ]
@@ -278,19 +353,25 @@ async def build_class_overview_payload(
     recent_days: int = 3,
 ) -> dict[str, Any]:
     target_date = target_date or (date.today() - timedelta(days=1))
+    window_start = target_date - timedelta(days=max(recent_days - 1, 0))
     latest_summaries = get_class_summaries(session, class_id, target_date, target_date)
     week_summaries = get_class_summaries(session, class_id, target_date - timedelta(days=6), target_date)
+    population = get_class_population_counts(session, class_id, target_date)
     snapshot = session.exec(
         select(ClassDailySnapshot)
         .where(ClassDailySnapshot.class_id == class_id)
         .where(ClassDailySnapshot.snapshot_date == target_date)
     ).first()
-    recent_analysis = await generate_class_window_analysis(
-        session,
-        class_id=class_id,
-        target_date=target_date,
-        window_days=recent_days,
-    )
+    recent_analysis = session.exec(
+        select(AnalyticsArtifact)
+        .where(AnalyticsArtifact.artifact_type == "class_window_analysis")
+        .where(AnalyticsArtifact.scope == "class")
+        .where(AnalyticsArtifact.class_id == class_id)
+        .where(AnalyticsArtifact.target_date == target_date)
+        .where(AnalyticsArtifact.window_start == window_start)
+        .where(AnalyticsArtifact.window_end == target_date)
+        .order_by(AnalyticsArtifact.updated_at.desc())
+    ).first()
 
     vocab_rates = [s.vocab_growth_rate for s in week_summaries if s.vocab_growth_rate is not None]
     grammar_slopes = [s.grammar_error_decay_slope for s in week_summaries if s.grammar_error_decay_slope is not None]
@@ -312,11 +393,25 @@ async def build_class_overview_payload(
             "data_points": len(week_summaries),
             "common_error_index": snapshot.common_error_index if snapshot else None,
         },
+        # The overview endpoint is a read path. Scheduled analytics jobs can
+        # populate an LLM-enhanced artifact; until then, return factual counts
+        # instead of blocking the teacher page on cloud/RAG timeouts.
         "recent_analysis": {
-            "window_start": str(recent_analysis.window_start) if recent_analysis.window_start else None,
-            "window_end": str(recent_analysis.window_end) if recent_analysis.window_end else None,
-            "content": recent_analysis.content,
-            "evidence": recent_analysis.evidence,
+            "window_start": str(recent_analysis.window_start)
+            if recent_analysis and recent_analysis.window_start
+            else str(window_start),
+            "window_end": str(recent_analysis.window_end)
+            if recent_analysis and recent_analysis.window_end
+            else str(target_date),
+            "content": recent_analysis.content
+            if recent_analysis
+            else (
+                f"{class_id} 班级近{recent_days}天：在册学生 "
+                f"{population['enrolled_students']} 人，当天活跃 "
+                f"{population['active_students']} 人，当天已分析 "
+                f"{population['analyzed_students']} 人。"
+            ),
+            "evidence": recent_analysis.evidence if recent_analysis else [],
         },
         "charts": _build_class_charts(latest_summaries, week_summaries),
     }

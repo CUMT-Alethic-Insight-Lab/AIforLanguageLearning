@@ -17,6 +17,15 @@ from __future__ import annotations
 from typing import Any
 
 
+def _normalize_essay_score(value: float | int | None) -> float:
+    if not isinstance(value, (int, float)):
+        return 0.0
+    raw = float(value)
+    if raw <= 10:
+        raw *= 10
+    return max(0.0, min(100.0, raw))
+
+
 def build_pie_chart(title: str, labels: list[str], data: list[float], dataset_label: str = "数值") -> dict[str, Any]:
     """构建饼图。"""
     return {
@@ -100,7 +109,7 @@ def build_essay_dimension_radar(dimensions: dict[str, dict[str, float]], title: 
     """
     labels = ["内容", "结构", "语言", "语法"]
     keys = ["content", "structure", "language", "grammar"]
-    data = [dimensions.get(k, {}).get("score", 0) * 10 for k in keys]
+    data = [_normalize_essay_score(dimensions.get(k, {}).get("score", 0)) for k in keys]
     return build_radar_chart(
         title=title,
         labels=labels,
@@ -121,9 +130,9 @@ def build_essay_history_line(
         title=title,
         labels=dates,
         datasets=[
-            {"label": "内容", "data": content_scores},
-            {"label": "结构", "data": structure_scores},
-            {"label": "语言", "data": language_scores},
-            {"label": "语法", "data": grammar_scores},
+            {"label": "内容", "data": [_normalize_essay_score(score) for score in content_scores]},
+            {"label": "结构", "data": [_normalize_essay_score(score) for score in structure_scores]},
+            {"label": "语言", "data": [_normalize_essay_score(score) for score in language_scores]},
+            {"label": "语法", "data": [_normalize_essay_score(score) for score in grammar_scores]},
         ],
     )

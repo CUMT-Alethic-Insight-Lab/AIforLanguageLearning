@@ -6,6 +6,7 @@
  */
 
 import { ref, onMounted, watch } from 'vue';
+import { getDefaultBackendUrl, getDefaultBackendWsHost } from '../services/backend-url';
 import { ConfigService, type AppConfig, type SystemConfig } from '../services/config';
 
 // --- 状态管理 ---
@@ -15,7 +16,7 @@ const settings = ref<AppConfig>({
   general: { theme: 'dark', language: 'zh-CN', autoUpdate: true },
   audio: { inputDevice: 'default', outputDevice: 'default', volume: 80 },
   ai: { model: 'local-model', temperature: 0.7, voice: 'alloy' },
-  backend: { url: 'http://localhost:8012', wsUrl: 'localhost:8012' }
+  backend: { url: getDefaultBackendUrl(), wsUrl: getDefaultBackendWsHost() }
 });
 
 /** 后端返回的可用本地模型列表 */
@@ -53,11 +54,11 @@ onMounted(async () => {
 
     // 兜底确保 backend 字段存在
     if (!settings.value.backend) {
-      settings.value.backend = { url: 'http://localhost:8012', wsUrl: 'localhost:8012' };
+      settings.value.backend = { url: getDefaultBackendUrl(), wsUrl: getDefaultBackendWsHost() };
     } else {
       settings.value.backend = {
-        url: settings.value.backend.url || 'http://localhost:8012',
-        wsUrl: settings.value.backend.wsUrl || 'localhost:8012'
+        url: settings.value.backend.url || getDefaultBackendUrl(),
+        wsUrl: settings.value.backend.wsUrl || getDefaultBackendWsHost()
       };
     }
 

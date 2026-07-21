@@ -19,6 +19,36 @@ from .models import RecommendationResult, VocabularyRecommendation
 
 logger = logging.getLogger(__name__)
 
+TOPIC_KEYWORDS: dict[str, tuple[str, ...]] = {
+    "travel": ("travel", "airport", "hotel", "boarding", "customs", "destination", "trip", "ticket"),
+    "business": ("business", "meeting", "agenda", "proposal", "deadline", "stakeholder", "invoice", "client"),
+    "academic": ("academic", "research", "thesis", "lecture", "seminar", "curriculum", "citation", "exam"),
+    "social": ("party", "friend", "dating", "small talk", "conversation", "introduce", "greet"),
+    "food": ("restaurant", "menu", "order", "coffee", "cafe", "dish", "bill", "reservation"),
+    "daily": ("daily", "schedule", "grocery", "commute", "laundry", "exercise", "appointment", "weekend"),
+}
+
+TOPIC_ALIASES: dict[str, str] = {
+    "daily life": "daily",
+    "daily_life": "daily",
+    "business english": "business",
+    "food_service": "food",
+}
+
+
+def _normalized_topic_name(raw_topic: str) -> str:
+    topic = str(raw_topic or "").strip().lower()
+    return TOPIC_ALIASES.get(topic, topic)
+
+
+def _extract_topics_from_text(text: str) -> set[str]:
+    haystack = str(text or "").lower()
+    topics: set[str] = set()
+    for topic, keywords in TOPIC_KEYWORDS.items():
+        if any(keyword in haystack for keyword in keywords):
+            topics.add(topic)
+    return topics
+
 # 可选依赖占位
 try:
     import numpy as np  # noqa: F401
@@ -79,26 +109,32 @@ class RecommendationEngine:
         for record in user_history:
             meta = record.get("meta_data") or {}
             for topic in meta.get("topics") or []:
-                topic_freq[topic] = topic_freq.get(topic, 0) + 1
+                normalized_topic = _normalized_topic_name(topic)
+                if normalized_topic:
+                    topic_freq[normalized_topic] = topic_freq.get(normalized_topic, 0) + 1
             # 从 content 中提取场景关键词
             content = str(record.get("content") or "").lower()
-            for topic in ("travel", "business", "daily", "academic", "social", "food"):
-                if topic in content:
-                    topic_freq[topic] = topic_freq.get(topic, 0) + 1
+            for topic in _extract_topics_from_text(content):
+                topic_freq[topic] = topic_freq.get(topic, 0) + 1
+
+            for topic in _extract_topics_from_text(" ".join(str(item) for item in meta.get("words") or [])):
+                topic_freq[topic] = topic_freq.get(topic, 0) + 1
 
         if not topic_freq:
             return []
 
-        # 对候选池按主题匹配度排序（简单 Jaccard 代理）
+        # 对候选池按主题匹配度排序。
         scored: List[tuple[float, str]] = []
         for word in candidate_pool:
-            # 启发式：假设 candidate_pool 中的词带有隐式主题
-            # 实际生产环境应接入词汇标签库
             word_lower = word.lower()
-            matched = 0
-            for topic, freq in topic_freq.items():
-                if topic in word_lower or word_lower in topic:
-                    matched += freq
+            inferred_topics = _extract_topics_from_text(word_lower)
+            matched = sum(topic_freq.get(topic, 0) for topic in inferred_topics)
+
+            if matched == 0:
+                for topic, keywords in TOPIC_KEYWORDS.items():
+                    if word_lower in keywords:
+                        matched += topic_freq.get(topic, 0)
+
             if matched > 0:
                 scored.append((matched, word))
 

@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import logging
-import math
 from datetime import date, timedelta
 from typing import Any
 
@@ -15,8 +14,10 @@ from sqlmodel import Session, select
 
 from ...db import get_engine
 from ...domain.analytics.models import ClassDailySnapshot, StudentDailySummary
-from ...domain.models import StudentProfile
-from .daily_summary import _classify_topic_labels
+from .orchestration import (
+    get_class_population_counts,
+    get_class_user_ids,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -103,7 +104,9 @@ def _calc_common_error_index(current_summaries: list[StudentDailySummary]) -> fl
     return round((grammar_regress / valid + error_high / valid) / 2, 4)
 
 
-def _calc_mid_tier_difficulty_tolerance(current_summaries: list[StudentDailySummary]) -> float | None:
+def _calc_mid_tier_difficulty_tolerance(
+    current_summaries: list[StudentDailySummary],
+) -> float | None:
     """B3: 中层学生难度耐受力。
 
     中层 60% 学生的 difficulty_jump_success 均值。
@@ -213,7 +216,9 @@ def _calc_bottleneck_duration_days(current_summaries: list[StudentDailySummary])
     return round((bottleneck_count / total) * 14, 4)
 
 
-def _calc_feedback_adoption_tendency(current_summaries: list[StudentDailySummary]) -> dict[str, Any] | None:
+def _calc_feedback_adoption_tendency(
+    current_summaries: list[StudentDailySummary],
+) -> dict[str, Any] | None:
     """B9: 反馈采纳群体倾向。
 
     基于 feedback_response_depth 分布统计结构/语法建议采纳比例代理。
@@ -221,7 +226,11 @@ def _calc_feedback_adoption_tendency(current_summaries: list[StudentDailySummary
     if not current_summaries:
         return None
 
-    depths = [s.feedback_response_depth for s in current_summaries if s.feedback_response_depth is not None]
+    depths = [
+        s.feedback_response_depth
+        for s in current_summaries
+        if s.feedback_response_depth is not None
+    ]
     if not depths:
         return None
 
@@ -274,18 +283,15 @@ def generate_class_daily_snapshot(
         target_date = date.today() - timedelta(days=1)
 
     with Session(get_engine()) as session:
-        user_ids = [
-            p.user_id
-            for p in session.exec(
-                select(StudentProfile).where(StudentProfile.class_id == class_id)
-            )
-        ]
+        user_ids = get_class_user_ids(session, class_id)
+        population = get_class_population_counts(session, class_id, target_date)
 
         # 当日摘要
         current_summaries = list(
             session.exec(
                 select(StudentDailySummary)
                 .where(StudentDailySummary.user_id.in_(user_ids))
+                .where(StudentDailySummary.class_id == class_id)
                 .where(StudentDailySummary.summary_date == target_date)
             )
         ) if user_ids else []
@@ -296,6 +302,7 @@ def generate_class_daily_snapshot(
             session.exec(
                 select(StudentDailySummary)
                 .where(StudentDailySummary.user_id.in_(user_ids))
+                .where(StudentDailySummary.class_id == class_id)
                 .where(StudentDailySummary.summary_date == prev_date)
             )
         ) if user_ids else []
@@ -323,7 +330,13 @@ def generate_class_daily_snapshot(
         feedback_adoption_tendency=b9 or {},
         task_completion_resilience=b10,
         raw_snapshot={
+            # Backward compatibility: student_count has always represented
+            # daily summaries, not the class roster.
             "student_count": len(current_summaries),
+            "total_students": population["total_students"],
+            "enrolled_students": population["enrolled_students"],
+            "active_students": population["active_students"],
+            "analyzed_students": len(current_summaries),
             "previous_date": str(prev_date),
             "previous_student_count": len(previous_summaries),
             "computed_dimensions": {

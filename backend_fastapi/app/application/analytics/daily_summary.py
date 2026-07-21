@@ -6,7 +6,7 @@ import asyncio
 import logging
 import math
 import re
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlmodel import Session, select
@@ -14,7 +14,7 @@ from sqlmodel import Session, select
 from ...db import get_engine
 from ...domain.analytics.models import StudentDailySummary
 from ...domain.models import LearningRecord, StudentProfile, VocabularyItem
-from ...llm import chat_complete, chat_complete_cloud_first
+from ...llm import chat_complete_cloud_first
 from ...models import ConversationEvent, EssayResult, EssaySubmission, UserVocabQuery
 from ._text_analysis import (
     analyze_morph_transfer,
@@ -274,8 +274,24 @@ def _calc_long_term_memory(vocab_items: list[VocabularyItem]) -> int | None:
     """A5: 长时记忆健壮度（进入长复习周期的单词数）。"""
     if not vocab_items:
         return None
-    one_year_later = datetime.utcnow() + timedelta(days=365)
+    # 以样本自身的最新观测时间为锚点，避免历史回放时被运行当天时间污染。
+    reference_time = max(
+        (item.created_at for item in vocab_items if isinstance(item.created_at, datetime)),
+        default=datetime.now(UTC),
+    )
+    one_year_later = reference_time + timedelta(days=365)
     return sum(1 for v in vocab_items if v.next_review_at >= one_year_later)
+
+
+def _extract_dimension_score(dimensions: dict[str, Any], key: str) -> float | None:
+    raw = dimensions.get(key)
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    if isinstance(raw, dict):
+        score = raw.get("score")
+        if isinstance(score, (int, float)):
+            return float(score)
+    return None
 
 
 def _calc_grammar_error_decay(essay_results: list[EssayResult]) -> float | None:
@@ -283,7 +299,7 @@ def _calc_grammar_error_decay(essay_results: list[EssayResult]) -> float | None:
     scores: list[float] = []
     for er in sorted(essay_results, key=lambda x: x.created_at)[-5:]:
         dims = (er.result or {}).get("dimensions", {})
-        g = dims.get("grammar")
+        g = _extract_dimension_score(dims, "grammar")
         if isinstance(g, (int, float)):
             scores.append(float(g))
     if len(scores) < 2:
@@ -333,7 +349,7 @@ def _calc_logical_coherence(essay_results: list[EssayResult]) -> float | None:
     scores: list[float] = []
     for er in sorted(essay_results, key=lambda x: x.created_at)[-5:]:
         dims = (er.result or {}).get("dimensions", {})
-        s = dims.get("structure")
+        s = _extract_dimension_score(dims, "structure")
         if isinstance(s, (int, float)):
             scores.append(float(s))
     if not scores:
@@ -342,18 +358,17 @@ def _calc_logical_coherence(essay_results: list[EssayResult]) -> float | None:
 
 
 def _calc_semantic_accuracy(essay_results: list[EssayResult]) -> float | None:
-    """A10: 语义表达准确性（最近5篇 language 维度均值，越低越好，取反）。"""
+    """A10: 语义表达准确性（最近5篇 language 维度均值，转换为0-100分制）。"""
     scores: list[float] = []
     for er in sorted(essay_results, key=lambda x: x.created_at)[-5:]:
         dims = (er.result or {}).get("dimensions", {})
-        l = dims.get("language")
+        l = _extract_dimension_score(dims, "language")
         if isinstance(l, (int, float)):
             scores.append(float(l))
     if not scores:
         return None
     avg = sum(scores) / len(scores)
-    # 转换为"越高越好"方向（假设满分 100）
-    return round(100 - avg, 4)
+    return round(100.0 - avg, 4)
 
 
 def _calc_response_latency(events: list[ConversationEvent]) -> int | None:
@@ -400,6 +415,18 @@ def _calc_difficulty_jump_success(events: list[ConversationEvent]) -> float | No
     - 仅统计场景复杂度 >= 4 的用户回合，避免简单寒暄稀释结果；
     - 认为“成功”需同时满足：用户有足够输出、AI 正常响应且延迟不过长。
     """
+    latency_by_request_id: dict[str, float] = {}
+    for event in events:
+        if event.type != "AI_MESSAGE":
+            continue
+        payload = event.payload or {}
+        latency = payload.get("response_latency_ms")
+        if not isinstance(latency, (int, float)) or latency < 0:
+            continue
+        request_id = str(event.request_id or "").strip()
+        if request_id:
+            latency_by_request_id[request_id] = float(latency)
+
     attempts = 0
     successes = 0
     for event in events:
@@ -414,6 +441,9 @@ def _calc_difficulty_jump_success(events: list[ConversationEvent]) -> float | No
         attempts += 1
         word_count = payload.get("word_count")
         latency = payload.get("response_latency_ms")
+        if not isinstance(latency, (int, float)):
+            request_id = str(event.request_id or "").strip()
+            latency = latency_by_request_id.get(request_id)
         if not isinstance(word_count, (int, float)) or word_count < 4:
             continue
         if isinstance(latency, (int, float)) and latency > 8000:
@@ -455,10 +485,11 @@ def _calc_paraphrase_count(events: list[ConversationEvent]) -> int | None:
 
 def _calc_learning_stability(records: list[LearningRecord]) -> float | None:
     """A16: 学习行为稳定性（近7日学习记录频次标准差，越小越稳）。"""
-    if not records:
+    effective_records = [record for record in records if _is_user_initiated_learning_record(record)]
+    if not effective_records:
         return None
     daily_counts: dict[date, int] = {}
-    for record in records:
+    for record in effective_records:
         day = record.created_at.date()
         daily_counts[day] = daily_counts.get(day, 0) + 1
     if len(daily_counts) <= 1:
@@ -467,6 +498,15 @@ def _calc_learning_stability(records: list[LearningRecord]) -> float | None:
     avg = sum(values) / len(values)
     variance = sum((value - avg) ** 2 for value in values) / len(values)
     return round(math.sqrt(variance), 4)
+
+
+def _is_user_initiated_learning_record(record: LearningRecord) -> bool:
+    meta = record.meta_data or {}
+    action = str(meta.get("action") or "").strip().lower()
+    source = str(meta.get("source") or "").strip().lower()
+    if record.type == "essay" and action == "grade_essay" and source == "celery":
+        return False
+    return True
 
 
 def _calc_error_regression_rate(records: list[LearningRecord]) -> float | None:
@@ -509,7 +549,9 @@ def _calc_feedback_response_depth(essay_results: list[EssayResult], records: lis
     follow_up_actions = sum(
         1
         for record in records
-        if record.type in {"vocabulary", "dialogue"} and str((record.meta_data or {}).get("action") or "") in {"review", "lookup", "lookup_ocr"}
+        if _is_user_initiated_learning_record(record)
+        if record.type in {"vocabulary", "essay"}
+        and str((record.meta_data or {}).get("action") or "") in {"review", "lookup", "lookup_ocr", "grade_essay"}
     )
     base = sum(improvements) / len(improvements)
     depth = base * 0.7 + min(1.0, follow_up_actions / 5.0) * 0.3
@@ -531,6 +573,8 @@ def _calc_topic_coverage_breadth(
         meta = query.meta_data or {}
         labels.update(_classify_topic_labels(query.term, query.result, meta.get("theme") or "", meta.get("scenario") or ""))
     for event in events:
+        if str(event.type or "") != "USER_MESSAGE":
+            continue
         payload = event.payload or {}
         labels.update(_classify_topic_labels(payload.get("scenario") or "", payload.get("text") or ""))
     for record in records:
@@ -546,6 +590,7 @@ def _calc_autonomous_drive(queries: list[UserVocabQuery], records: list[Learning
     if not queries and not records:
         return None
     count = 0
+    essay_submission_keys: set[str] = set()
     for query in queries:
         meta = query.meta_data or {}
         action = str(meta.get("action") or "").strip().lower()
@@ -557,7 +602,18 @@ def _calc_autonomous_drive(queries: list[UserVocabQuery], records: list[Learning
         action = str(meta.get("action") or "").strip().lower()
         if action in {"generate_vocab", "lookup", "lookup_ocr", "review"}:
             count += 1
-    return count if count > 0 else None
+            continue
+        if action not in {"submit_essay", "grade_essay"}:
+            continue
+
+        submission_id = meta.get("submission_id")
+        if submission_id is None:
+            essay_submission_keys.add(f"fallback:{record.created_at.isoformat()}:{action}")
+            continue
+        essay_submission_keys.add(str(submission_id))
+
+    total = count + len(essay_submission_keys)
+    return total if total > 0 else None
 
 
 # ───────────────────────────────────────────────

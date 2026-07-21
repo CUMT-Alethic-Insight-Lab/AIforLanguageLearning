@@ -92,11 +92,9 @@ async def update_config(
     _: Any = Depends(_require_admin),
 ) -> ConfigResponse:
     # FastAPI settings 是只读的，运行时配置持久化到 runtime_config.json
-    from ..runtime_config import get_runtime_config, update_runtime_config
+    from ..runtime_config import update_runtime_config
 
-    runtime = get_runtime_config()
-    runtime.update(body)
-    update_runtime_config(runtime)
+    runtime = update_runtime_config(body)
     return ConfigResponse(success=True, data=runtime)
 
 
@@ -375,14 +373,17 @@ async def update_user_role(
     new_role = body.get("role", "").strip()
     if not new_role:
         raise HTTPException(status_code=400, detail="Missing role")
+    if new_role not in {"student", "teacher", "admin"}:
+        raise HTTPException(status_code=400, detail="Invalid role")
     from ..infrastructure.db_user import get_user_by_id
 
     user = get_user_by_id(user_id)
     if user is None:
         raise HTTPException(status_code=404, detail="User not found")
     user.role = new_role
-    from ..db import get_engine
     from sqlmodel import Session
+
+    from ..db import get_engine
 
     with Session(get_engine()) as session:
         session.add(user)

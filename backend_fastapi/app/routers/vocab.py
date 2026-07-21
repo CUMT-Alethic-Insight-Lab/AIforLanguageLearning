@@ -9,15 +9,14 @@ from sqlmodel import Session, select
 from ..application.db_learning import create_record
 from ..application.db_vocabulary import add_word, get_due_words, review_word
 from ..db import get_session
-from ..domain.models import VocabularyItem
 from ..domain.knowledge_graph import get_kg_service
+from ..domain.models import User, VocabularyItem
 from ..infrastructure.dependencies import get_current_user, get_optional_user
 from ..infrastructure.messaging.tasks import generate_daily_vocab_task
 from ..infrastructure.persistence.search.es_client import search_vocabulary
 from ..llm import generate_definition, generate_vocab_fields
 from ..models import PublicVocabEntry, UserVocabQuery
 from ..ocr import ocr_image_base64
-from ..domain.models import User
 
 router = APIRouter(prefix="/v1/vocab", tags=["vocab"])
 
@@ -124,10 +123,14 @@ class VocabReviewSubmitResponse(BaseModel):
 
 
 def _resolve_user_id(current_user: User | None, requested_user_id: int | None) -> int | None:
+    """Return the user_id from the authenticated user, or None if anonymous.
+
+    P0 fix: the ``requested_user_id`` parameter is retained for signature
+    compatibility but is *never* used as a fallback — unauthenticated clients
+    cannot inject an arbitrary user_id via the request body.
+    """
     if current_user is not None and current_user.id is not None:
         return int(current_user.id)
-    if isinstance(requested_user_id, int) and requested_user_id > 0:
-        return requested_user_id
     return None
 
 
@@ -153,15 +156,7 @@ def _parse_definition_block(term: str, definition: str, structured_defs: list[di
     example_translation = normalized[0].example_translation if normalized else ""
 
     if normalized:
-        lines: list[str] = []
-        for idx, item in enumerate(normalized, start=1):
-            prefix = f"{idx}. " if len(normalized) > 1 else ""
-            lines.append(f"{prefix}释义：{item.meaning}")
-            if item.example:
-                lines.append(f"例句：{item.example}")
-            if item.example_translation:
-                lines.append(f"例句翻译：{item.example_translation}")
-        return meaning, example, example_translation, normalized if normalized else [VocabDefinition(meaning=term)]
+        return meaning, example, example_translation, normalized
 
     text = str(definition or "").strip()
     parsed_meaning = ""
@@ -247,6 +242,8 @@ async def _build_recommendations(
         "similar_form": "形近词",
     }
 
+    kg_service = None
+
     try:
         kg_service = await get_kg_service()
         related = await kg_service.get_word_relations(term.lower(), limit=5)
@@ -268,6 +265,26 @@ async def _build_recommendations(
         pass
 
     if user_id is not None and len(out) < 5:
+        try:
+            for item in get_due_words(user_id, limit=5):
+                word = str(item.word or "").strip()
+                if not word or word.lower() == term.lower() or word in seen:
+                    continue
+                out.append(
+                    LookupRecommendation(
+                        word=word,
+                        relation_type="review_due",
+                        score=1.0,
+                        reason="这个词已到复习时间，建议顺手回顾",
+                    )
+                )
+                seen.add(word)
+                if len(out) >= 5:
+                    break
+        except Exception:
+            pass
+
+    if user_id is not None and len(out) < 5 and kg_service is not None:
         learned_words = list(
             session.exec(
                 select(VocabularyItem.word)
@@ -575,12 +592,18 @@ async def list_due_vocab_for_review(
 async def submit_vocab_review(
     req: VocabReviewSubmitRequest,
     current_user: User = Depends(get_current_user),
+    session: Session = Depends(get_session),
 ) -> VocabReviewSubmitResponse:
+    # 先校验所有权，防止 IDOR（越权修改他人复习记录）
+    existing = session.get(VocabularyItem, req.vocab_id)
+    if existing is None or existing.user_id != (current_user.id or 0):
+        raise HTTPException(status_code=404, detail="vocab item not found")
+
     item = review_word(
         req.vocab_id,
         correct=req.correct if req.correct is not None else int(req.quality or 0) >= 3,
     )
-    if item is None or item.user_id != (current_user.id or 0):
+    if item is None:
         raise HTTPException(status_code=404, detail="vocab item not found")
 
     create_record(

@@ -8,7 +8,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from ..domain.knowledge_graph import (
-    KnowledgeGraphService,
     RelationType,
     get_kg_service,
 )

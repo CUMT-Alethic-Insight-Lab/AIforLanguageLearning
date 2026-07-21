@@ -7,15 +7,118 @@
 
 from __future__ import annotations
 
+import hashlib
+import os
 import re
+import tempfile
+import threading
 from typing import Any
 
 # 尝试导入tiktoken，如果不存在则使用近似计数
 try:
     import tiktoken
+    from tiktoken import registry as tiktoken_registry
+
     TIKTOKEN_AVAILABLE = True
 except ImportError:
+    tiktoken = None
+    tiktoken_registry = None
     TIKTOKEN_AVAILABLE = False
+
+
+_ENCODING_RESOURCES: dict[str, tuple[tuple[str, str], ...]] = {
+    "gpt2": (
+        (
+            "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/vocab.bpe",
+            "1ce1664773c50f3e0cc8842619a93edc4624525b728b188a9e0be33b7726adc5",
+        ),
+        (
+            "https://openaipublic.blob.core.windows.net/gpt-2/encodings/main/encoder.json",
+            "196139668be63f3b5d6574427317ae82f612a97c5d1cdaf36ed2256dbf636783",
+        ),
+    ),
+    "r50k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/r50k_base.tiktoken",
+            "306cd27f03c1a714eca7108e03d66b7dc042abe8c258b44c199a7ed9838dd930",
+        ),
+    ),
+    "p50k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
+            "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
+        ),
+    ),
+    "p50k_edit": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/p50k_base.tiktoken",
+            "94b5ca7dff4d00767bc256fdd1b27e5b17361d7b8a5f968547f9f23eb70d2069",
+        ),
+    ),
+    "cl100k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken",
+            "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7",
+        ),
+    ),
+    "o200k_base": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+            "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+        ),
+    ),
+    "o200k_harmony": (
+        (
+            "https://openaipublic.blob.core.windows.net/encodings/o200k_base.tiktoken",
+            "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d",
+        ),
+    ),
+}
+
+_TOKENIZER_LOCK = threading.RLock()
+_TOKENIZER_CACHE: dict[str, Any | None] = {}
+_LOCAL_ENCODING_CACHE: dict[str, bool] = {}
+
+
+def _tiktoken_cache_dir() -> str:
+    if "TIKTOKEN_CACHE_DIR" in os.environ:
+        return os.environ["TIKTOKEN_CACHE_DIR"]
+    if "DATA_GYM_CACHE_DIR" in os.environ:
+        return os.environ["DATA_GYM_CACHE_DIR"]
+    return os.path.join(tempfile.gettempdir(), "data-gym-cache")
+
+
+def _cached_resource_is_valid(cache_dir: str, url: str, expected_hash: str) -> bool:
+    cache_key = hashlib.sha1(url.encode()).hexdigest()
+    cache_path = os.path.join(cache_dir, cache_key)
+    try:
+        digest = hashlib.sha256()
+        with open(cache_path, "rb") as cached_file:
+            for chunk in iter(lambda: cached_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest() == expected_hash
+    except OSError:
+        return False
+
+
+def _has_local_encoding_data(encoding_name: str) -> bool:
+    cached = _LOCAL_ENCODING_CACHE.get(encoding_name)
+    if cached is not None:
+        return cached
+
+    loaded_encodings = getattr(tiktoken_registry, "ENCODINGS", {})
+    if encoding_name in loaded_encodings:
+        _LOCAL_ENCODING_CACHE[encoding_name] = True
+        return True
+
+    resources = _ENCODING_RESOURCES.get(encoding_name)
+    cache_dir = _tiktoken_cache_dir()
+    available = bool(cache_dir and resources) and all(
+        _cached_resource_is_valid(cache_dir, url, expected_hash)
+        for url, expected_hash in resources
+    )
+    _LOCAL_ENCODING_CACHE[encoding_name] = available
+    return available
 
 
 def get_tokenizer(model_name: str = "gpt-3.5-turbo") -> Any:
@@ -30,17 +133,33 @@ def get_tokenizer(model_name: str = "gpt-3.5-turbo") -> Any:
     """
     if not TIKTOKEN_AVAILABLE:
         return None
-    
-    try:
-        # 尝试获取对应模型的encoding
-        encoding = tiktoken.encoding_for_model(model_name)
-        return encoding
-    except KeyError:
-        # 如果模型不在列表中，使用cl100k_base（支持大多数模型）
+
+    with _TOKENIZER_LOCK:
+        if model_name in _TOKENIZER_CACHE:
+            return _TOKENIZER_CACHE[model_name]
+
         try:
-            return tiktoken.get_encoding("cl100k_base")
+            encoding_name = tiktoken.encoding_name_for_model(model_name)
+        except KeyError:
+            encoding_name = "cl100k_base"
         except Exception:
+            _TOKENIZER_CACHE[model_name] = None
             return None
+
+        # tiktoken会在词表缓存缺失或损坏时自动联网下载。仅在确认本地数据完整时构造，
+        # 保证默认运行和测试不依赖公网。
+        if not _has_local_encoding_data(encoding_name):
+            _TOKENIZER_CACHE[model_name] = None
+            return None
+
+        try:
+            encoding = tiktoken.get_encoding(encoding_name)
+        except Exception:
+            encoding = None
+
+        # None也缓存：构造失败后本进程不再反复尝试下载或等待网络超时。
+        _TOKENIZER_CACHE[model_name] = encoding
+        return encoding
 
 
 def count_tokens(text: str, model_name: str = "gpt-3.5-turbo") -> int:
@@ -310,7 +429,9 @@ def compress_messages(
     if available_for_conv < 500:
         # 空间太小，只保留system和最后一轮
         if conversation:
-            return system_msgs + conversation[-2:] if len(conversation) >= 2 else system_msgs + conversation
+            if len(conversation) >= 2:
+                return system_msgs + conversation[-2:]
+            return system_msgs + conversation
         return system_msgs
     
     # 从后往前找能完整保留的对话轮数

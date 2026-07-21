@@ -3,11 +3,9 @@
 from __future__ import annotations
 
 import heapq
-import re
-from collections import defaultdict
 from typing import Any, Dict, List, Optional
 
-from .client import get_neo4j_client, Neo4jClient
+from .client import Neo4jClient, get_neo4j_client
 from .models import (
     RecommendationResult,
     RelationQueryResult,
@@ -75,8 +73,12 @@ class KnowledgeGraphService:
         """获取或创建客户端"""
         if self._client is None:
             self._client = await get_neo4j_client()
-            await self._client.connect()
-            await self._client.init_schema()
+            try:
+                await self._client.connect()
+                await self._client.init_schema()
+            except Exception:
+                # Neo4j server unavailable; gracefully degrade
+                pass
         return self._client
 
     # ==================== 词汇关系查询 ====================

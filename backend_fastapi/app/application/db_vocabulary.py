@@ -57,6 +57,7 @@ def get_due_words(user_id: int, limit: int = 20) -> list[VocabularyItem]:
                 select(VocabularyItem)
                 .where(VocabularyItem.user_id == user_id)
                 .where(VocabularyItem.next_review_at <= now)
+                .order_by(col(VocabularyItem.mastery_level))
                 .order_by(col(VocabularyItem.next_review_at))
                 .limit(limit)
             ).all()

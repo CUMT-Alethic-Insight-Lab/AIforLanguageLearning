@@ -8,38 +8,34 @@ import api from './api';
 import type { EssayCorrectionResult } from '../types/essay';
 
 function toEssayCorrectionResult(raw: any, originalText: string): EssayCorrectionResult {
+  // Backend EssayGradeResponse: { submission_id, score (0-100), result: { dimensions, total_score (0-10), grade, feedback, suggestions, corrected_text } }
   const result = (raw?.result && typeof raw.result === 'object') ? raw.result : raw;
+  const dims = result?.dimensions && typeof result.dimensions === 'object' ? result.dimensions : null;
 
-  const total = Number(result?.score ?? result?.scores?.total ?? 0);
-  const scores = result?.scores && typeof result.scores === 'object'
-    ? result.scores
-    : {
-        vocabulary: Math.max(0, Math.min(100, Math.round(total))),
-        grammar: Math.max(0, Math.min(100, Math.round(total))),
-        fluency: Math.max(0, Math.min(100, Math.round(total))),
-        logic: Math.max(0, Math.min(100, Math.round(total))),
-        content: Math.max(0, Math.min(100, Math.round(total))),
-        structure: Math.max(0, Math.min(100, Math.round(total))),
-        total: Math.max(0, Math.min(100, Math.round(total))),
-      };
+  // total_score is 0-10 from backend; convert to 0-100 for frontend display.
+  const totalScore10 = Number(result?.total_score ?? (raw?.score != null ? raw.score / 10 : 0));
+  const total100 = Math.round(Math.max(0, Math.min(100, totalScore10 * 10)));
+
+  const dimScore = (key: string) =>
+    dims ? Math.round(Math.max(0, Math.min(100, Number(dims[key]?.score ?? totalScore10) * 10))) : total100;
 
   return {
     original: String(result?.original || originalText || ''),
-    correction: String(result?.rewritten || result?.correction || ''),
+    correction: String(result?.corrected_text || result?.rewritten || result?.correction || ''),
     scores: {
-      vocabulary: Number(scores.vocabulary ?? total ?? 0),
-      grammar: Number(scores.grammar ?? total ?? 0),
-      fluency: Number(scores.fluency ?? total ?? 0),
-      logic: Number(scores.logic ?? total ?? 0),
-      content: Number(scores.content ?? total ?? 0),
-      structure: Number(scores.structure ?? total ?? 0),
-      total: Number(scores.total ?? total ?? 0),
+      vocabulary: dims?.vocabulary ? dimScore('vocabulary') : dimScore('language'),
+      grammar: dimScore('grammar'),
+      fluency: dims?.fluency ? dimScore('fluency') : dimScore('language'),
+      logic: dims?.logic ? dimScore('logic') : dimScore('structure'),
+      content: dimScore('content'),
+      structure: dimScore('structure'),
+      total: total100,
     },
     feedback: String(result?.feedback || ''),
     suggestions: Array.isArray(result?.suggestions) ? result.suggestions : [],
     questions: Array.isArray(result?.questions) ? result.questions : [],
     improvements: Array.isArray(result?.improvements) ? result.improvements : [],
-    evaluation: String(result?.evaluation || ''),
+    evaluation: String(result?.grade || result?.evaluation || ''),
   };
 }
 
@@ -55,7 +51,7 @@ export const EssayService = {
    * @throws {Error} 如果批改失败
    */
   async correct(text: string, language: string = 'english'): Promise<EssayCorrectionResult> {
-    const response = await api.post('/v1/essays/grade', { ocr_text: text, language }, { timeout: 60000 });
+    const response = await api.post('/v1/essays/grade', { text, language }, { timeout: 60000 });
     return toEssayCorrectionResult(response, text);
   },
 

@@ -5,11 +5,25 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 
-from minio import Minio
-
 logger = logging.getLogger(__name__)
+
+_MINIO_IMPORT_ERROR: str | None = None
+
+
+def is_minio_available() -> bool:
+    """Check whether the MinIO SDK is installed."""
+    global _MINIO_IMPORT_ERROR
+    if _MINIO_IMPORT_ERROR:
+        return False
+    try:
+        import minio  # noqa: F401
+        return True
+    except ImportError as e:
+        _MINIO_IMPORT_ERROR = str(e)
+        return False
 
 
 @dataclass
@@ -30,11 +44,16 @@ class MinIOStorage:
         secret_key: str,
         secure: bool = False,
     ):
+        try:
+            from minio import Minio
+        except ImportError as e:
+            raise RuntimeError(
+                "MinIO SDK is not installed. Install with: pip install minio"
+            ) from e
         self.client = Minio(endpoint, access_key=access_key, secret_key=secret_key, secure=secure)
-        self._loop = asyncio.get_event_loop()
 
     async def _run(self, fn, *args, **kwargs):
-        return await self._loop.run_in_executor(None, lambda: fn(*args, **kwargs))
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def ensure_bucket(self, bucket: str) -> None:
         exists = await self._run(self.client.bucket_exists, bucket)
@@ -73,7 +92,7 @@ class MinIOStorage:
             self.client.presigned_get_object,
             bucket,
             key,
-            expires,
+            timedelta(seconds=expires),
         )
 
     async def initiate_multipart_upload(
@@ -113,18 +132,25 @@ class MinIOStorage:
 _storage: MinIOStorage | None = None
 
 
-def get_minio_storage() -> MinIOStorage:
+def get_minio_storage() -> MinIOStorage | None:
     global _storage
     if _storage is None:
+        if not is_minio_available():
+            logger.warning("MinIO SDK not available; storage features disabled.")
+            return None
         from app.settings import settings
 
         endpoint = getattr(settings, "minio_endpoint", "localhost:9000")
         access_key = getattr(settings, "minio_access_key", "minioadmin")
         secret_key = getattr(settings, "minio_secret_key", "minioadmin")
-        _storage = MinIOStorage(
-            endpoint=endpoint,
-            access_key=access_key,
-            secret_key=secret_key,
-            secure=False,
-        )
+        try:
+            _storage = MinIOStorage(
+                endpoint=endpoint,
+                access_key=access_key,
+                secret_key=secret_key,
+                secure=False,
+            )
+        except RuntimeError:
+            logger.warning("MinIO SDK not available; storage features disabled.")
+            return None
     return _storage

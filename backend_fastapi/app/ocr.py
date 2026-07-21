@@ -6,7 +6,6 @@ import tempfile
 from pathlib import Path
 from threading import RLock
 
-
 _OCR_LOCK = RLock()
 _OCR_ENGINE = None
 _OCR_LANG = None
@@ -126,7 +125,7 @@ def ocr_image_base64(image_b64: str, *, language: str = "english") -> str:
             engine3 = _get_ocr_engine(lang)
             ocr_fn = getattr(engine3, "ocr", None)
             if callable(ocr_fn):
-                rows = ocr_fn(str(tmp_path), cls=True)
+                rows = ocr_fn(str(tmp_path))
                 t3: list[str] = []
                 if isinstance(rows, list):
                     for page in rows:

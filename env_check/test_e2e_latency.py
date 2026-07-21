@@ -86,7 +86,10 @@ def run_test(xtts, asr, text, lang, prompt_wav):
 
 def main():
     # Configuration
-    prompt_wav = os.environ.get("XTTS_PROMPT_WAV", "e:\\projects\\AiforForiegnLanguageLearning\\testresources\\TTSpromptAudio.wav")
+    default_prompt_wav = str(
+        Path(__file__).resolve().parent.parent / "testresources" / "TTSpromptAudio.wav"
+    )
+    prompt_wav = os.environ.get("XTTS_PROMPT_WAV", default_prompt_wav)
     if not os.path.exists(prompt_wav):
         print(f"Error: Prompt wav not found at {prompt_wav}")
         return

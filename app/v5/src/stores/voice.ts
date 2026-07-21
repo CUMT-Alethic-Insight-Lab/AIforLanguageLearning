@@ -6,9 +6,10 @@
 
 import { defineStore } from 'pinia';
 import { ref } from 'vue';
-import { voiceSocket } from '../services/voice-socket';
 import { audioManager } from '../services/audio-manager';
+import { normalizeBackendWsHost } from '../services/backend-url';
 import { ConfigService } from '../services/config';
+import { voiceSocket } from '../services/voice-socket';
 
 export const useVoiceStore = defineStore('voice', () => {
   const getCurrentUserId = (): number | undefined => {
@@ -45,6 +46,9 @@ export const useVoiceStore = defineStore('voice', () => {
   /** 状态栏显示的类型 (决定颜色和图标) */
   const statusType = ref<'success' | 'processing' | 'listening' | 'speaking' | 'error'>('success');
 
+  /** 是否静音 (用户手动关闭麦克风) */
+  const isMuted = ref(false);
+
   /** 对话历史记录列表 */
   const currentDialogue = ref<Array<{ role: 'user' | 'assistant', content: string }>>([]);
 
@@ -54,10 +58,17 @@ export const useVoiceStore = defineStore('voice', () => {
   const currentRequestId = ref<string | null>(null);
   const autoCaptureEnabled = ref(false);
   const speechThreshold = ref(420);
+  const classroomSessionId = ref(localStorage.getItem('classroom_session_id') || '');
 
   // Ensure we only register one WS message handler.
   let wsUnsubscribe: (() => void) | null = null;
   let hasInitialized = false;
+
+  // Track which request_id's TTS is currently playing.
+  // Used to decide whether TASK_FINISHED should restart recording immediately,
+  // or wait for the TTS_RESULT.finally() callback to do it.
+  let pendingTtsId: string | null = null;
+  let ttsPlaybackChain: Promise<void> = Promise.resolve();
 
   // ============ 核心方法 ============
 
@@ -77,19 +88,12 @@ export const useVoiceStore = defineStore('voice', () => {
     if (isConnected.value) return;
     try {
       const cfg: any = await ConfigService.getConfig();
-      let backendUrl = String(cfg?.backend?.wsUrl || cfg?.backendUrl || 'localhost:8012');
-      // Guard: avoid accidentally connecting to the frontend dev server (e.g. localhost:8000).
-      try {
-        const host = String(window?.location?.host || '');
-        if (backendUrl === host || /:(8000)\b/.test(backendUrl)) {
-          backendUrl = 'localhost:8012';
-        }
-      } catch {}
+      const backendUrl = normalizeBackendWsHost(cfg?.backend?.wsUrl || cfg?.backendUrl);
       voiceSocket.connectWsV1({
         backendUrl,
         sessionId: sessionId.value,
         conversationId: conversationId.value,
-        userId: getCurrentUserId(),
+        classroomSessionId: classroomSessionId.value || null,
       });
     } catch (e) {
       console.warn('ws-v1 connect failed, falling back to legacy connect', e);
@@ -200,32 +204,115 @@ export const useVoiceStore = defineStore('voice', () => {
           isProcessing.value = true;
           return;
         }
-        case 'TTS_CHUNK':
-        case 'TTS_RESULT': {
-          const b64 = String(payload?.data_b64 || payload?.audio_base64 || '');
+        case 'TTS_CHUNK': {
+          // TTS_CHUNK carries raw WAV byte slices — only the first chunk has a
+          // WAV header, so individual chunks cannot be decoded by decodeAudioData.
+          // We do NOT play them; full audio arrives via TTS_RESULT.
+          // We DO stop the mic immediately to cut the echo-feedback loop.
           if (testIsRunning.value) {
-            testTtsState.value = `已收到${t === 'TTS_CHUNK' ? '音频分片' : '最终音频'}`
+            testTtsState.value = 'Received audio chunk';
+            testMetrics.value.tts_synthesis_ms =
+              typeof payload?.tts_synthesis_ms === 'number' ? payload.tts_synthesis_ms : testMetrics.value.tts_synthesis_ms;
+          }
+          audioManager.stopRecordingForBackend(); // mute mic to prevent echo loop
+          isSpeaking.value = true;
+          isProcessing.value = false;
+          setStatus('Synthesizing...', 'speaking');
+          return;
+        }
+        case 'TTS_RESULT': {
+          const b64 = String(payload?.audio_base64 || payload?.data_b64 || '');
+          const isFinalSegment = payload?.is_final_segment !== false;
+          if (testIsRunning.value) {
+            testTtsState.value = 'Received final audio';
             testMetrics.value.tts_synthesis_ms =
               typeof payload?.tts_synthesis_ms === 'number' ? payload.tts_synthesis_ms : testMetrics.value.tts_synthesis_ms;
             testMetrics.value.tts_total_ms =
               typeof payload?.tts_total_ms === 'number' ? payload.tts_total_ms : testMetrics.value.tts_total_ms;
           }
           if (b64) {
-            setStatus('正在回复...', 'speaking');
+            audioManager.stopRecordingForBackend(); // ensure mic is muted
+            setStatus('Speaking', 'speaking');
             isSpeaking.value = true;
             isProcessing.value = false;
-            // ws-v1 sends wav bytes
-            void audioManager.playWavChunk(b64);
+            const capturedRid = rid;
+            pendingTtsId = capturedRid;
+            ttsPlaybackChain = ttsPlaybackChain
+              .catch(() => undefined)
+              .then(async () => {
+                if (pendingTtsId !== capturedRid) return;
+                await audioManager.playWavChunk(b64);
+              })
+              .finally(() => {
+                if (!isFinalSegment || pendingTtsId !== capturedRid) return;
+                pendingTtsId = null;
+                isSpeaking.value = false;
+                // Restart recording for the next utterance after the final TTS segment finishes.
+                if (autoCaptureEnabled.value) {
+                  setStatus('Listening', 'listening');
+                  void startRecording();
+                } else {
+                  setStatus('Ready', 'success');
+                }
+              });
+            void ttsPlaybackChain;
+          } else if (isFinalSegment && pendingTtsId === rid) {
+            pendingTtsId = null;
+            isSpeaking.value = false;
+            if (autoCaptureEnabled.value) {
+              setStatus('Listening', 'listening');
+              void startRecording();
+            } else {
+              setStatus('Ready', 'success');
+            }
           }
+          return;
+        }
+        case 'TTS_STREAM_END': {
+          if (testIsRunning.value) {
+            testTtsState.value = 'Playback queued';
+            testMetrics.value.tts_synthesis_ms =
+              typeof payload?.tts_synthesis_ms === 'number' ? payload.tts_synthesis_ms : testMetrics.value.tts_synthesis_ms;
+            testMetrics.value.tts_total_ms =
+              typeof payload?.tts_total_ms === 'number' ? payload.tts_total_ms : testMetrics.value.tts_total_ms;
+          }
+
+          // Live TTS segments arrive before their total count is known. This
+          // explicit end marker lets us wait for the playback promise chain
+          // instead of reopening the microphone after an arbitrary segment.
+          const capturedRid = rid;
+          pendingTtsId = capturedRid;
+          isSpeaking.value = true;
+          ttsPlaybackChain = ttsPlaybackChain
+            .catch(() => undefined)
+            .then(() => {
+              if (pendingTtsId !== capturedRid) return;
+              pendingTtsId = null;
+              isSpeaking.value = false;
+              if (autoCaptureEnabled.value) {
+                setStatus('Listening', 'listening');
+                void startRecording();
+              } else {
+                setStatus('Ready', 'success');
+              }
+            });
+          void ttsPlaybackChain;
           return;
         }
         case 'TASK_ABORTED': {
           if (rid && rid === currentRequestId.value) {
             audioManager.stopPlayback();
+            pendingTtsId = null;
             isSpeaking.value = false;
             isProcessing.value = false;
             currentRequestId.value = null;
-            setStatus('已打断', 'success');
+            // After barge-in / abort, restart listening if in auto-capture mode.
+            if (autoCaptureEnabled.value) {
+              setStatus('Listening', 'listening');
+              void startRecording();
+            } else {
+              setStatus('Ready', 'success');
+            }
           }
           return;
         }
@@ -233,7 +320,6 @@ export const useVoiceStore = defineStore('voice', () => {
           if (rid && rid === currentRequestId.value) {
             isProcessing.value = false;
             currentRequestId.value = null;
-            isSpeaking.value = false;
             if (testIsRunning.value && payload?.pipeline_metrics) {
               const metrics = payload.pipeline_metrics as Record<string, unknown>;
               testMetrics.value.asr_latency_ms =
@@ -251,12 +337,16 @@ export const useVoiceStore = defineStore('voice', () => {
               testMetrics.value.total_roundtrip_ms =
                 typeof metrics.total_roundtrip_ms === 'number' ? metrics.total_roundtrip_ms : testMetrics.value.total_roundtrip_ms;
             }
-            if ((payload?.ok ?? true) === false) {
-              setStatus('任务已结束（取消/失败）', 'error');
-            } else if (payload?.asr_only) {
-              setStatus('完成', 'success');
-            } else {
-              setStatus('完成', 'success');
+            // If TTS is still playing (pendingTtsId === rid), the TTS_RESULT.finally()
+            // callback will handle isSpeaking reset and recording restart.
+            // If no TTS was played (empty reply / TTS failure), handle it here.
+            if (!isSpeaking.value && payload?.pipeline_metrics?.tts_streaming !== true) {
+              if (autoCaptureEnabled.value) {
+                setStatus('Listening', 'listening');
+                void startRecording();
+              } else {
+                setStatus('Ready', 'success');
+              }
             }
           }
           return;
@@ -335,36 +425,35 @@ export const useVoiceStore = defineStore('voice', () => {
     language: string;
     scenario?: string;
   }) => {
-    // Ensure WS handler is registered before any server events arrive.
-    init();
-    if (!isConnected.value) {
-      await ensureConnectedWsV1();
-    }
-
-    // 重置状态
+    // Each new session gets a fresh conversationId to prevent history contamination.
+    conversationId.value = `conv_${Date.now().toString(16)}`;
+    pendingTtsId = null;
     currentDialogue.value = [];
+
+    // Force-reconnect WS with the new conversationId so the backend reads
+    // the correct conversation context from the DB.
+    const cfgData: any = await ConfigService.getConfig();
+    const backendUrl = normalizeBackendWsHost(cfgData?.backend?.wsUrl || cfgData?.backendUrl);
+    voiceSocket.reconnectWsV1({
+      backendUrl,
+      sessionId: sessionId.value,
+      conversationId: conversationId.value,
+      classroomSessionId: classroomSessionId.value || null,
+    });
+    // Re-register message handler because reconnect cleared the old WS.
+    if (wsUnsubscribe) wsUnsubscribe();
+    wsUnsubscribe = voiceSocket.onMessage(handleMessage);
+    hasInitialized = true;
+
+    await waitForConnected(8000);
+
     currentLanguage.value = config.language;
     currentScenario.value = config.scenario || currentScenario.value;
     autoCaptureEnabled.value = true;
-    
-    // 添加开场白消息
-    addMessage('assistant', config.openingText);
-    
-    // 播放开场白音频
-    if (config.openingAudio) {
-      isSpeaking.value = true;
-      setStatus('正在回复...', 'speaking');
-      // openingAudio uses base64(wav bytes)
-      void audioManager.playWavChunk(config.openingAudio).finally(() => {
-        // 这是“开场白”本地播放，不会收到 TASK_FINISHED；需要自行复位。
-        if (!isRecording.value && !isProcessing.value) {
-          isSpeaking.value = false;
-          setStatus('就绪', 'success');
-        }
-      });
-    }
 
-    // ws-v1: 写入对话上下文（system prompt），供后端在 LLM 生成时使用。
+    addMessage('assistant', config.openingText);
+
+    // ws-v1: push conversation context (system prompt) so backend uses it for LLM calls.
     if (voiceSocket.isWsV1()) {
       const ctxRid = `ctx_${Date.now().toString(16)}`;
       voiceSocket.sendWsV1Event(
@@ -378,7 +467,6 @@ export const useVoiceStore = defineStore('voice', () => {
         ctxRid
       );
     } else {
-      // legacy-stream 才发送 init_session
       voiceSocket.send({
         type: 'init_session',
         config: {
@@ -389,8 +477,23 @@ export const useVoiceStore = defineStore('voice', () => {
       });
     }
 
-    // 会话启动后直接进入“自动聆听”模式。
-    await startRecording();
+    // Play opening audio with mic OFF (no echo risk).
+    // Mic starts only after playback finishes (in the finally() callback).
+    if (config.openingAudio) {
+      isSpeaking.value = true;
+      setStatus('Speaking...', 'speaking');
+      void audioManager.playWavChunk(config.openingAudio).finally(() => {
+        isSpeaking.value = false;
+        if (autoCaptureEnabled.value) {
+          setStatus('Listening', 'listening');
+          void startRecording();
+        } else {
+          setStatus('Ready', 'success');
+        }
+      });
+    } else {
+      await startRecording();
+    }
   };
 
   /**
@@ -497,6 +600,23 @@ export const useVoiceStore = defineStore('voice', () => {
       stopRecording();
     } else {
       void startRecording();
+    }
+  };
+
+  /**
+   * 切换静音状态
+   */
+  const toggleMute = () => {
+    isMuted.value = !isMuted.value;
+  };
+
+  const setClassroomSessionId = (id: string | number | null | undefined) => {
+    const next = String(id || '').trim();
+    classroomSessionId.value = next;
+    if (next) {
+      localStorage.setItem('classroom_session_id', next);
+    } else {
+      localStorage.removeItem('classroom_session_id');
     }
   };
 
@@ -622,9 +742,11 @@ export const useVoiceStore = defineStore('voice', () => {
     autoCaptureEnabled,
     statusText,
     statusType,
+    isMuted,
     currentLanguage,
     currentScenario,
     currentDialogue,
+    classroomSessionId,
     localAsrText,
     localVadSpeaking,
     localBargeInCount,
@@ -637,6 +759,8 @@ export const useVoiceStore = defineStore('voice', () => {
     // Actions
     init,
     toggleRecording,
+    toggleMute,
+    setClassroomSessionId,
     startCustomSession,
     stopSession,
     startLocalAsrTest,

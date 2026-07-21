@@ -8,7 +8,8 @@ param(
 $pgData = "$env:USERPROFILE\scoop\apps\postgresql\current\data"
 $pgLog = "$env:USERPROFILE\scoop\apps\postgresql\current\logfile"
 $pgCtl = "$env:USERPROFILE\scoop\apps\postgresql\current\bin\pg_ctl.exe"
-$minioData = "e:\projects\AiforForiegnLanguageLearning\infra_bin\minio_data"
+$repoRoot = (Resolve-Path (Join-Path (Split-Path -Parent $PSCommandPath) "..")).Path
+$minioData = Join-Path $repoRoot "infra_bin\minio_data"
 
 function Test-Port($port) {
     try {

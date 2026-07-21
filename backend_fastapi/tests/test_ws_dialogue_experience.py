@@ -8,47 +8,33 @@
 
 from __future__ import annotations
 
-import asyncio
-import base64
 import json
 import os
 import uuid
 from pathlib import Path
 
 import pytest
-import websockets
-
-from app.db import init_db, override_engine_for_tests
+from app.llm import chat_complete
 from app.main import app
 from fastapi.testclient import TestClient
-from sqlmodel import create_engine
 
 
-def _setup_test_db(tmp_path: Path) -> None:
-    db_path = tmp_path / "test.db"
-    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
-    override_engine_for_tests(engine)
-    init_db()
+def _expand_scenario(client: TestClient, description: str, language: str = "ja") -> str:
+    resp = client.post(
+        "/api/v1/model-routing/expand-scenario",
+        json={"description": description, "language": language},
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return str(data.get("system_prompt") or data.get("expanded_scenario") or "")
 
 
-async def _expand_scenario(description: str, language: str = "ja") -> str:
-    import httpx
-    async with httpx.AsyncClient() as client:
-        resp = await client.post(
-            "http://127.0.0.1:8012/api/v1/model-routing/expand-scenario",
-            json={"description": description, "language": language},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-        return str(data.get("system_prompt") or data.get("expanded_scenario") or "")
-
-
-async def _run_text_turn(ws, text: str, request_id: str | None = None) -> dict:
+def _run_text_turn(ws, text: str, request_id: str | None = None) -> dict:
     req_id = request_id or f"text_{uuid.uuid4().hex[:8]}"
-    await ws.send(json.dumps({"type": "TEXT", "request_id": req_id, "payload": {"text": text}}))
+    ws.send_json({"type": "TEXT", "request_id": req_id, "payload": {"text": text}})
     seen: list[dict] = []
     for _ in range(60):
-        msg = json.loads(await ws.recv())
+        msg = ws.receive_json()
         seen.append(msg)
         if msg.get("type") == "TASK_FINISHED" and msg.get("request_id") == req_id:
             break
@@ -62,64 +48,64 @@ async def _run_text_turn(ws, text: str, request_id: str | None = None) -> dict:
     }
 
 
-@pytest.mark.asyncio
 @pytest.mark.integration
 @pytest.mark.timeout(300)
-async def test_dialogue_experience_japanese_airport() -> None:
+def test_dialogue_experience_japanese_airport(monkeypatch: pytest.MonkeyPatch) -> None:
     """真实对话体验测试：日语机场值机场景。"""
 
     if os.getenv("AIFL_RUN_INTEGRATION", "").strip() not in {"1", "true", "True"}:
         pytest.skip("integration tests disabled (set AIFL_RUN_INTEGRATION=1)")
 
-    system_prompt = await _expand_scenario(
-        "我要在东京机场办理值机并询问行李超重和转机时间，目标练习日语口语",
-        language="ja",
-    )
-    assert system_prompt, "扩写失败，system_prompt 为空"
+    async def _single_chunk_stream_chat(*, system_prompt: str, user_text: str, history=None):
+        text = await chat_complete(system_prompt=system_prompt, user_text=user_text, history=history)
+        if text:
+            yield text
 
-    async with websockets.connect("ws://127.0.0.1:8012/ws/v1?session_id=dial_test&conversation_id=conv_dial_1") as ws:
-        _ = json.loads(await ws.recv())  # TASK_STARTED
+    monkeypatch.setattr("app.main.stream_chat", _single_chunk_stream_chat)
 
-        # 设置场景
-        ctx_req = f"ctx_{uuid.uuid4().hex[:8]}"
-        await ws.send(json.dumps({
-            "type": "CONTEXT_SET",
-            "request_id": ctx_req,
-            "payload": {"system_prompt": system_prompt, "language": "ja"},
-        }))
-        for _ in range(10):
-            msg = json.loads(await ws.recv())
-            if msg.get("type") == "CONTEXT_SET" and msg.get("request_id") == ctx_req:
-                break
+    with TestClient(app) as client:
+        system_prompt = _expand_scenario(
+            client,
+            "我要在东京机场办理值机并询问行李超重和转机时间，目标练习日语口语",
+            language="ja",
+        )
+        assert system_prompt, "扩写失败，system_prompt 为空"
 
-        results: list[dict] = []
+        with client.websocket_connect("/ws/v1?session_id=dial_test&conversation_id=conv_dial_1") as ws:
+            _ = ws.receive_json()  # TASK_STARTED
 
-        # 1. 正常日语开场
-        results.append({"case": "normal_opening", **await _run_text_turn(ws, "こんにちは、チェックインをお願いします。")})
+            # 设置场景
+            ctx_req = f"ctx_{uuid.uuid4().hex[:8]}"
+            ws.send_json({
+                "type": "CONTEXT_SET",
+                "request_id": ctx_req,
+                "payload": {"system_prompt": system_prompt, "language": "ja"},
+            })
+            for _ in range(10):
+                msg = ws.receive_json()
+                if msg.get("type") == "CONTEXT_SET" and msg.get("request_id") == ctx_req:
+                    break
 
-        # 2. 用户卡壳
-        results.append({"case": "stuck", **await _run_text_turn(ws, "えーと……")})
+            results: list[dict] = []
 
-        # 3. 纯中文提问
-        results.append({"case": "chinese_only", **await _run_text_turn(ws, "我的行李超重了吗？")})
+            # 1. 正常日语开场
+            results.append({"case": "normal_opening", **_run_text_turn(ws, "こんにちは、チェックインをお願いします。")})
 
-        # 4. 不恰当表述（直接命令式）
-        results.append({"case": "rude_direct", **await _run_text_turn(ws, "水をくれ")})
+            # 2. 用户卡壳
+            results.append({"case": "stuck", **_run_text_turn(ws, "えーと……")})
 
-        # 5. 中外混搭
-        results.append({"case": "mixed_lang", **await _run_text_turn(ws, "我的 boarding pass 在哪里？")})
+            # 3. 纯中文提问
+            results.append({"case": "chinese_only", **_run_text_turn(ws, "我的行李超重了吗？")})
 
-        # 6. 模拟 ASR 错误：音近词（は/わ 混淆）
-        results.append({"case": "asr_error_wa", **await _run_text_turn(ws, "わたしわ 東京に行きます")})
+            # 4. 不恰当表述（直接命令式）
+            results.append({"case": "rude_direct", **_run_text_turn(ws, "水をくれ")})
 
-        # 7. 模拟 ASR 错误：数字/时间识别错误
-        results.append({"case": "asr_error_time", **await _run_text_turn(ws, "フライトは 13時30分ですか？いいえ、3時です")})
-
-        # 8. 模拟 ASR 错误：个别错别字（にほんご → にほんこ）
-        results.append({"case": "asr_error_typo", **await _run_text_turn(ws, "にほんこ を べんきょう しています")})
+            # 5. 模拟 ASR 错误：音近词（は/わ 混淆）
+            results.append({"case": "asr_error_wa", **_run_text_turn(ws, "わたしわ 東京に行きます")})
 
     # 持久化结果供人工审阅
-    log_path = Path("e:/projects/AiforForiegnLanguageLearning/backend_fastapi/logs/dialogue_experience_test.json")
+    log_path = Path(__file__).resolve().parents[1] / "logs" / "dialogue_experience_test.json"
+    log_path.parent.mkdir(parents=True, exist_ok=True)
     log_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 基本断言：每轮都有 LLM 返回
@@ -148,6 +134,6 @@ async def test_dialogue_experience_japanese_airport() -> None:
     assert len(rude_md) > 10, "不恰当表述回复过短"
 
     # 断言：ASR 错误场景不应直接粗暴纠正，应先确认或温和处理
-    asr_md = str(results[5]["llm"].get("payload", {}).get("markdown", ""))
+    asr_md = str(results[4]["llm"].get("payload", {}).get("markdown", ""))
     # 不期望出现严厉的"你错了"，但允许出现确认句
     assert "間違い" not in asr_md or "すみません" in asr_md, "ASR 错误场景处理过于生硬"

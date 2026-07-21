@@ -29,6 +29,10 @@ def test_ws_voice_audio_binary_chunk_min_flow(tmp_path: Path, monkeypatch) -> No
         "app.main.synthesize_tts_wav",
         lambda text: b"FAKE_WAV_DATA",
     )
+    monkeypatch.setattr(
+        "app.main.try_create_seamless_transcriber",
+        lambda **_: (lambda _audio, _cfg: "hello from asr"),
+    )
     monkeypatch.setattr("app.main.settings.enable_asr", True)
     monkeypatch.setattr("app.main.settings.asr_backend", "seamless")
 

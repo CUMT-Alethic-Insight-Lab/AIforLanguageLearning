@@ -6,7 +6,6 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query
 
-from ..domain.prompt_management.models import PromptRegistry
 from ..domain.prompt_management.service import PromptManager
 
 router = APIRouter(prefix="/api/v1/prompts", tags=["Prompt Management"])

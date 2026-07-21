@@ -7,6 +7,13 @@
 - 字段必须包含：score, scores, feedback, evaluation, errors, suggestions, questions, rewritten。
 - score 为 0-100 整数（等同于 scores.total）。
 - scores 为对象，必须包含：vocabulary, grammar, fluency, logic, content, structure, total（均为 0-100 整数）。
+- 六个维度必须独立评分，不要用同一个分数重复填充：
+  - content：内容完整度、任务回应、观点充分性，权重 25%。
+  - structure：段落组织、开头结尾、篇章结构，权重 15%。
+  - vocabulary：词汇准确性、多样性、搭配自然度，权重 15%。
+  - grammar：语法准确性、时态、句法、标点，权重 15%。
+  - fluency：表达流畅度、句间衔接、可读性，权重 15%。
+  - logic：论证逻辑、因果关系、观点推进，权重 15%。
 - evaluation 为一句到三句的综合评价。
 - suggestions 为字符串数组（可执行的改进建议），**必须使用中文**。
 - questions 为字符串数组（给学生的追问/引导思考，可为空数组），**必须使用中文**。

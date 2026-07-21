@@ -109,7 +109,30 @@ backend_fastapi/data/*.sqlite*
 env_check/obsolete/
 env_check/tmp/
 app/v5/resources/whisper/*.zip
+
+# Test media assets (large binary files, not for version control)
+testresources/*.wav
+testresources/*.png
 app/v5/resources/whisper/*.bin
 app/v5/resources/whisper/Release/
 app/v5/resources/whisper/*.exe
 app/v5/resources/whisper/*.dll
+
+# Local AI-agent workspaces and vendored helper skills
+/.agents/
+/.claude/
+/.continue/
+/.deepseek/
+/.trae/
+/skills/
+
+# Local model assets and one-off debugging artifacts
+/backend_fastapi/data/models/
+/backend_fastapi/backend_*.txt
+/backend_fastapi/debug_*.py
+/backend_fastapi/fix_toml.py
+/backend_fastapi/verify_assay.py
+/scripts/apply_voice_fix.py
+/scripts/patch_body.ts
+/scripts/patch_voice_store.py
+/test_result.txt

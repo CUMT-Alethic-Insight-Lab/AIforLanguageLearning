@@ -5,31 +5,20 @@
  */
 
 import axios from 'axios';
+import { getDefaultBackendUrl, normalizeBackendUrl } from './backend-url';
 
 // 后端服务的基础地址（HTTP API）
 // 说明：避免从 ConfigService 读取以免循环依赖；改为每次请求从 localStorage 的 app_config 动态读取。
-const DEFAULT_BACKEND_URL = 'http://localhost:8012';
+const DEFAULT_BACKEND_URL = getDefaultBackendUrl();
 
 function getConfiguredBackendUrl(): string {
   try {
     const raw = localStorage.getItem('app_config');
     if (!raw) return DEFAULT_BACKEND_URL;
     const cfg = JSON.parse(raw);
-    let url = String(cfg?.backend?.url || '').trim();
-    if (!url) return DEFAULT_BACKEND_URL;
-    if (!/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
-      url = `http://${url}`;
-    }
-    url = url.replace(/\/$/, '');
+    const migrated = normalizeBackendUrl(cfg?.backend?.url);
 
-    const migrated = url
-      .replace('http://localhost:8011', 'http://localhost:8012')
-      .replace('http://127.0.0.1:8011', 'http://127.0.0.1:8012')
-      // Common misconfig: pointing backend URL to the Vite dev server port.
-      .replace('http://localhost:8000', 'http://localhost:8012')
-      .replace('http://127.0.0.1:8000', 'http://127.0.0.1:8012');
-
-    if (migrated !== url) {
+    if (migrated !== cfg?.backend?.url) {
       try {
         const nextCfg = { ...(cfg || {}), backend: { ...(cfg?.backend || {}), url: migrated } };
         localStorage.setItem('app_config', JSON.stringify(nextCfg));

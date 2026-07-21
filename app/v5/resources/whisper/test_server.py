@@ -1,8 +1,9 @@
 import urllib.request
 import time
+from pathlib import Path
 
 url = 'http://127.0.0.1:9090/inference'
-wav = r'e:\projects\AiforForiegnLanguageLearning\app\v5\resources\whisper\test_hello.wav'
+wav = Path(__file__).resolve().parent / 'test_hello.wav'
 
 with open(wav, 'rb') as f:
     audio = f.read()

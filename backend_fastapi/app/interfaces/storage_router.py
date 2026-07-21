@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, HTTPException, UploadFile
 from pydantic import BaseModel
 
 from app.infrastructure.storage.minio_storage import get_minio_storage
 
 router = APIRouter(prefix="/api/v1/upload", tags=["storage"])
+
+
+def _get_storage_or_503():
+    """Return the MinIO storage instance or raise HTTP 503 if unavailable."""
+    storage = get_minio_storage()
+    if storage is None:
+        raise HTTPException(
+            status_code=503, detail="MinIO storage is not available"
+        )
+    return storage
 
 
 class PresignedUrlRequest(BaseModel):
@@ -46,7 +56,7 @@ class UploadResponse(BaseModel):
 
 @router.post("", response_model=UploadResponse)
 async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
-    storage = get_minio_storage()
+    storage = _get_storage_or_503()
     bucket = "aifl-uploads"
     key = file.filename or "unnamed"
     data = await file.read()
@@ -64,14 +74,14 @@ async def upload_file(file: UploadFile = File(...)) -> UploadResponse:
 
 @router.post("/multipart/init", response_model=MultipartInitResponse)
 async def init_multipart(req: MultipartInitRequest) -> MultipartInitResponse:
-    storage = get_minio_storage()
+    storage = _get_storage_or_503()
     upload_id = await storage.initiate_multipart_upload(req.bucket, req.key, req.content_type)
     return MultipartInitResponse(upload_id=upload_id)
 
 
 @router.post("/multipart/complete", response_model=UploadResponse)
 async def complete_multipart(req: MultipartCompleteRequest) -> UploadResponse:
-    storage = get_minio_storage()
+    storage = _get_storage_or_503()
     result = await storage.complete_multipart_upload(req.bucket, req.key, req.upload_id, req.parts)
     return UploadResponse(
         bucket=result.bucket,
@@ -82,6 +92,6 @@ async def complete_multipart(req: MultipartCompleteRequest) -> UploadResponse:
 
 @router.post("/presigned-url", response_model=PresignedUrlResponse)
 async def get_presigned_url(req: PresignedUrlRequest) -> PresignedUrlResponse:
-    storage = get_minio_storage()
+    storage = _get_storage_or_503()
     url = await storage.generate_presigned_url(req.bucket, req.key, req.expires)
     return PresignedUrlResponse(url=url)

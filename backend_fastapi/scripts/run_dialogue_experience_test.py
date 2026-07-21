@@ -90,7 +90,7 @@ async def main() -> None:
         results.append({"case": "asr_error_typo", **await _run_text_turn(ws, "にほんこ で はなせます か")})
 
     # 持久化结果
-    log_dir = Path("e:/projects/AiforForiegnLanguageLearning/backend_fastapi/logs")
+    log_dir = Path(__file__).resolve().parents[1] / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     log_path = log_dir / "dialogue_experience_test.json"
     log_path.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")

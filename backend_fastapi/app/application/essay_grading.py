@@ -142,8 +142,10 @@ async def run_grading_pipeline(*, ocr_text: str, language: str = "en") -> dict[s
     result_json = build_essay_result(
         content_score=dim["content"],
         structure_score=dim["structure"],
-        language_score=dim["language"],
+        vocabulary_score=dim["vocabulary"],
         grammar_score=dim["grammar"],
+        fluency_score=dim["fluency"],
+        logic_score=dim["logic"],
         feedback=feedback,
         suggestions=suggestions,
         corrected_text=corrected_text,
@@ -152,13 +154,13 @@ async def run_grading_pipeline(*, ocr_text: str, language: str = "en") -> dict[s
 
     # 将 LLM 返回的 errors 映射为带字符偏移量的标准化格式
     llm_errors = llm_result.get("errors", [])
-    result_json["errors_normalized"] = _normalize_errors(ocr_text, llm_errors)
+    result_json["errors_normalized"] = _normalize_errors(essay_text, llm_errors)
 
     # 轻量结构化解析（连接词、论证标记、段落分析）
-    result_json["structure_analysis"] = analyze_essay_structure(ocr_text)
+    result_json["structure_analysis"] = analyze_essay_structure(essay_text)
 
     # LanguageTool 拼写/基础语法预检（可选，失败时静默降级）
-    result_json["spelling_check"] = check_essay(ocr_text)
+    result_json["spelling_check"] = check_essay(essay_text)
 
     return result_json
 

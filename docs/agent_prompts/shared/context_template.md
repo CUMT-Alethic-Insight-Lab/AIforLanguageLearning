@@ -16,7 +16,7 @@
 ## 代码库结构
 
 ```
-e:/projects/AiforForiegnLanguageLearning/
+./
 ├── backend/                    # 旧后端 (Node.js/TypeScript) - 待废弃
 │   ├── src/
 │   │   ├── api/                # Express Routes

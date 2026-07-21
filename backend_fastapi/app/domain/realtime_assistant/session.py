@@ -13,28 +13,58 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from ...llm import chat_complete, chat_complete_multimodal
+from ...llm import chat_complete_cloud_first, chat_complete_multimodal, chat_complete_race
 from ...ocr import ocr_image_base64
 from ...settings import settings
 from ...tts import synthesize_tts_wav
-from .screen_detector import ScreenChangeDetector, ScreenChangeResult
-from .suggestion_engine import ProactiveSuggestionEngine, Suggestion, SuggestionType
-from .trigger_engine import SmartTriggerEngine, TriggerDecision, TriggerPriority
+from .screen_detector import ScreenChangeDetector
+from .suggestion_engine import ProactiveSuggestionEngine, SuggestionType
+from .trigger_engine import SmartTriggerEngine, TriggerPriority
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SessionContext:
-    """会话级上下文（助教与教师的最近 N 轮交互）。"""
+    """会话级上下文（助教与教师的最近 N 轮交互）。
+
+    支持打断续接：已播报内容作为 assistant 记录，未播报内容标记为
+    [interrupted:未播报]，让 LLM 充分了解打断位置。
+    """
 
     turns: list[dict[str, Any]] = field(default_factory=list)
     max_turns: int = 6
+    _interrupted_buffer: str = ""  # 未播报内容缓冲区
 
     def append(self, role: str, content: str) -> None:
         self.turns.append({"role": role, "content": content})
         if len(self.turns) > self.max_turns * 2:
             self.turns = self.turns[-self.max_turns * 2 :]
+
+    def mark_interrupted(self, spoken: str, remaining: str) -> None:
+        """标记打断状态：已播报内容加入历史，未播报内容存入缓冲区。"""
+        if spoken:
+            self.turns.append({
+                "role": "assistant",
+                "content": spoken,
+                "metadata": {"interrupted": True, "part": "spoken"}
+            })
+        if remaining:
+            self._interrupted_buffer = remaining
+
+    def get_interruption_context(self) -> str:
+        """获取打断上下文提示（注入 System Prompt）。"""
+        if not self._interrupted_buffer:
+            return ""
+        return (
+            f"【打断上下文】上一次回复在播报中被教师打断。"
+            f"未播报内容：{self._interrupted_buffer[:200]}..."
+            f"请基于未播报内容的意图继续表达，不要重复已播报部分。"
+        )
+
+    def clear_interruption(self) -> None:
+        """清除打断缓冲区（新一轮成功播报后）。"""
+        self._interrupted_buffer = ""
 
     def to_history(self) -> list[dict[str, Any]]:
         return list(self.turns)
@@ -142,6 +172,11 @@ class RealtimeAssistantSession:
         self._last_trigger_time: float = 0.0
         self._active: bool = True
 
+        # Barge-in 打断续接状态
+        self._current_tts_content: str = ""       # 当前正在播报的内容
+        self._current_tts_total_bytes: int = 0    # TTS 总字节数
+        self._current_tts_sent_bytes: int = 0     # 已发送字节数
+
     # ── 公共事件接口 ──
 
     async def on_screen_frame(self, image_base64: str) -> dict[str, Any] | None:
@@ -192,7 +227,9 @@ class RealtimeAssistantSession:
                 )
             return await self._handle_voice_request(text)
 
-    async def on_explicit_request(self, text: str, image_base64: str | None = None) -> dict[str, Any] | None:
+    async def on_explicit_request(
+        self, text: str, image_base64: str | None = None
+    ) -> dict[str, Any] | None:
         """处理教师的显式请求（如点击"请教助教"按钮）。"""
         if not self._active:
             return None
@@ -203,7 +240,9 @@ class RealtimeAssistantSession:
                 priority="high",
             )
 
-    async def on_mouse_lasso(self, region: dict[str, Any], image_base64: str | None = None) -> dict[str, Any] | None:
+    async def on_mouse_lasso(
+        self, region: dict[str, Any], image_base64: str | None = None
+    ) -> dict[str, Any] | None:
         """处理鼠标框选事件。"""
         if not self._active:
             return None
@@ -227,10 +266,46 @@ class RealtimeAssistantSession:
                 )
         return None
 
+    # ── Barge-in 打断续接 ──
+
+    def on_barge_in(self, spoken_bytes: int, total_bytes: int) -> None:
+        """处理教师打断事件。
+
+        将已播报内容作为 assistant 记录到上下文，未播报内容标记为
+        "打断而未表达"，让 LLM 充分了解打断位置。
+        """
+        content = self._current_tts_content
+        if not content or total_bytes <= 0:
+            return
+
+        ratio = max(0.0, min(1.0, spoken_bytes / float(total_bytes)))
+        cut = int(len(content) * ratio)
+        spoken_text = content[:cut].strip()
+        remaining_text = content[cut:].strip()
+
+        # 已播报内容加入历史，未播报内容存入缓冲区
+        self.context.mark_interrupted(spoken_text, remaining_text)
+        logger.info(
+            "RTA barge-in for user=%s: spoken=%d chars, remaining=%d chars",
+            self.user_id,
+            len(spoken_text),
+            len(remaining_text),
+        )
+
+        # 清空当前 TTS 状态
+        self._current_tts_content = ""
+        self._current_tts_total_bytes = 0
+        self._current_tts_sent_bytes = 0
+
+    def on_tts_progress(self, sent_bytes: int, total_bytes: int) -> None:
+        """更新 TTS 播报进度（前端通过 WebSocket 上报）。"""
+        self._current_tts_sent_bytes = sent_bytes
+        self._current_tts_total_bytes = total_bytes
+
     def close(self) -> None:
         """关闭会话，释放资源。"""
         self._active = False
-        self.turns = []
+        self.context.turns = []
         logger.info("RTA session closed for user=%s", self.user_id)
 
     # ── 内部处理链路 ──
@@ -336,10 +411,20 @@ class RealtimeAssistantSession:
                 max_tokens=400,
             )
 
-        if not llm_raw or "网络不太稳定" in llm_raw or "LLM 输出为空" in llm_raw:
-            # 降级到纯文本模式，采用云端优先 1s 超时 fallback 到本地
-            from ...llm import chat_complete_cloud_first
+        def _is_degraded_reply(text: str) -> bool:
+            return (not text) or ("网络不太稳定" in text) or ("LLM 输出为空" in text)
 
+        if _is_degraded_reply(llm_raw):
+            # 先复用场景对话链路中的云+本地竞速能力。
+            llm_raw = await chat_complete_race(
+                system_prompt=self.SYSTEM_PROMPT,
+                user_text=user_prompt,
+                history=self.context.to_history(),
+                temperature=0.7,
+            )
+
+        if _is_degraded_reply(llm_raw):
+            # 竞速仍失败时，保留原有云优先超时回退策略作为最后兜底。
             llm_raw = await chat_complete_cloud_first(
                 system_prompt=self.SYSTEM_PROMPT,
                 user_text=user_prompt,
@@ -352,7 +437,7 @@ class RealtimeAssistantSession:
         decision = self._extract_rta_decision(llm_raw)
 
         # 4. LLM 不可用时的兜底
-        if not llm_raw or "网络不太稳定" in llm_raw or "LLM 输出为空" in llm_raw:
+        if _is_degraded_reply(llm_raw):
             if is_wake_request:
                 # 唤醒请求必须响应，使用兜底文本并可 TTS
                 decision = {
@@ -380,16 +465,24 @@ class RealtimeAssistantSession:
         urgency = decision.get("urgency", priority)
 
         # 6. 更新上下文（只记录实际介入的内容）
+        # 如果有打断缓冲区，说明上一轮被打断，本轮 LLM 已基于未播报内容生成新回复
+        # 清除打断状态，避免重复注入
+        self.context.clear_interruption()
         self.context.append("user", trigger_text)
         self.context.append("assistant", content)
 
         # 7. TTS 合成（仅当 LLM 明确要求时才执行）
         audio_base64 = ""
+        audio_bytes = b""
         if self.config.tts_enabled and use_tts and content:
             try:
                 audio_bytes = await asyncio.to_thread(synthesize_tts_wav, content)
                 if audio_bytes:
                     audio_base64 = base64.b64encode(audio_bytes).decode("utf-8")
+                    # 记录当前 TTS 内容用于打断续接
+                    self._current_tts_content = content
+                    self._current_tts_total_bytes = len(audio_bytes)
+                    self._current_tts_sent_bytes = 0
             except Exception as exc:
                 logger.warning("TTS failed for user=%s: %s", self.user_id, exc)
 
@@ -405,6 +498,7 @@ class RealtimeAssistantSession:
         if audio_base64:
             payload["audio_base64"] = audio_base64
             payload["audio_format"] = "wav"
+            payload["tts_total_bytes"] = len(audio_bytes)
 
         logger.info(
             "RTA suggestion generated for user=%s priority=%s intervene=%s use_tts=%s has_audio=%s",
@@ -420,6 +514,12 @@ class RealtimeAssistantSession:
 
     def _build_user_prompt(self, trigger_text: str, region: dict[str, Any] | None) -> str:
         parts: list[str] = []
+
+        # 注入打断续接上下文（如果有未播报内容）
+        interruption_ctx = self.context.get_interruption_context()
+        if interruption_ctx:
+            parts.append(interruption_ctx)
+
         if trigger_text.startswith("[WAKE] "):
             actual = trigger_text.removeprefix("[WAKE] ")
             parts.append(f"[显式唤醒] 教师说：{actual}")
@@ -515,7 +615,11 @@ class RealtimeAssistantSession:
 
         s = (text or "").strip()
         if not s:
-            return {"should_intervene": False, "content": "", "use_tts": False, "urgency": "low", "intervention_type": "none"}
+            return {
+                "should_intervene": False, "content": "",
+                "use_tts": False, "urgency": "low",
+                "intervention_type": "none",
+            }
 
         # 1. 从 markdown code block 中提取
         m = re.search(r"```(?:json)?\s*(.*?)```", s, re.DOTALL)
@@ -554,7 +658,11 @@ class RealtimeAssistantSession:
                 "urgency": "medium",
             }
 
-        return {"should_intervene": False, "content": "", "use_tts": False, "urgency": "low", "intervention_type": "none"}
+        return {
+            "should_intervene": False, "content": "",
+            "use_tts": False, "urgency": "low",
+            "intervention_type": "none",
+        }
 
     @staticmethod
     def _normalize_decision(obj: dict[str, Any]) -> dict[str, Any]:

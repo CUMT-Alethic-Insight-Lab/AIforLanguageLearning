@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session, create_engine, select
 
 from app.db import init_db, override_engine_for_tests
+from app.domain.models import User, VocabularyItem
 from app.main import app
 from app.models import PublicVocabEntry, UserVocabQuery
 
@@ -116,3 +118,51 @@ def test_vocab_lookup_persists_user_linked_metadata(tmp_path: Path, monkeypatch)
         assert query.user_id is not None
         assert query.meta_data["cefr_level"]
         assert query.meta_data["source"] == "manual"
+
+
+def test_vocab_lookup_merges_due_review_words_into_recommendations(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "test.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    override_engine_for_tests(engine)
+    init_db()
+
+    async def _no_kg_service():
+        raise RuntimeError("kg disabled in unit test")
+
+    monkeypatch.setattr("app.routers.vocab.get_kg_service", _no_kg_service)
+
+    with Session(engine) as session:
+        session.add(PublicVocabEntry(term="agenda", definition="释义：议程\n例句：Review the agenda.", lang="en"))
+        session.commit()
+
+    client = TestClient(app)
+    token = _register_and_login(client, "student_due_vocab")
+
+    with Session(engine) as session:
+        user = session.exec(select(User).where(User.username == "student_due_vocab")).one()
+        session.add(
+            VocabularyItem(
+                user_id=user.id,
+                word="schedule",
+                definition="计划表",
+                mastery_level=0,
+                next_review_at=datetime.utcnow() - timedelta(days=1),
+                created_at=datetime.utcnow() - timedelta(days=2),
+                updated_at=datetime.utcnow() - timedelta(days=2),
+            )
+        )
+        session.commit()
+
+    resp = client.post(
+        "/v1/vocab/lookup",
+        json={"term": "agenda", "source": "manual"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 200
+    recommendations = resp.json()["recommendations"]
+    assert any(
+        item["word"] == "schedule" and item["relation_type"] == "review_due"
+        for item in recommendations
+    )

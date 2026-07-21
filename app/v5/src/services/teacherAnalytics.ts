@@ -102,8 +102,14 @@ export interface StudentListItem {
 export interface ClassOverview {
   class_id: string;
   date: string;
+  /** Compatibility field; currently identical to the enrolled class roster. */
   total_students: number;
+  /** Distinct students currently enrolled in the class with the student role. */
+  enrolled_students: number;
+  /** Enrolled students with source learning activity on the selected day. */
   active_students: number;
+  /** Enrolled students with a class-scoped daily analysis on the selected day. */
+  analyzed_students: number;
   risk_count: number;
   avg_vocab_growth: number | null;
   avg_grammar_decay: number | null;
@@ -237,8 +243,13 @@ export const TeacherAnalyticsService = {
     return response as unknown as StudentListItem[];
   },
 
-  async getStudentProfile(student_id: number, days?: number, target_date?: string): Promise<StudentProfile> {
-    const params: Record<string, string | number> = {};
+  async getStudentProfile(
+    student_id: number,
+    class_id: string,
+    days?: number,
+    target_date?: string,
+  ): Promise<StudentProfile> {
+    const params: Record<string, string | number> = { class_id };
     if (days) params.days = days;
     if (target_date) params.target_date = target_date;
     const response = await api.get<StudentProfile>(`/api/v1/analytics/student/${student_id}/profile`, { params });
@@ -247,25 +258,36 @@ export const TeacherAnalyticsService = {
 
   async getStudentDashboard(
     student_id: number,
+    class_id: string,
     days?: number,
     target_date?: string,
     llm_enhance = false,
   ): Promise<StudentDashboard> {
-    const params: Record<string, string | number | boolean> = { llm_enhance };
+    const params: Record<string, string | number | boolean> = { class_id, llm_enhance };
     if (days) params.days = days;
     if (target_date) params.target_date = target_date;
     const response = await api.get<StudentDashboard>(`/api/v1/analytics/student/${student_id}/dashboard`, { params });
     return response as unknown as StudentDashboard;
   },
 
-  async getStudentReport(student_id: number, target_date?: string): Promise<StudentReport> {
-    const params = target_date ? { target_date } : {};
+  async getStudentReport(
+    student_id: number,
+    class_id: string,
+    target_date?: string,
+  ): Promise<StudentReport> {
+    const params: Record<string, string> = { class_id };
+    if (target_date) params.target_date = target_date;
     const response = await api.get<StudentReport>(`/api/v1/analytics/student/${student_id}/report`, { params });
     return response as unknown as StudentReport;
   },
 
-  async regenerateStudentLongitudinalSummary(student_id: number, days?: number, target_date?: string): Promise<Record<string, unknown>> {
-    const params: Record<string, string | number> = {};
+  async regenerateStudentLongitudinalSummary(
+    student_id: number,
+    class_id: string,
+    days?: number,
+    target_date?: string,
+  ): Promise<Record<string, unknown>> {
+    const params: Record<string, string | number> = { class_id };
     if (days) params.days = days;
     if (target_date) params.target_date = target_date;
     const response = await api.post<Record<string, unknown>>(`/api/v1/analytics/student/${student_id}/llm-profile`, undefined, { params });

@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-
-from sqlalchemy import ForeignKey
+from typing import Any
 
 from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy.types import JSON

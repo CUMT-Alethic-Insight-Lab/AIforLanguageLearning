@@ -23,9 +23,10 @@ def db_engine(tmp_path):
 
 
 def test_grade_essay_task_eager(db_engine, monkeypatch):
-    from sqlmodel import Session
+    from sqlmodel import Session, select
     from app.db import get_engine
     from app.models import EssaySubmission
+    from app.domain.models import LearningRecord
 
     async def _fake_grade_essay(*, ocr_text: str, language: str):
         return {
@@ -80,6 +81,21 @@ def test_grade_essay_task_eager(db_engine, monkeypatch):
     assert "dimensions" in result["result"]
     assert "total_score" in result["result"]
     assert "grade" in result["result"]
+
+    with Session(get_engine()) as session:
+        records = list(
+            session.exec(
+                select(LearningRecord)
+                .where(LearningRecord.user_id == 1)
+                .where(LearningRecord.type == "essay")
+            ).all()
+        )
+        assert len(records) == 1
+        record = records[0]
+        assert record.meta_data["action"] == "grade_essay"
+        assert record.meta_data["source"] == "celery"
+        assert record.meta_data["input_mode"] == "text"
+        assert record.meta_data["score"] == result["score"]
 
 
 def test_generate_daily_vocab_task_eager():

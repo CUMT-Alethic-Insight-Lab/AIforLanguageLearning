@@ -8,12 +8,18 @@ param(
   [int]$FirstHop = -1,
   [int]$FirstChunks = 1,
   [switch]$LoadTrtEstimator = $false,
-  [string]$TensorRtHome = "e:\\projects\\AiforForiegnLanguageLearning\\TensorRT-10.13.3.9",
+  [string]$TensorRtHome = "",
   [string]$CudaHome = $env:CUDA_PATH,
   [string]$CondaEnvPath = ""
 )
 
 $ErrorActionPreference = 'Stop'
+
+$scriptRoot = Split-Path -Parent $PSCommandPath
+$workspaceRoot = (Resolve-Path (Join-Path $scriptRoot "..")).Path
+if (-not $TensorRtHome) {
+  $TensorRtHome = Join-Path $workspaceRoot "TensorRT-10.13.3.9"
+}
 
 $env:COSY_TORCH_FORCE_CPU = $(if ($ForceTorchCPU) { "1" } else { "0" })  # Allow enabling CPU-only mode if kernels are incompatible
 $env:COSY_GPU_ONLY        = "1"          # Enforce GPU EPs only in ORT
@@ -32,7 +38,7 @@ $env:COSY_CV2_TRT         = $(if ($LoadTrtEstimator) { "1" } else { "0" })
 $env:COSY_WARMUP          = "1"
 $env:COSY_LANGS           = $Langs
 
-$script = "e:\\projects\\AiforForiegnLanguageLearning\\env_check\\run_cosyvoice2_stream_multilang.py"
+$script = Join-Path $scriptRoot "run_cosyvoice2_stream_multilang.py"
 
 if ($TryTRT) {
   # Prepend TensorRT and CUDA runtime libraries to PATH so ORT TRT EP can find nvinfer*.dll and cudnn
@@ -47,8 +53,8 @@ if ($TryTRT) {
     if (Test-Path $p) { $env:PATH = $p + ";" + $env:PATH }
   }
   # Ensure cache directories exist
-  $trtCache = "e:\\projects\\AiforForiegnLanguageLearning\\tmp\\trt_engine_cache"
-  $timingCache = "e:\\projects\\AiforForiegnLanguageLearning\\tmp\\trt_timing_cache"
+  $trtCache = Join-Path $workspaceRoot "tmp\\trt_engine_cache"
+  $timingCache = Join-Path $workspaceRoot "tmp\\trt_timing_cache"
   if (-not (Test-Path $trtCache)) { New-Item -ItemType Directory -Path $trtCache | Out-Null }
   if (-not (Test-Path $timingCache)) { New-Item -ItemType Directory -Path $timingCache | Out-Null }
   $env:COSY_ORT_TRT_CACHE_PATH = $trtCache

@@ -2,12 +2,18 @@ param(
   [string]$Config = "Release",
   [string]$CudaHome = $env:CUDA_PATH,
   [string]$CudaVersion = "13.0",
-  [string]$TensorRtHome = "e:\\projects\\AiforForiegnLanguageLearning\\TensorRT-10.13.3.9",
+  [string]$TensorRtHome = "",
   [string]$CudaArch = "120",
   [switch]$BuildWheel = $true
 )
 
 $ErrorActionPreference = 'Stop'
+
+$root = Split-Path -Parent $PSCommandPath
+$ws = (Resolve-Path (Join-Path $root "..")).Path
+if (-not $TensorRtHome) {
+  $TensorRtHome = Join-Path $ws "TensorRT-10.13.3.9"
+}
 
 # Resolve CUDA home if not set
 if (-not $CudaHome -or -not (Test-Path $CudaHome)) {
@@ -34,9 +40,7 @@ Write-Host "[build_ort_win] cuDNN_HOME=$CudnnHome"
 Write-Host "[build_ort_win] TENSORRT_HOME=$TensorRtHome"
 Write-Host "[build_ort_win] CUDA_ARCH=$CudaArch"
 
-$root = Split-Path -Parent $PSCommandPath
-$ws = Resolve-Path (Join-Path $root "..")
-$ortSrc = Resolve-Path (Join-Path $ws "onnxruntime-main")
+$ortSrc = Join-Path $ws "onnxruntime-main"
 
 if (-not (Test-Path (Join-Path $ortSrc "build.bat"))) {
   Write-Error "onnxruntime-main/build.bat not found. Ensure sources are present."

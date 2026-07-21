@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
-from unittest.mock import AsyncMock, patch
+import asyncio
+from unittest.mock import patch
 
 import pytest
 
@@ -75,6 +75,8 @@ class TestModelRouterFallback:
         )
 
         async def mock_call(endpoint, messages, stream, temperature):
+            if False:
+                yield ""
             raise ConnectionError("all down")
 
         with patch.object(router, "_call_endpoint", side_effect=mock_call):
@@ -103,3 +105,79 @@ class TestModelRouterFallback:
         with patch.object(router, "_call_endpoint", side_effect=mock_call):
             chunks = [c async for c in router.call_with_fallback(decision, messages=[], stream=True)]
             assert chunks == ["primary"]
+
+    @pytest.mark.asyncio
+    async def test_cloud_local_race_stream_uses_fastest_first_token(self) -> None:
+        router = ModelRouter()
+        cloud = ModelEndpoint(
+            provider=ModelProvider.KIMI,
+            base_url="http://cloud",
+            api_key="cloud-key",
+            model_id="kimi",
+        )
+        local = ModelEndpoint(
+            provider=ModelProvider.LOCAL,
+            base_url="http://local",
+            api_key="local-key",
+            model_id="qwen",
+        )
+        router._endpoints = {
+            ModelProvider.KIMI: [cloud],
+            ModelProvider.LOCAL: [local],
+        }
+
+        async def mock_call(endpoint, messages, stream, temperature):
+            if endpoint.provider == ModelProvider.KIMI:
+                await asyncio.sleep(0.01)
+                yield "cloud-first"
+                await asyncio.sleep(0.05)
+                yield "-cloud-last"
+            else:
+                await asyncio.sleep(0.03)
+                yield "local-fast-full"
+
+        with patch.object(router, "_call_endpoint", side_effect=mock_call):
+            chunks = [
+                chunk
+                async for chunk in router.call_cloud_local_race_stream(
+                    messages=[{"role": "user", "content": "hello"}]
+                )
+            ]
+
+        assert chunks == ["cloud-first", "-cloud-last"]
+
+    @pytest.mark.asyncio
+    async def test_cloud_local_race_preserves_string_api(self) -> None:
+        router = ModelRouter()
+        cloud = ModelEndpoint(
+            provider=ModelProvider.KIMI,
+            base_url="http://cloud",
+            api_key="cloud-key",
+            model_id="kimi",
+        )
+        local = ModelEndpoint(
+            provider=ModelProvider.LOCAL,
+            base_url="http://local",
+            api_key="local-key",
+            model_id="qwen",
+        )
+        router._endpoints = {
+            ModelProvider.KIMI: [cloud],
+            ModelProvider.LOCAL: [local],
+        }
+
+        async def mock_call(endpoint, messages, stream, temperature):
+            if endpoint.provider == ModelProvider.KIMI:
+                await asyncio.sleep(0.01)
+                yield "a"
+                yield "b"
+            else:
+                await asyncio.sleep(0.03)
+                yield "c"
+
+        with patch.object(router, "_call_endpoint", side_effect=mock_call):
+            text = await router.call_cloud_local_race(
+                messages=[{"role": "user", "content": "hello"}]
+            )
+
+        assert text == "ab"

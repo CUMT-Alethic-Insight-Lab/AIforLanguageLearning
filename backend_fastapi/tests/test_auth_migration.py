@@ -7,6 +7,7 @@ from sqlmodel import SQLModel, create_engine
 
 from app.db import override_engine_for_tests
 from app.main import app
+from app.settings import settings
 
 
 @pytest.fixture(scope="module")
@@ -84,24 +85,14 @@ def test_student_profile(client: TestClient) -> None:
 
 
 def test_admin_users(client: TestClient) -> None:
-    # create admin user manually by registering as admin
-    client.post(
-        "/api/auth/register",
-        json={"username": "admin", "email": "admin@example.com", "password": "Admin1234"},
+    assert settings.seed_admin_enabled is True
+    r = client.post(
+        "/api/auth/login",
+        json={
+            "username": settings.seed_admin_username,
+            "password": settings.seed_admin_password,
+        },
     )
-    # 提升为 admin 角色
-    from app.infrastructure.db_user import get_user_by_username
-    from app.db import get_engine
-    from sqlmodel import Session
-
-    admin_user = get_user_by_username("admin")
-    assert admin_user is not None
-    admin_user.role = "admin"
-    with Session(get_engine()) as session:
-        session.add(admin_user)
-        session.commit()
-
-    r = client.post("/api/auth/login", json={"username": "admin", "password": "Admin1234"})
     token = r.json()["data"]["accessToken"]
 
     r = client.get("/api/admin/users", headers={"Authorization": f"Bearer {token}"})

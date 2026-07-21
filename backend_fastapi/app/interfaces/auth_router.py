@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel, EmailStr
-from sqlmodel import col
+from sqlalchemy.exc import IntegrityError
 
 from ..application.db_student import get_profile, upsert_profile
 from ..application.db_vocabulary import get_due_words
@@ -13,15 +13,22 @@ from ..infrastructure.db_user import (
     get_user_by_username,
 )
 from ..infrastructure.dependencies import get_current_user
+from ..infrastructure.rbac import get_user_role, is_account_enabled
 from ..infrastructure.security import (
     create_access_token,
     create_refresh_token,
     decode_token,
+    hash_password,
     validate_password_strength,
     verify_password,
 )
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+_AUTHENTICATION_FAILED = "Invalid username or password"
+_REGISTRATION_CONFLICT = "Unable to register with provided credentials"
+_INVALID_SESSION = "Invalid or expired session"
+_DUMMY_PASSWORD_HASH = hash_password("HelixDummyLoginPassword1")
 
 
 class RegisterRequest(BaseModel):
@@ -83,10 +90,28 @@ class DueWordsResponse(BaseModel):
     error: str | None = None
 
 
+def _can_authenticate(user: User | None) -> bool:
+    return user is not None and is_account_enabled(user) and get_user_role(user) is not None
+
+
+def _login_data_for(user: User) -> LoginData:
+    role = get_user_role(user)
+    if role is None or user.id is None:
+        raise ValueError("Cannot issue tokens for an invalid account")
+
+    token_data = {"sub": user.username, "userId": user.id}
+    return LoginData(
+        accessToken=create_access_token(token_data),
+        refreshToken=create_refresh_token(token_data),
+        expiresIn=60 * 60 * 24 * 7,
+        user=LoginUser(id=user.id, username=user.username, role=role.value),
+    )
+
+
 @router.post("/register", response_model=LoginResponse)
 async def register(req: RegisterRequest) -> LoginResponse:
     username = (req.username or "").strip()
-    email = (req.email or "").strip()
+    email = (req.email or "").strip().lower()
     password = req.password or ""
 
     if not username or not email or not password:
@@ -96,26 +121,16 @@ async def register(req: RegisterRequest) -> LoginResponse:
     if not strength.get("valid"):
         return LoginResponse(success=False, error=str(strength.get("message")))
 
-    if get_user_by_username(username):
-        return LoginResponse(success=False, error="Username already exists")
-    if get_user_by_email(email):
-        return LoginResponse(success=False, error="Email already exists")
+    username_exists = get_user_by_username(username) is not None
+    email_exists = get_user_by_email(email) is not None
+    if username_exists or email_exists:
+        return LoginResponse(success=False, error=_REGISTRATION_CONFLICT)
 
-    from ..infrastructure.security import hash_password
-
-    user = create_user(username, email, hash_password(password))
-    token_data = {"sub": user.username, "userId": user.id}
-    access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
-    return LoginResponse(
-        success=True,
-        data=LoginData(
-            accessToken=access_token,
-            refreshToken=refresh_token,
-            expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
-        ),
-    )
+    try:
+        user = create_user(username, email, hash_password(password))
+    except IntegrityError:
+        return LoginResponse(success=False, error=_REGISTRATION_CONFLICT)
+    return LoginResponse(success=True, data=_login_data_for(user))
 
 
 @router.post("/login", response_model=LoginResponse)
@@ -124,48 +139,28 @@ async def login(req: LoginRequest) -> LoginResponse:
     password = req.password or ""
 
     if not username or not password:
-        return LoginResponse(success=False, error="Missing credentials")
+        return LoginResponse(success=False, error=_AUTHENTICATION_FAILED)
 
     user = get_user_by_username(username)
-    if user is None or not verify_password(password, user.password_hash):
-        return LoginResponse(success=False, error="Invalid username or password")
+    password_hash = user.password_hash if user is not None else _DUMMY_PASSWORD_HASH
+    password_matches = verify_password(password, password_hash)
+    if not _can_authenticate(user) or not password_matches:
+        return LoginResponse(success=False, error=_AUTHENTICATION_FAILED)
 
-    token_data = {"sub": user.username, "userId": user.id}
-    access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
-    return LoginResponse(
-        success=True,
-        data=LoginData(
-            accessToken=access_token,
-            refreshToken=refresh_token,
-            expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
-        ),
-    )
+    return LoginResponse(success=True, data=_login_data_for(user))
 
 
 @router.post("/refresh", response_model=LoginResponse)
 async def refresh(req: RefreshRequest) -> LoginResponse:
-    payload = decode_token(req.refreshToken)
+    payload = decode_token(req.refreshToken, expected_type="refresh")
     if payload is None:
-        return LoginResponse(success=False, error="Invalid or expired refresh token")
+        return LoginResponse(success=False, error=_INVALID_SESSION)
     username = payload.get("sub")
     user = get_user_by_username(username) if username else None
-    if user is None:
-        return LoginResponse(success=False, error="User not found")
+    if not _can_authenticate(user):
+        return LoginResponse(success=False, error=_INVALID_SESSION)
 
-    token_data = {"sub": user.username, "userId": user.id}
-    access_token = create_access_token(token_data)
-    refresh_token = create_refresh_token(token_data)
-    return LoginResponse(
-        success=True,
-        data=LoginData(
-            accessToken=access_token,
-            refreshToken=refresh_token,
-            expiresIn=60 * 60 * 24 * 7,
-            user=LoginUser(id=user.id or 0, username=user.username, role=user.role or "student"),
-        ),
-    )
+    return LoginResponse(success=True, data=_login_data_for(user))
 
 
 @router.post("/logout")

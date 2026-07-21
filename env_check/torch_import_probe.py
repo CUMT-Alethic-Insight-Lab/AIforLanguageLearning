@@ -1,8 +1,10 @@
 import os
-lib_dir = r"E:\projects\AiforForiegnLanguageLearning\third_party\pytorch\torch\lib"
+from pathlib import Path
+
+lib_dir = Path(__file__).resolve().parent.parent / "third_party" / "pytorch" / "torch" / "lib"
 try:
     if hasattr(os, 'add_dll_directory'):
-        os.add_dll_directory(lib_dir)
+        os.add_dll_directory(str(lib_dir))
 except Exception as e:
     print('add_dll_directory failed:', e)
 

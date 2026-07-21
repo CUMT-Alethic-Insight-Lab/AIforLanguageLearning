@@ -63,13 +63,16 @@ class TestEssayScoring:
         result = calculate_essay_score(
             content_score=8.0,
             structure_score=7.0,
-            language_score=8.0,
+            vocabulary_score=7.5,
             grammar_score=6.0,
+            fluency_score=8.5,
+            logic_score=7.0,
         )
-        assert result["total_score"] == pytest.approx(7.35, 0.01)
+        assert result["total_score"] == pytest.approx(7.40, 0.01)
         assert result["grade"] == "B+"
         dims = result["dimensions"]
-        assert dims["content"]["weight"] == 0.30
+        assert dims["content"]["weight"] == 0.25
+        assert dims["vocabulary"]["weight"] == 0.15
         assert dims["grammar"]["score"] == 6.0
 
     def test_calculate_essay_score_clamping(self):
@@ -77,20 +80,32 @@ class TestEssayScoring:
         result = calculate_essay_score(
             content_score=15.0,
             structure_score=-2.0,
-            language_score=5.0,
+            vocabulary_score=5.0,
             grammar_score=5.0,
+            fluency_score=5.0,
+            logic_score=5.0,
         )
         assert result["dimensions"]["content"]["score"] == 10.0
         assert result["dimensions"]["structure"]["score"] == 0.0
 
     def test_map_grade_boundaries(self):
         # 边界值测试（总分 = sum(score * weight)）
-        assert calculate_essay_score(content_score=10, structure_score=10, language_score=10, grammar_score=10)["grade"] == "A+"
-        assert calculate_essay_score(content_score=8, structure_score=8, language_score=8, grammar_score=8)["grade"] == "A"
-        assert calculate_essay_score(content_score=7, structure_score=7, language_score=7, grammar_score=7)["grade"] == "B+"
-        assert calculate_essay_score(content_score=6, structure_score=6, language_score=6, grammar_score=6)["grade"] == "B"
-        assert calculate_essay_score(content_score=5, structure_score=5, language_score=5, grammar_score=5)["grade"] == "C"
-        assert calculate_essay_score(content_score=4, structure_score=4, language_score=4, grammar_score=4)["grade"] == "D"
+        def score_all(value: int):
+            return calculate_essay_score(
+                content_score=value,
+                structure_score=value,
+                vocabulary_score=value,
+                grammar_score=value,
+                fluency_score=value,
+                logic_score=value,
+            )
+
+        assert score_all(10)["grade"] == "A+"
+        assert score_all(8)["grade"] == "A"
+        assert score_all(7)["grade"] == "B+"
+        assert score_all(6)["grade"] == "B"
+        assert score_all(5)["grade"] == "C"
+        assert score_all(4)["grade"] == "D"
 
     def test_convert_llm_scores_to_dimensions(self):
         llm_scores = {
@@ -99,19 +114,24 @@ class TestEssayScoring:
             "vocabulary": 75,
             "fluency": 85,
             "grammar": 60,
+            "logic": 65,
         }
         dim = convert_llm_scores_to_dimensions(llm_scores)
         assert dim["content"] == 8.0
         assert dim["structure"] == 7.0
-        assert dim["language"] == 8.0  # (75+85)/2/10
+        assert dim["vocabulary"] == 7.5
+        assert dim["fluency"] == 8.5
         assert dim["grammar"] == 6.0
+        assert dim["logic"] == 6.5
 
     def test_build_essay_result_structure(self):
         result = build_essay_result(
             content_score=8.0,
             structure_score=7.0,
-            language_score=8.0,
+            vocabulary_score=7.5,
             grammar_score=6.0,
+            fluency_score=8.5,
+            logic_score=7.0,
             feedback="整体良好",
             suggestions=["注意语法"],
             corrected_text="I have a pen.",

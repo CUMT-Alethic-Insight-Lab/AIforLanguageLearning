@@ -43,7 +43,7 @@
   ```powershell
   conda run -p C:\Users\74090\Miniconda3\envs\torchnb311 python -V
   conda run -p C:\Users\74090\Miniconda3\envs\torchnb311 python -m pip install -U `
-    "E:\projects\AiforForiegnLanguageLearning\TensorRT-10.13.3.9\python\tensorrt-10.13.3.9-cp311-none-win_amd64.whl"
+    ".\TensorRT-10.13.3.9\python\tensorrt-10.13.3.9-cp311-none-win_amd64.whl"
   ```
 
   验证导入（可选）：
@@ -64,7 +64,7 @@
   $env:COSY_FP16='0'                 # 内部 TRT 引擎 FP32
   $env:COSY_AMP_DTYPE='bf16'         # PyTorch AMP 用 bf16
   $env:COSY_REBUILD_TRT='1'          # 首次/重建
-  & E:\projects\AiforForiegnLanguageLearning\env_check\run_iobind_windows.ps1 `
+  & .\env_check\run_iobind_windows.ps1 `
     -CondaEnvPath 'C:\Users\74090\Miniconda3\envs\torchnb311' `
     -Langs 'zh' -TryTRT -TrtFp16:$false -TokenHop 32 -LoadTrtEstimator
   ```

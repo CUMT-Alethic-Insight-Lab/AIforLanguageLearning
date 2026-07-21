@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 from pathlib import Path
 
@@ -25,6 +26,12 @@ def test_ws_voice_tts_chunk_order_and_last(tmp_path: Path, monkeypatch) -> None:
 
     monkeypatch.setattr("app.main.stream_chat", fake_stream_chat)
     monkeypatch.setattr("app.main.synthesize_tts_wav", lambda text: fake_tts(text))
+    monkeypatch.setattr(
+        "app.main.try_create_seamless_transcriber",
+        lambda **_: (lambda _audio, _cfg: "hello from asr"),
+    )
+    monkeypatch.setattr("app.main.settings.enable_asr", True)
+    monkeypatch.setattr("app.main.settings.asr_backend", "seamless")
 
     client = TestClient(app)
     with client.websocket_connect("/ws/v1?session_id=test&conversation_id=conv_voice_tts") as ws:
@@ -60,11 +67,10 @@ def test_ws_voice_tts_chunk_order_and_last(tmp_path: Path, monkeypatch) -> None:
         assert "LLM_RESULT" in types
         assert "TTS_CHUNK" in types
         assert "TTS_RESULT" in types
+        assert "TTS_STREAM_END" in types
 
-        # Chunking order: all TTS_CHUNK after LLM_RESULT.
-        first_llm = types.index("LLM_RESULT")
-        first_tts = types.index("TTS_CHUNK")
-        assert first_tts > first_llm
+        assert types.index("TTS_CHUNK") < types.index("TTS_STREAM_END")
+        assert types.index("TTS_STREAM_END") < types.index("TASK_FINISHED")
 
         chunks = [m for m in seen if m.get("type") == "TTS_CHUNK"]
         assert len(chunks) >= 2
@@ -83,3 +89,54 @@ def test_ws_voice_tts_chunk_order_and_last(tmp_path: Path, monkeypatch) -> None:
             b64 = (c.get("payload") or {}).get("data_b64")
             assert isinstance(b64, str)
             base64.b64decode(b64.encode("utf-8"))
+
+
+def test_ws_text_tts_starts_after_first_sentence_before_llm_finishes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "test_live_tts.db"
+    engine = create_engine(f"sqlite:///{db_path}", connect_args={"check_same_thread": False})
+    override_engine_for_tests(engine)
+    init_db()
+
+    async def fake_stream_chat(**_kwargs):
+        yield "First sentence."
+        await asyncio.sleep(0.08)
+        yield " Second sentence."
+
+    monkeypatch.setattr("app.main.stream_chat", fake_stream_chat)
+    monkeypatch.setattr("app.main.synthesize_tts_wav", lambda text: f"wav:{text}".encode())
+
+    client = TestClient(app)
+    with client.websocket_connect("/ws/v1?session_id=test&conversation_id=conv_live_tts") as ws:
+        _ = ws.receive_json()
+        ws.send_json(
+            {
+                "type": "TEXT",
+                "request_id": "text_live_tts",
+                "payload": {"text": "hello"},
+            }
+        )
+
+        seen = []
+        for _ in range(40):
+            message = ws.receive_json()
+            seen.append(message)
+            if message.get("type") == "TASK_FINISHED":
+                break
+
+    types = [message.get("type") for message in seen]
+    first_tts_result = types.index("TTS_RESULT")
+    assert types.index("LLM_TOKEN") < first_tts_result < types.index("LLM_RESULT")
+    assert types.index("TTS_STREAM_END") < types.index("TASK_FINISHED")
+
+    tts_results = [message for message in seen if message.get("type") == "TTS_RESULT"]
+    assert [message["payload"]["text"] for message in tts_results] == [
+        "First sentence.",
+        "Second sentence.",
+    ]
+    assert all(message["payload"]["is_final_segment"] is False for message in tts_results)
+
+    stream_end = next(message for message in seen if message.get("type") == "TTS_STREAM_END")
+    assert stream_end["payload"]["tts_streaming"] is True
+    assert stream_end["payload"]["tts_segment_count"] == 2

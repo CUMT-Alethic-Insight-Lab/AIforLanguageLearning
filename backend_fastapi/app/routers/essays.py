@@ -8,11 +8,14 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlmodel import Session, col, select
 
+from ..application.db_learning import create_record
 from ..application.essay_grading import run_grading_pipeline
 from ..application.event_service import append_event
 from ..db import get_session
+from ..domain.models import User
+from ..infrastructure.dependencies import get_optional_user
 from ..infrastructure.messaging.tasks import grade_essay_task
-from ..models import ConversationEvent, EssayResult, EssaySubmission
+from ..models import EssayResult, EssaySubmission
 from ..ocr import ocr_image_base64
 
 router = APIRouter(prefix="/v1/essays", tags=["essays"])
@@ -40,6 +43,7 @@ class EssayGradeRequest(BaseModel):
     session_id: str = "anonymous"
     conversation_id: str | None = None
     request_id: str | None = None
+    user_id: int | None = None
 
 
 class EssayGradeResponse(BaseModel):
@@ -52,15 +56,22 @@ class EssayGradeResponse(BaseModel):
 
 
 class EssayGetResponse(BaseModel):
+    success: bool = True
+    data: dict[str, Any]
+
+
+class EssayGetData(BaseModel):
     submission_id: int
-    session_id: str
-    conversation_id: str
-    request_id: str
-    ocr_text: str
-    language: str
-    score: int | None
-    result: dict[str, Any]
     status: str = "completed"
+    session_id: str = ""
+    conversation_id: str = ""
+    request_id: str = ""
+    ocr_text: str = ""
+    language: str = ""
+    score: int | None
+    result: dict[str, Any] = {}
+    created_at: str
+    completed_at: str | None = None
 
 
 class EssayGradeOcrRequest(BaseModel):
@@ -69,6 +80,7 @@ class EssayGradeOcrRequest(BaseModel):
     session_id: str = "anonymous"
     conversation_id: str | None = None
     request_id: str | None = None
+    user_id: int | None = None
 
 
 async def _grade_and_persist(
@@ -80,6 +92,7 @@ async def _grade_and_persist(
     request_id: str,
     session: Session,
     user_id: int | None = None,
+    input_mode: str = "text",
 ) -> EssayGradeResponse:
     ts = int(time.time() * 1000)
 
@@ -154,6 +167,21 @@ async def _grade_and_persist(
 
     session.commit()
 
+    if user_id is not None:
+        create_record(
+            user_id=user_id,
+            record_type="essay",
+            content=ocr_text[:200],
+            metadata={
+                "action": "grade_essay",
+                "submission_id": int(submission_id),
+                "language": language,
+                "score": score_int,
+                "source": "http",
+                "input_mode": input_mode,
+            },
+        )
+
     return EssayGradeResponse(
         submission_id=int(submission_id),
         session_id=session_id,
@@ -165,7 +193,11 @@ async def _grade_and_persist(
 
 
 @router.post("/grade", response_model=EssayGradeResponse)
-async def grade(req: EssayGradeRequest, session: Session = Depends(get_session)) -> EssayGradeResponse:
+async def grade(
+    req: EssayGradeRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_optional_user),
+) -> EssayGradeResponse:
     # 优先使用 text，如果提供了 image 则 OCR 提取文本
     text = (req.text or "").strip()
     image = (req.image or "").strip()
@@ -185,6 +217,8 @@ async def grade(req: EssayGradeRequest, session: Session = Depends(get_session))
     conversation_id = (req.conversation_id or f"conv_{uuid.uuid4().hex[:8]}").strip()
     request_id = (req.request_id or f"req_{uuid.uuid4().hex[:10]}").strip()
     language = (req.language or "").strip() or "en"
+    # P0 fix: never fall back to client-supplied req.user_id when unauthenticated.
+    resolved_user_id = current_user.id if current_user and current_user.id is not None else None
     return await _grade_and_persist(
         ocr_text=ocr_text,
         language=language,
@@ -192,11 +226,17 @@ async def grade(req: EssayGradeRequest, session: Session = Depends(get_session))
         conversation_id=conversation_id,
         request_id=request_id,
         session=session,
+        user_id=resolved_user_id,
+        input_mode="text" if text else "ocr",
     )
 
 
 @router.post("/grade-ocr", response_model=EssayGradeResponse)
-async def grade_ocr(req: EssayGradeOcrRequest, session: Session = Depends(get_session)) -> EssayGradeResponse:
+async def grade_ocr(
+    req: EssayGradeOcrRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_optional_user),
+) -> EssayGradeResponse:
     text = ocr_image_base64(req.image, language=req.language)
     text = str(text or "").strip()
     if not text:
@@ -206,6 +246,8 @@ async def grade_ocr(req: EssayGradeOcrRequest, session: Session = Depends(get_se
     conversation_id = (req.conversation_id or f"conv_{uuid.uuid4().hex[:8]}").strip()
     request_id = (req.request_id or f"req_{uuid.uuid4().hex[:10]}").strip()
     language = (req.language or "").strip() or "english"
+    # P0 fix: never fall back to client-supplied req.user_id when unauthenticated.
+    resolved_user_id = current_user.id if current_user and current_user.id is not None else None
 
     return await _grade_and_persist(
         ocr_text=text,
@@ -214,11 +256,17 @@ async def grade_ocr(req: EssayGradeOcrRequest, session: Session = Depends(get_se
         conversation_id=conversation_id,
         request_id=request_id,
         session=session,
+        user_id=resolved_user_id,
+        input_mode="ocr",
     )
 
 
 @router.post("", response_model=EssaySubmitResponse)
-async def submit_essay(req: EssaySubmitRequest, session: Session = Depends(get_session)) -> EssaySubmitResponse:
+async def submit_essay(
+    req: EssaySubmitRequest,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_optional_user),
+) -> EssaySubmitResponse:
     content = (req.content or "").strip()
     image_key = (req.image_key or "").strip()
 
@@ -229,11 +277,13 @@ async def submit_essay(req: EssaySubmitRequest, session: Session = Depends(get_s
     conversation_id = (req.conversation_id or f"conv_{uuid.uuid4().hex[:8]}").strip()
     request_id = (req.request_id or f"req_{uuid.uuid4().hex[:10]}").strip()
     language = (req.language or "").strip() or "en"
+    # P0 fix: never fall back to client-supplied req.user_id when unauthenticated.
+    resolved_user_id = current_user.id if current_user and current_user.id is not None else None
 
     ts = int(time.time() * 1000)
 
     submission = EssaySubmission(
-        user_id=req.user_id,
+        user_id=resolved_user_id,
         session_id=session_id,
         conversation_id=conversation_id,
         request_id=request_id,
@@ -250,7 +300,7 @@ async def submit_essay(req: EssaySubmitRequest, session: Session = Depends(get_s
 
     append_event(
         session,
-        user_id=req.user_id,
+        user_id=resolved_user_id,
         session_id=session_id,
         conversation_id=conversation_id,
         request_id=request_id,
@@ -260,6 +310,20 @@ async def submit_essay(req: EssaySubmitRequest, session: Session = Depends(get_s
         final=False,
     )
     session.commit()
+
+    if resolved_user_id is not None:
+        create_record(
+            user_id=resolved_user_id,
+            record_type="essay",
+            content=(content if content else "")[:200],
+            metadata={
+                "action": "submit_essay",
+                "submission_id": int(submission_id),
+                "language": language,
+                "source": "http",
+                "input_mode": "text" if content else "ocr",
+            },
+        )
 
     task_payload = content if content else image_key
     task_result = grade_essay_task.delay(str(submission_id), task_payload)
@@ -274,10 +338,25 @@ async def submit_essay(req: EssaySubmitRequest, session: Session = Depends(get_s
 
 
 @router.get("/{submission_id}", response_model=EssayGetResponse)
-def get_essay(submission_id: int, session: Session = Depends(get_session)) -> EssayGetResponse:
+def get_essay(
+    submission_id: int,
+    session: Session = Depends(get_session),
+    current_user: User | None = Depends(get_optional_user),
+) -> EssayGetResponse:
     submission = session.get(EssaySubmission, submission_id)
     if submission is None:
         raise HTTPException(status_code=404, detail="submission not found")
+
+    # Access control
+    if current_user is None:
+        # Anonymous: only read anonymous submissions (user_id IS NULL)
+        if submission.user_id is not None:
+            raise HTTPException(status_code=403, detail="access denied")
+    elif current_user.role == "student":
+        # Student: only read own submissions
+        if submission.user_id != current_user.id:
+            raise HTTPException(status_code=403, detail="access denied")
+    # teacher/admin roles can read all submissions
 
     sid = submission.id
     if sid is None:
@@ -291,14 +370,24 @@ def get_essay(submission_id: int, session: Session = Depends(get_session)) -> Es
 
     status = "completed" if essay_result is not None else "grading"
 
-    return EssayGetResponse(
+    payload = EssayGetData(
         submission_id=int(sid),
+        status=status,
         session_id=str(submission.session_id or ""),
         conversation_id=str(submission.conversation_id or ""),
         request_id=str(submission.request_id or ""),
         ocr_text=str(submission.ocr_text or ""),
         language=str(submission.language or ""),
-        score=int(essay_result.score) if essay_result is not None and essay_result.score is not None else None,
+        score=(
+            int(essay_result.score)
+            if essay_result is not None and essay_result.score is not None
+            else None
+        ),
         result=dict(essay_result.result or {}) if essay_result is not None else {},
-        status=status,
+        created_at=submission.created_at.isoformat(),
+        completed_at=essay_result.created_at.isoformat() if essay_result is not None else None,
+    )
+    return EssayGetResponse(
+        success=True,
+        data=payload.model_dump(),
     )

@@ -90,7 +90,7 @@ class Neo4jClient:
                     tags=tags,
                 )
                 return True
-        except Neo4jError as e:
+        except Exception as e:
             print(f"Neo4j error creating word: {e}")
             return False
 
@@ -101,15 +101,20 @@ class Neo4jClient:
 
         query = """
         MATCH (w:Word {word: $word})
-        RETURN w.word as word, w.phonetic as phonetic,
-               w.meaning as meaning, w.difficulty as difficulty,
-               w.tags as tags
+        RETURN w.word as word,
+               COALESCE(w.phonetic, '') as phonetic,
+               COALESCE(w.meaning, '') as meaning,
+               COALESCE(w.difficulty, 1) as difficulty,
+               COALESCE(w.tags, []) as tags
         """
 
-        async with self.driver.session() as session:
-            result = await session.run(query, word=word)
-            record = await result.single()
-            return dict(record) if record else None
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(query, word=word)
+                record = await result.single()
+                return dict(record) if record else None
+        except Exception:
+            return None
 
     async def create_relation(
         self,
@@ -142,7 +147,7 @@ class Neo4jClient:
                     strength=strength,
                 )
                 return True
-        except Neo4jError as e:
+        except Exception as e:
             print(f"Neo4j error creating relation: {e}")
             return False
 
@@ -159,26 +164,25 @@ class Neo4jClient:
         if relation_type:
             query = f"""
             MATCH (w:Word {{word: $word}})-[r:{relation_type.upper()}]->(related:Word)
-            RETURN related.word as word, r.strength as strength,
-                   COALESCE(related.meaning, '') as meaning,
-                   COALESCE(related.difficulty, 1) as difficulty,
+            RETURN related.word as word, COALESCE(r.strength, 1.0) as strength,
                    '{relation_type}' as relation_type
             LIMIT $limit
             """
         else:
             query = """
             MATCH (w:Word {word: $word})-[r]->(related:Word)
-            RETURN related.word as word, r.strength as strength,
-                   COALESCE(related.meaning, '') as meaning,
-                   COALESCE(related.difficulty, 1) as difficulty,
+            RETURN related.word as word, COALESCE(r.strength, 1.0) as strength,
                    type(r) as relation_type
             LIMIT $limit
             """
 
-        async with self.driver.session() as session:
-            result = await session.run(query, word=word, limit=limit)
-            records = await result.data()
-            return records
+        try:
+            async with self.driver.session() as session:
+                result = await session.run(query, word=word, limit=limit)
+                records = await result.data()
+                return records
+        except Exception:
+            return []
 
     async def get_antonyms(self, word: str) -> List[Dict[str, Any]]:
         """获取反义词"""
@@ -206,7 +210,7 @@ class Neo4jClient:
             for query in queries:
                 try:
                     await session.run(query)
-                except Neo4jError as e:
+                except Exception as e:
                     print(f"Schema init warning: {e}")
 
 

@@ -36,6 +36,7 @@
     "echarts": "^5.4.3",
     "electron-log": "^5.4.3",
     "electron-store": "^11.0.2",
+    "lucide-vue-next": "^1.0.0",
     "pinia": "^2.1.7",
     "three": "^0.160.0",
     "vue": "^3.4.0",

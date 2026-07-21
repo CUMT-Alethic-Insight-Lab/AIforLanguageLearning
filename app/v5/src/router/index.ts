@@ -2,7 +2,6 @@
  * @fileoverview 路由配置模块 (Vue Router)
  * @description 定义前端应用的路由规则，映射 URL 路径到具体的页面组件。
  *              使用 Hash 模式以确保在 Electron 环境下的兼容性。
- *              包含基于角色的导航守卫，保护教师专属页面。
  */
 
 import { createRouter, createWebHashHistory, RouteRecordRaw } from 'vue-router'
@@ -13,13 +12,28 @@ import VoiceView from '../views/VoiceView.vue'
 import AnalysisView from '../views/AnalysisView.vue'
 import SettingsView from '../views/SettingsView.vue'
 import EssayView from '../views/EssayView.vue'
-import TeacherDashboardView from '../views/TeacherDashboardView.vue'
-import StudentProfileView from '../views/StudentProfileView.vue'
+import AssistantView from '../views/AssistantView.vue'
+import LoginView from '../views/LoginView.vue'
+import RegisterView from '../views/RegisterView.vue'
+import TeacherAnalyticsView from '../views/TeacherAnalyticsView.vue'
+import { AuthService, AuthUser } from '../services/auth'
 
 /**
  * 路由表定义
  */
 const routes: Array<RouteRecordRaw> = [
+  {
+    path: '/login',
+    name: 'login',
+    component: LoginView,
+    meta: { title: '登录', public: true }
+  },
+  {
+    path: '/register',
+    name: 'register',
+    component: RegisterView,
+    meta: { title: '注册', public: true }
+  },
   {
     path: '/',
     name: 'home',
@@ -45,22 +59,22 @@ const routes: Array<RouteRecordRaw> = [
     meta: { title: '学习分析' }
   },
   {
+    path: '/teacher',
+    name: 'teacher',
+    component: TeacherAnalyticsView,
+    meta: { title: '班级学情', allowedRoles: ['teacher', 'admin'] }
+  },
+  {
+    path: '/assistant',
+    name: 'assistant',
+    component: AssistantView,
+    meta: { title: '智慧助教' }
+  },
+  {
     path: '/settings',
     name: 'settings',
     component: SettingsView,
     meta: { title: '设置' }
-  },
-  {
-    path: '/teacher',
-    name: 'teacher-dashboard',
-    component: TeacherDashboardView,
-    meta: { title: '教师仪表盘', requiresRole: 'teacher' }
-  },
-  {
-    path: '/teacher/student/:student_id',
-    name: 'student-profile',
-    component: StudentProfileView,
-    meta: { title: '学生画像', requiresRole: 'teacher' }
   }
 ]
 
@@ -76,24 +90,29 @@ const router = createRouter({
 })
 
 /**
- * 全局导航守卫 — 角色权限校验
- * 
- * 对标记了 requiresRole 的路由进行拦截，检查当前用户是否具备对应角色。
- * 未授权用户会被重定向到首页，并在控制台给出提示。
+ * 全局导航守卫 — 页面标题更新
  */
 router.beforeEach((to, _from, next) => {
-  const requiredRole = to.meta.requiresRole as string | undefined
-  if (requiredRole) {
-    try {
-      const raw = localStorage.getItem('auth_user')
-      const user = raw ? JSON.parse(raw) : null
-      const userRole = user?.role || 'student'
-      if (userRole !== requiredRole) {
-        console.warn(`[Router Guard] 访问被拒绝：需要角色 '${requiredRole}'，当前角色 '${userRole}'`)
-        return next('/')
-      }
-    } catch {
-      return next('/')
+  const title = to.meta.title as string | undefined
+  if (title) {
+    document.title = `${title} - AI语言学习`
+  }
+  const isPublic = Boolean(to.meta.public)
+  const hasToken = AuthService.hasToken()
+  if (!isPublic && !hasToken) {
+    next({ path: '/login' })
+    return
+  }
+  if (isPublic && hasToken && (to.path === '/login' || to.path === '/register')) {
+    next({ path: '/' })
+    return
+  }
+  const allowedRoles = to.meta.allowedRoles as AuthUser['role'][] | undefined
+  if (allowedRoles) {
+    const user = AuthService.getCurrentUser()
+    if (!user || !allowedRoles.includes(user.role)) {
+      next({ path: '/' })
+      return
     }
   }
   next()

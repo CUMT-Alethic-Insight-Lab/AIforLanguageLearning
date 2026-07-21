@@ -13,13 +13,13 @@ from typing import Any
 
 from sqlmodel import Session, select
 
+from ...application.analytics.agents import BottomTierAgent, MiddleTierAgent, TopTierAgent
+from ...application.analytics.class_snapshot import generate_class_daily_snapshot
+from ...application.analytics.daily_summary import generate_student_daily_summary
+from ...application.analytics.weekly_report import generate_class_weekly_report
 from ...db import get_engine
-from ...domain.analytics.models import ClassDailySnapshot, InterventionTask, StudentDailySummary
+from ...domain.analytics.models import ClassDailySnapshot, StudentDailySummary
 from ...domain.models import User
-from ..application.analytics.agents import BottomTierAgent, MiddleTierAgent, TopTierAgent
-from ..application.analytics.class_snapshot import generate_class_daily_snapshot
-from ..application.analytics.daily_summary import generate_student_daily_summary
-from ..application.analytics.weekly_report import generate_class_weekly_report
 from .celery_app import app
 
 logger = logging.getLogger(__name__)
@@ -170,10 +170,7 @@ def generate_class_weekly_report_task(self, class_id: str, week_start_str: str |
                 week_start = today
 
         record = generate_class_weekly_report(class_id, week_start)
-        with Session(get_engine()) as session:
-            session.add(record)
-            session.commit()
-            session.refresh(record)
+        # generate_class_weekly_report already commits internally; no extra session needed
 
         result = {
             "class_id": class_id,

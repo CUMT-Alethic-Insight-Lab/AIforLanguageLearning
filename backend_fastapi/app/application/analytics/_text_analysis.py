@@ -58,7 +58,11 @@ def analyze_morph_transfer(
     unique = set(words)
     learned_lower = {w.lower() for w in learned_words}
     if not learned_lower:
-        return {"transfer_ratio": None, "new_words_with_roots": 0, "total_unique_words": len(unique)}
+        return {
+            "transfer_ratio": None,
+            "new_words_with_roots": 0,
+            "total_unique_words": len(unique),
+        }
 
     new_words_with_roots = 0
     for word in unique:
@@ -94,15 +98,29 @@ def estimate_advanced_vocab_substitution(
 ) -> dict[str, Any]:
     """估计高级词汇替代率。
 
-    优先使用 EssayResult.dimensions.vocabulary 分数；
+    优先使用 EssayResult.dimensions.vocabulary 分数。当前六维结构中的
+    ``vocabulary.score`` 为 0-10，历史数值结构中的 ``vocabulary`` 为 0-100；
     若无，则基于文本中高级形态词汇比例做代理。
     """
-    dims = (essay_result or {}).get("dimensions") or {}
-    vocab_score = dims.get("vocabulary")
-    if isinstance(vocab_score, (int, float)) and vocab_score > 0:
-        # 假设满分 100，归一化到 0-1
+    dims = (essay_result or {}).get("dimensions")
+    raw_vocab = dims.get("vocabulary") if isinstance(dims, dict) else None
+
+    score_scale = 100.0
+    if isinstance(raw_vocab, dict):
+        raw_vocab = raw_vocab.get("score")
+        score_scale = 10.0
+
+    normalized_score: float | None = None
+    if (
+        isinstance(raw_vocab, (int, float))
+        and not isinstance(raw_vocab, bool)
+        and math.isfinite(float(raw_vocab))
+    ):
+        normalized_score = max(0.0, min(1.0, float(raw_vocab) / score_scale))
+
+    if normalized_score is not None:
         return {
-            "substitution_rate": round(min(1.0, float(vocab_score) / 100.0), 4),
+            "substitution_rate": round(normalized_score, 4),
             "source": "essay_dimension_vocabulary",
         }
 
@@ -144,11 +162,11 @@ def analyze_sentence_diversity(essay_text: str) -> dict[str, Any]:
         words = re.findall(r"[a-zA-Z]+", sent)
         lengths.append(len(words))
 
-    if not lengths or all(l == 0 for l in lengths):
+    if not lengths or all(length == 0 for length in lengths):
         return {"diversity_index": None, "sentence_count": len(sentences)}
 
     avg_len = sum(lengths) / len(lengths)
-    variance = sum((l - avg_len) ** 2 for l in lengths) / len(lengths)
+    variance = sum((length - avg_len) ** 2 for length in lengths) / len(lengths)
     std_len = math.sqrt(variance)
 
     # 句长多样性：标准差 / 平均句长，理想值约 0.3-0.6

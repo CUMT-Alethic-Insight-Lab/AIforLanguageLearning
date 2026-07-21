@@ -1,11 +1,16 @@
 from __future__ import annotations
 
-from pydantic import AliasChoices, Field
+from pydantic import AliasChoices, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        hide_input_in_errors=True,
+    )
 
     app_env: str = Field(
         default="development", validation_alias=AliasChoices("AIFL_APP_ENV", "APP_ENV")
@@ -26,11 +31,19 @@ class Settings(BaseSettings):
     )
 
     llm_model: str = Field(
-        default="local-model", validation_alias=AliasChoices("AIFL_LLM_MODEL", "LLM_MODEL")
+        default="qwen/qwen3.5-9b", validation_alias=AliasChoices("AIFL_LLM_MODEL", "LLM_MODEL")
     )
     llm_timeout_seconds: float = Field(
         default=30.0,
         validation_alias=AliasChoices("AIFL_LLM_TIMEOUT_SECONDS", "LLM_TIMEOUT_SECONDS"),
+    )
+    kimi_base_url: str = Field(
+        default="https://api.moonshot.cn/v1",
+        validation_alias=AliasChoices("AIFL_KIMI_BASE_URL", "KIMI_BASE_URL"),
+    )
+    kimi_api_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("AIFL_KIMI_API_KEY", "KIMI_API_KEY"),
     )
 
     # DB
@@ -43,6 +56,46 @@ class Settings(BaseSettings):
         default="your-super-secret-key-change-this-in-production",
         validation_alias=AliasChoices("AIFL_JWT_SECRET", "JWT_SECRET"),
     )
+    seed_admin_enabled: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AIFL_SEED_ADMIN_ENABLED", "SEED_ADMIN_ENABLED"),
+    )
+    seed_admin_username: str = Field(
+        default="admin",
+        validation_alias=AliasChoices("AIFL_SEED_ADMIN_USERNAME", "SEED_ADMIN_USERNAME"),
+    )
+    seed_admin_email: str = Field(
+        default="admin@helix.local",
+        validation_alias=AliasChoices("AIFL_SEED_ADMIN_EMAIL", "SEED_ADMIN_EMAIL"),
+    )
+    seed_admin_password: str = Field(
+        default="Admin1234!",
+        validation_alias=AliasChoices("AIFL_SEED_ADMIN_PASSWORD", "SEED_ADMIN_PASSWORD"),
+    )
+
+    @model_validator(mode="after")
+    def reject_insecure_production_auth_defaults(self) -> Settings:
+        environment = str(self.app_env or "").strip().lower()
+        if environment in {"development", "dev", "local", "test", "testing"}:
+            return self
+
+        insecure_settings: list[str] = []
+        if not self.jwt_secret or self.jwt_secret in {
+            "your-super-secret-key-change-this-in-production",
+            "change-me-in-production",
+        }:
+            insecure_settings.append("AIFL_JWT_SECRET")
+        if self.seed_admin_enabled and (
+            not self.seed_admin_password or self.seed_admin_password == "Admin1234!"
+        ):
+            insecure_settings.append("AIFL_SEED_ADMIN_PASSWORD")
+
+        if insecure_settings:
+            names = ", ".join(insecure_settings)
+            raise ValueError(
+                f"Unsafe authentication defaults for {environment or 'non-development'}: {names}"
+            )
+        return self
 
     # Infrastructure
     redis_url: str = Field(
@@ -96,12 +149,19 @@ class Settings(BaseSettings):
         default="int8",
         validation_alias=AliasChoices("AIFL_ASR_COMPUTE_TYPE", "ASR_COMPUTE_TYPE"),
     )
+    asr_local_files_only: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AIFL_ASR_LOCAL_FILES_ONLY", "ASR_LOCAL_FILES_ONLY"),
+    )
 
     # Voice WS: 请求级别空闲超时（秒）；防止客户端未发送 AUDIO_END 导致会话长期占用。
     voice_request_idle_seconds: int = 30
 
     # Voice VAD（P1）：停顿判定，支持“无需客户端发送 AUDIO_END 也能自动收句”。
-    enable_vad: bool = Field(default=True, validation_alias=AliasChoices("AIFL_ENABLE_VAD", "ENABLE_VAD"))
+    enable_vad: bool = Field(
+        default=True,
+        validation_alias=AliasChoices("AIFL_ENABLE_VAD", "ENABLE_VAD"),
+    )
     vad_mode: int = Field(default=2, validation_alias=AliasChoices("AIFL_VAD_MODE", "VAD_MODE"))
     vad_silence_ms: int = Field(
         default=800,

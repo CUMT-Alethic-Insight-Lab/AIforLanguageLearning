@@ -11,7 +11,7 @@ from __future__ import annotations
 import datetime as _dt
 from typing import Any
 
-from sqlalchemy import Column, ForeignKey, UniqueConstraint
+from sqlalchemy import Column, UniqueConstraint
 from sqlalchemy.types import JSON
 from sqlmodel import Field, SQLModel
 

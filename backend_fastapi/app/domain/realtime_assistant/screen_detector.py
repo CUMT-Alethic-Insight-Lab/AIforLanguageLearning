@@ -20,8 +20,6 @@ logger = logging.getLogger(__name__)
 
 # 可选依赖：当 Pillow/imagehash 不可用时降级到基础哈希
 try:
-    from PIL import Image
-    from imagehash import phash
     IMAGEHASH_AVAILABLE = True
 except Exception:
     IMAGEHASH_AVAILABLE = False
@@ -133,8 +131,9 @@ class ScreenChangeDetector:
         if not IMAGEHASH_AVAILABLE:
             return image_bytes
         try:
-            from PIL import Image
             from io import BytesIO
+
+            from PIL import Image
 
             img = Image.open(BytesIO(image_bytes))
             if img.mode not in ("RGB", "L"):
@@ -153,9 +152,10 @@ class ScreenChangeDetector:
             # 降级：使用 bytes 长度 + 首尾 64 bytes 做简单指纹
             return hash((len(image_bytes), image_bytes[:64], image_bytes[-64:]))
         try:
-            from PIL import Image
             from io import BytesIO
+
             from imagehash import phash
+            from PIL import Image
 
             img = Image.open(BytesIO(image_bytes))
             if img.mode != "RGB":
@@ -182,8 +182,9 @@ class ScreenChangeDetector:
         if not IMAGEHASH_AVAILABLE or img1_bytes is None:
             return 0.5  # 无法计算时保守返回
         try:
-            from PIL import Image
             from io import BytesIO
+
+            from PIL import Image
 
             i1 = Image.open(BytesIO(img1_bytes)).convert("L")
             i2 = Image.open(BytesIO(img2_bytes)).convert("L")

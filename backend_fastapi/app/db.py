@@ -5,13 +5,14 @@ from typing import AsyncGenerator, Generator
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
-from sqlmodel import Session, SQLModel, create_engine
+from sqlmodel import Session, SQLModel, create_engine, select
 
 from . import models as _app_models  # noqa: F401
 
 # Import domain models to ensure all tables are registered in SQLModel metadata
 from .domain import models as _domain_models  # noqa: F401
 from .domain.analytics import models as _analytics_models  # noqa: F401
+from .domain.classroom import models as _classroom_models  # noqa: F401
 from .domain.prompt_management import models as _prompt_models  # noqa: F401
 from .settings import settings
 
@@ -79,6 +80,39 @@ def override_async_engine_for_tests(engine) -> None:
 def init_db() -> None:
     engine = get_engine()
     SQLModel.metadata.create_all(engine)
+    _seed_admin_user()
+
+
+def _seed_admin_user() -> None:
+    if not bool(settings.seed_admin_enabled):
+        return
+
+    username = str(settings.seed_admin_username or "").strip()
+    email = str(settings.seed_admin_email or "").strip()
+    password = str(settings.seed_admin_password or "")
+    if not username or not email or not password:
+        return
+
+    from .domain.models import User
+    from .infrastructure.security import hash_password, validate_password_strength
+
+    if not validate_password_strength(password).get("valid"):
+        return
+
+    with Session(get_engine()) as session:
+        existing_username = session.exec(select(User).where(User.username == username)).first()
+        existing_email = session.exec(select(User).where(User.email == email)).first()
+        if existing_username is not None or existing_email is not None:
+            return
+        session.add(
+            User(
+                username=username,
+                email=email,
+                password_hash=hash_password(password),
+                role="admin",
+            )
+        )
+        session.commit()
 
 
 async def init_db_async() -> None:

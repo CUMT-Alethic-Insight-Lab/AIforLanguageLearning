@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -28,10 +28,15 @@ from app.application.analytics.agents import (
 )
 from app.application.analytics.facade import assign_student_class, backfill_student_class_ids
 from app.application.analytics.daily_summary import (
+    _calc_autonomous_drive,
+    _calc_feedback_response_depth,
     _calc_grammar_error_decay,
+    _calc_learning_stability,
+    _calc_difficulty_jump_success,
     _calc_long_term_memory,
     _calc_lookup_conversion,
     _calc_semantic_accuracy,
+    _calc_topic_coverage_breadth,
     _calc_vocab_growth_rate,
     generate_student_daily_summary,
 )
@@ -203,16 +208,16 @@ def test_calc_lookup_conversion() -> None:
     )
 
     queries = [
-        UserVocabQuery(term="apple", source="manual", result="", created_at=datetime.utcnow()),
-        UserVocabQuery(term="banana", source="manual", result="", created_at=datetime.utcnow()),
+        UserVocabQuery(term="apple", source="manual", result="", created_at=datetime.now(UTC)),
+        UserVocabQuery(term="banana", source="manual", result="", created_at=datetime.now(UTC)),
     ]
     vocab_items = [
         VocabularyItem(
             user_id=1,
             word="Apple",
             mastery_level=4,
-            next_review_at=datetime.utcnow(),
-            created_at=datetime.utcnow(),
+            next_review_at=datetime.now(UTC),
+            created_at=datetime.now(UTC),
         ),
     ]
     rate = _calc_lookup_conversion(queries, vocab_items)
@@ -233,6 +238,155 @@ def test_calc_semantic_accuracy(sample_essay_results: list[EssayResult]) -> None
     assert acc is not None
     # language: 70, 72, 74 => avg = 72 => 100 - 72 = 28
     assert acc == pytest.approx(28.0, rel=1e-3)
+
+
+def test_calc_feedback_response_depth_counts_essay_follow_up() -> None:
+    essay_results = [
+        EssayResult(submission_id=1, score=70, result={}, created_at=datetime(2026, 4, 1, 12, 0, 0)),
+        EssayResult(submission_id=2, score=80, result={}, created_at=datetime(2026, 4, 2, 12, 0, 0)),
+    ]
+    records = [
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="rewrite essay after feedback",
+            meta_data={"action": "grade_essay", "source": "http"},
+            created_at=datetime(2026, 4, 2, 12, 30, 0),
+        )
+    ]
+
+    depth = _calc_feedback_response_depth(essay_results, records)
+    assert depth == pytest.approx(0.76, rel=1e-3)
+
+
+def test_calc_autonomous_drive_counts_essay_grading_records() -> None:
+    records = [
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="self-initiated essay practice",
+            meta_data={"action": "grade_essay", "source": "http"},
+            created_at=datetime(2026, 4, 18, 10, 0, 0),
+        ),
+        LearningRecord(
+            user_id=1,
+            type="vocabulary",
+            content="review apple",
+            meta_data={"action": "review", "correct": True},
+            created_at=datetime(2026, 4, 18, 10, 5, 0),
+        ),
+    ]
+
+    count = _calc_autonomous_drive([], records)
+    assert count == 2
+
+
+def test_calc_autonomous_drive_deduplicates_submit_and_grade_for_same_essay() -> None:
+    records = [
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="essay submit",
+            meta_data={"action": "submit_essay", "submission_id": 11, "input_mode": "text"},
+            created_at=datetime(2026, 4, 18, 10, 0, 0),
+        ),
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="essay graded",
+            meta_data={"action": "grade_essay", "submission_id": 11, "input_mode": "text"},
+            created_at=datetime(2026, 4, 18, 10, 2, 0),
+        ),
+        LearningRecord(
+            user_id=1,
+            type="vocabulary",
+            content="review apple",
+            meta_data={"action": "review", "correct": True},
+            created_at=datetime(2026, 4, 18, 10, 5, 0),
+        ),
+    ]
+
+    count = _calc_autonomous_drive([], records)
+    assert count == 2
+
+
+def test_calc_learning_stability_ignores_celery_grade_completion() -> None:
+    records = [
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="submitted essay",
+            meta_data={"action": "submit_essay", "submission_id": 21, "source": "http"},
+            created_at=datetime(2026, 4, 18, 10, 0, 0),
+        ),
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="graded essay",
+            meta_data={"action": "grade_essay", "submission_id": 21, "source": "celery"},
+            created_at=datetime(2026, 4, 19, 10, 0, 0),
+        ),
+    ]
+
+    stability = _calc_learning_stability(records)
+    assert stability == 0.0
+
+
+def test_calc_feedback_response_depth_ignores_celery_grade_completion() -> None:
+    essay_results = [
+        EssayResult(submission_id=1, score=70, result={}, created_at=datetime(2026, 4, 1, 12, 0, 0)),
+        EssayResult(submission_id=2, score=80, result={}, created_at=datetime(2026, 4, 2, 12, 0, 0)),
+    ]
+    records = [
+        LearningRecord(
+            user_id=1,
+            type="essay",
+            content="graded asynchronously",
+            meta_data={"action": "grade_essay", "source": "celery"},
+            created_at=datetime(2026, 4, 2, 12, 30, 0),
+        )
+    ]
+
+    depth = _calc_feedback_response_depth(essay_results, records)
+    assert depth == pytest.approx(0.7, rel=1e-3)
+
+
+def test_calc_topic_coverage_breadth_ignores_ai_message_topics() -> None:
+    user_event = ConversationEvent(
+        user_id=1,
+        session_id="sess-1",
+        conversation_id="conv-1",
+        seq=1,
+        type="USER_MESSAGE",
+        payload={
+            "text": "I need help at the airport customs desk.",
+            "scenario": "airport customs conversation",
+        },
+        request_id="req-user",
+        final=True,
+        ts=1,
+        created_at=datetime(2026, 4, 18, 10, 0, 0),
+    )
+    ai_event = ConversationEvent(
+        user_id=1,
+        session_id="sess-1",
+        conversation_id="conv-1",
+        seq=2,
+        type="AI_MESSAGE",
+        payload={
+            "text": "You can also practice business negotiation in a meeting room.",
+            "scenario": "business meeting negotiation",
+        },
+        request_id="req-user",
+        final=True,
+        ts=2,
+        created_at=datetime(2026, 4, 18, 10, 0, 1),
+    )
+
+    user_only_breadth = _calc_topic_coverage_breadth([], [], [user_event], [])
+    mixed_breadth = _calc_topic_coverage_breadth([], [], [user_event, ai_event], [])
+
+    assert mixed_breadth == user_only_breadth
 
 
 # ───────────────────────────────────────────────
@@ -335,6 +489,70 @@ def test_generate_student_daily_summary_exposes_methodology_and_topics(
     assert "travel" in summary.raw_snapshot["topics"]
 
 
+def test_calc_difficulty_jump_success_uses_matching_ai_latency() -> None:
+    events = [
+        ConversationEvent(
+            user_id=1,
+            session_id="sess-1",
+            conversation_id="conv-1",
+            seq=1,
+            type="USER_MESSAGE",
+            payload={
+                "text": "I need to explain a negotiation issue with customs and reroute a shipment.",
+                    "scenario": "complex business customs negotiation at airport transfer desk with stakeholder escalation and reroute decision",
+                "word_count": 12,
+            },
+            request_id="req-success",
+            final=True,
+            ts=1,
+            created_at=datetime(2026, 4, 18, 10, 0, 0),
+        ),
+        ConversationEvent(
+            user_id=1,
+            session_id="sess-1",
+            conversation_id="conv-1",
+            seq=2,
+            type="AI_MESSAGE",
+            payload={"response_latency_ms": 3200},
+            request_id="req-success",
+            final=True,
+            ts=2,
+            created_at=datetime(2026, 4, 18, 10, 0, 3),
+        ),
+        ConversationEvent(
+            user_id=1,
+            session_id="sess-1",
+            conversation_id="conv-1",
+            seq=3,
+            type="USER_MESSAGE",
+            payload={
+                "text": "I need to clarify a cross-cultural complaint during an interview and negotiation.",
+                    "scenario": "cross cultural interview negotiation involving etiquette conflict, customs misunderstanding, and high pressure clarification",
+                "word_count": 10,
+            },
+            request_id="req-slow",
+            final=True,
+            ts=3,
+            created_at=datetime(2026, 4, 18, 10, 5, 0),
+        ),
+        ConversationEvent(
+            user_id=1,
+            session_id="sess-1",
+            conversation_id="conv-1",
+            seq=4,
+            type="AI_MESSAGE",
+            payload={"response_latency_ms": 9000},
+            request_id="req-slow",
+            final=True,
+            ts=4,
+            created_at=datetime(2026, 4, 18, 10, 5, 9),
+        ),
+    ]
+
+    success_rate = _calc_difficulty_jump_success(events)
+    assert success_rate == pytest.approx(0.5, rel=1e-3)
+
+
 # ───────────────────────────────────────────────
 # Agent-1/2/3 分层分析测试
 # ───────────────────────────────────────────────
@@ -431,9 +649,9 @@ def test_generate_class_weekly_report_no_data() -> None:
 @pytest.mark.integration
 @patch("app.application.analytics.weekly_report._aggregate_weekly_class_data")
 @patch("app.application.analytics.weekly_report._aggregate_weekly_student_summaries")
-@patch("app.application.analytics.weekly_report.chat_complete")
+@patch("app.application.analytics.weekly_report.chat_complete_cloud_first")
 def test_generate_class_weekly_report_with_llm(
-    mock_chat: MagicMock, mock_students: MagicMock, mock_class: MagicMock
+    mock_chat: AsyncMock, mock_students: MagicMock, mock_class: MagicMock
 ) -> None:
     """集成测试：LLM 正常返回时生成完整周报。"""
     mock_chat.return_value = {"content": "本周班级表现良好，建议继续加强词汇训练。"}

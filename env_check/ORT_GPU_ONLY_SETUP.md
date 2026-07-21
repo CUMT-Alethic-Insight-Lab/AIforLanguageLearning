@@ -38,7 +38,7 @@ This note tracks a stable config for running CosyVoice2 zero-shot/streaming on W
 
 ```powershell
 wsl -e bash -lc "\
-  source ~/.venvs/ptsrc/bin/activate; cd /mnt/e/projects/AiforForiegnLanguageLearning/env_check; \
+  source ~/.venvs/ptsrc/bin/activate; cd ./env_check; \
   COSY_FORCE_CPU=1 COSY_ORT_NO_TRT=1 COSY_ORT_CAMPPLUS_TRT=0 COSY_ORT_IOBIND=0 COSY_ORT_SPEECH_CPU=1 COSY_GPU_ONLY=0 \
   COSY_DISABLE_TTSFRD=1 COSY_TEXT_NORMALIZER_MODULE='your_ttf_module' \
   python run_cosyvoice2_zero_shot.py --text '你好，测试功能链路。' --prompt_wav zero_shot_prompt.wav --use_fp16 0 --use_flow_cache 0\
@@ -52,7 +52,7 @@ wsl -e bash -lc "\
 ```powershell
 # Not recommended right now — causes CUDA misaligned errors
 wsl -e bash -lc "\
-  source ~/.venvs/ptsrc/bin/activate; cd /mnt/e/projects/AiforForiegnLanguageLearning/env_check; \
+  source ~/.venvs/ptsrc/bin/activate; cd ./env_check; \
   COSY_ORT_NO_TRT=1 COSY_ORT_CAMPPLUS_TRT=1 COSY_ORT_IOBIND=0 COSY_GPU_ONLY=1 \
   python run_cosyvoice2_zero_shot.py --text 'GPU 路径尝试。' --prompt_wav zero_shot_prompt.wav --use_fp16 1 --use_flow_cache 1\
 "
@@ -120,7 +120,7 @@ Ranked by likelihood to fix and effort:
 
 ```powershell
 wsl -e bash -lc "\
-  source ~/.venvs/ptsrc/bin/activate; cd /mnt/e/projects/AiforForiegnLanguageLearning; \
+  source ~/.venvs/ptsrc/bin/activate; cd .; \
   python -m env_check.run_cosyvoice2_trt_ab \
     --cmd \"python -m env_check.run_cosyvoice2_zero_shot --text '你好世界' --prompt_wav env_check/zero_shot_prompt.wav --use_flow_cache --use_fp16\" \
     --trt-env COSY_LOAD_TRT \

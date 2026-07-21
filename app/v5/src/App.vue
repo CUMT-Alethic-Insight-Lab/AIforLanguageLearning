@@ -14,14 +14,18 @@
  *              - 实时助教系统事件监听与悬浮窗集成。
  */
 import { onMounted, onUnmounted } from 'vue';
+import { useRoute } from 'vue-router';
 import Sidebar from './components/Sidebar.vue';
 import { useAssistantStore } from './stores/assistant';
 
 const assistant = useAssistantStore();
+const route = useRoute();
 
 onMounted(() => {
   // 初始化实时助教：注册系统事件监听（截图、划词）、建立 RTA WebSocket
-  assistant.init();
+  if (localStorage.getItem('auth_token')) {
+    assistant.init();
+  }
 });
 
 onUnmounted(() => {
@@ -33,7 +37,7 @@ onUnmounted(() => {
   <!-- 应用主容器：全屏高度，深色背景，白色文字 -->
   <div class="flex h-screen bg-gray-900 text-white overflow-hidden">
     <!-- 侧边栏组件：提供全局导航功能 -->
-    <Sidebar />
+    <Sidebar v-if="!route.meta.public" />
 
     <!-- 主内容区域：占据剩余空间，垂直排列 -->
     <main class="flex-1 flex flex-col min-w-0 overflow-hidden relative transition-all duration-300">

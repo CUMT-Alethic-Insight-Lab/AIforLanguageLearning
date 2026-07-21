@@ -3,16 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any
-from typing import AsyncIterator
-from typing import Literal
+from typing import Any, AsyncIterator, Literal
 
 import httpx
 
 from .prompts import render_prompt
 from .runtime_config import get_runtime_config, get_scene_model, update_runtime_config
 from .settings import settings
-
 
 _LLM_MODEL_CACHE: str | None = None
 _LLM_MODEL_LOCK = asyncio.Lock()
@@ -75,7 +72,7 @@ async def list_available_llm_models() -> list[str]:
 
     timeout = httpx.Timeout(min(float(settings.llm_timeout_seconds), 8.0), connect=2.0)
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
             resp = await client.get(
                 "/models",
                 headers={"Authorization": f"Bearer {settings.llm_api_key}"},
@@ -113,6 +110,129 @@ async def list_available_llm_models() -> list[str]:
     return ranked
 
 
+def _try_json_load(t: str) -> Any:
+    try:
+        return json.loads(t)
+    except Exception:
+        return None
+
+
+def _strip_thinking(text: str) -> str:
+    """Remove chain-of-thought / reasoning prefixes from LLM output.
+
+    Handles patterns like:
+    - "Thinking Process:\n...\n{...}"
+    - "<think>...</think>"
+    - "Reasoning: ...\nAnswer: ..."
+    Returns only the final answer/JSON portion.
+    """
+    s = (text or "").strip()
+    if not s:
+        return ""
+
+    # 1. Strip <think>...</think> blocks (common in Qwen/DeepSeek)
+    if "<think>" in s.lower():
+        s = re.sub(r"<think>.*?</think>", "", s, flags=re.DOTALL | re.IGNORECASE).strip()
+
+    # 1b. Strip "Thinking Process:" blocks (common in reasoning models)
+    if s.lower().startswith("thinking process:") or s.lower().startswith("thinking:"):
+        # Reasoning models often place the actual JSON inside a ```json block
+        # or at the end of the text.  Try code-fence first, then balanced braces.
+        last_fence = s.rfind("```")
+        if last_fence != -1:
+            fence_start = s.rfind("```", 0, last_fence)
+            if fence_start != -1:
+                inner = s[fence_start + 3 : last_fence].strip()
+                inner = re.sub(r"^json\s*", "", inner, flags=re.IGNORECASE).strip()
+                if _try_json_load(inner):
+                    return inner
+        # Fallback: extract last balanced {...} block that parses as JSON.
+        start = s.rfind("{")
+        end = s.rfind("}")
+        if start != -1 and end != -1 and start < end:
+            candidate = s[start:end + 1]
+            if _try_json_load(candidate):
+                return candidate
+        # If nothing works, still try the divider-based stripping below
+        # so the rest of the function can attempt further extraction.
+
+    # 2. Look for explicit dividers like "Construct JSON:", "Final Answer:", etc.
+    dividers = [
+        r"\n\s*\d+\s*\.\s*\*\*Construct JSON:\*\*\s*\n",
+        r"\n\s*\*\*Construct JSON:\*\*\s*\n",
+        r"\n\s*\d+\s*\.\s*Construct JSON:\s*\n",
+        r"\n\s*Construct JSON:\s*\n",
+        r"\n\s*Final Answer:\s*\n",
+        r"\n\s*Answer:\s*\n",
+        r"\n\s*Output:\s*\n",
+        r"\n\s*Result:\s*\n",
+    ]
+    for pat in dividers:
+        m = re.search(pat, s)
+        if m:
+            s = s[m.end():].strip()
+            break
+
+    # 3. If still contains thinking patterns or no valid JSON yet,
+    #    try to extract the last parseable JSON object/array from the text.
+
+    # Strip code fences first.
+    cleaned = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", s, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```\s*$", "", cleaned).strip()
+
+    # Try the cleaned text directly.
+    if _try_json_load(cleaned):
+        return cleaned
+
+    # Try all {...} and [...] blocks from longest to shortest.
+    candidates: list[str] = []
+    # Find balanced braces.
+    for opener, closer in (("{", "}"), ("[", "]")):
+        idx = 0
+        while True:
+            start = cleaned.find(opener, idx)
+            if start == -1:
+                break
+            depth = 0
+            for i in range(start, len(cleaned)):
+                if cleaned[i] == opener:
+                    depth += 1
+                elif cleaned[i] == closer:
+                    depth -= 1
+                    if depth == 0:
+                        candidates.append(cleaned[start : i + 1])
+                        idx = i + 1
+                        break
+            else:
+                break
+
+    # Sort by length descending (prefer largest valid JSON).
+    candidates.sort(key=len, reverse=True)
+    for cand in candidates:
+        if _try_json_load(cand):
+            return cand
+
+    # 4. Universal fallback: extract content from the last code fence regardless of prefix.
+    last_fence = s.rfind("```")
+    if last_fence != -1:
+        fence_start = s.rfind("```", 0, last_fence)
+        if fence_start != -1:
+            inner = s[fence_start + 3 : last_fence].strip()
+            inner = re.sub(r"^json\s*", "", inner, flags=re.IGNORECASE).strip()
+            if _try_json_load(inner):
+                return inner
+
+    # 5. Final fallback: extract the last balanced {...} block that parses as JSON.
+    start = s.rfind("{")
+    end = s.rfind("}")
+    if start != -1 and end != -1 and start < end:
+        candidate = s[start:end + 1]
+        if _try_json_load(candidate):
+            return candidate
+
+    return s
+
+
 def _extract_chat_response_text(data: Any) -> str:
     """Extract assistant text from an OpenAI-compatible chat.completions response.
 
@@ -133,11 +253,12 @@ def _extract_chat_response_text(data: Any) -> str:
         return ""
 
     content = msg.get("content")
+    raw = ""
     if isinstance(content, str) and content.strip():
-        return content.strip()
+        raw = content.strip()
 
     # Some providers return content as structured parts.
-    if isinstance(content, list):
+    elif isinstance(content, list):
         parts: list[str] = []
         for part in content:
             if isinstance(part, str) and part.strip():
@@ -147,11 +268,15 @@ def _extract_chat_response_text(data: Any) -> str:
                 if isinstance(txt, str) and txt.strip():
                     parts.append(txt.strip())
         if parts:
-            return "\n".join(parts).strip()
+            raw = "\n".join(parts).strip()
 
-    reasoning = msg.get("reasoning_content")
-    if isinstance(reasoning, str) and reasoning.strip():
-        return reasoning.strip()
+    if not raw:
+        reasoning = msg.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            raw = reasoning.strip()
+
+    if raw:
+        return _strip_thinking(raw)
 
     return ""
 
@@ -191,13 +316,9 @@ async def _resolve_llm_model(
 ) -> str:
     """Resolve a usable model id for OpenAI-compatible servers.
 
-    Problem:
-    - settings.llm_model defaults to 'local-model', which is often NOT a real model id in LM Studio.
-    - When the model id is invalid, LM calls fail and we degrade to fallback text.
-
     Strategy:
     - If user configured a non-placeholder model, use it.
-    - Otherwise, query /models and pick the first returned id (cached).
+    - Otherwise, return settings.llm_model (locked to configuration).
     """
 
     # 1) 场景模型（运行时配置）优先。
@@ -211,46 +332,22 @@ async def _resolve_llm_model(
     if primary and (not _is_placeholder_model(primary)):
         return primary
 
-    # 3) settings 默认模型（非占位）再次之。
-    configured = str(getattr(settings, "llm_model", "") or "").strip()
+    # 3) settings 默认模型（写死优先）。
+    configured = str(getattr(settings, "llm_model", "qwen/qwen3.5-9b") or "").strip()
     if configured and (not _is_placeholder_model(configured)):
         return configured
 
-    resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
-
-    if not use_global_cache:
-        try:
-            models = await _list_models_from_client(client, api_key=resolved_api_key)
-            if models:
-                return models[0]
-        except Exception:
-            pass
-        return configured or primary or scene_model or "local-model"
-
-    global _LLM_MODEL_CACHE
-    if _LLM_MODEL_CACHE:
-        return _LLM_MODEL_CACHE
-
-    async with _LLM_MODEL_LOCK:
-        if _LLM_MODEL_CACHE:
-            return _LLM_MODEL_CACHE
-
-        try:
-            models = await list_available_llm_models()
-            if models:
-                _LLM_MODEL_CACHE = models[0]
-                return _LLM_MODEL_CACHE
-        except Exception:
-            pass
-
-    # Last resort: use whatever is configured.
-    return configured or primary or scene_model or "local-model"
+    # Last resort: lock to qwen/qwen3.5-9b
+    return "qwen/qwen3.5-9b"
 
 
 def _extract_vocab_from_text(text: str) -> dict[str, Any]:
     s = (text or "").strip()
     if not s:
         return {"meaning": "", "example": "", "example_translation": "", "definitions": []}
+
+    # Strip thinking / reasoning chains and code fences before parsing.
+    s = _strip_thinking(s)
 
     def _maybe_fix_keys(raw: str) -> str:
         t = (raw or "").strip()
@@ -269,10 +366,9 @@ def _extract_vocab_from_text(text: str) -> dict[str, Any]:
         if not t:
             return None
 
-        # Strip code fences if present.
-        if t.startswith("```"):
-            t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t)
-            t = re.sub(r"\s*```\s*$", "", t).strip()
+        # Strip code fences if present (handles ```json, ```javascript, etc.).
+        t = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"\s*```\s*$", "", t).strip()
 
         # First attempt: direct JSON.
         try:
@@ -481,7 +577,7 @@ async def generate_vocab_fields(term: str) -> dict[str, Any]:
     timeout = httpx.Timeout(effective, connect=min(2.0, effective))
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
             model = await _resolve_llm_model(client, scene="vocab")
 
             async def _translate_example_to_zh(example_en: str) -> str:
@@ -511,143 +607,137 @@ async def generate_vocab_fields(term: str) -> dict[str, Any]:
                 return (txt or "").strip().strip('"')
 
             async def _request_vocab_json(user_prompt: str) -> str:
-                base_payload: dict[str, Any] = {
+                payload: dict[str, Any] = {
                     "model": model,
                     "messages": [
-                        {"role": "system", "content": "You are a helpful assistant."},
+                        {"role": "system", "content": "You are a helpful assistant. Respond with valid JSON only. Do not output any thinking process, reasoning, or explanation. Output ONLY the JSON object, nothing else."},
                         {"role": "user", "content": user_prompt},
                     ],
                     "temperature": 0.2,
                     "max_tokens": 700,
                 }
-
-                payload: dict[str, Any] = {**base_payload, "response_format": {"type": "json_object"}}
                 r = await client.post(
                     "/chat/completions",
                     headers={"Authorization": f"Bearer {settings.llm_api_key}"},
                     json=payload,
                 )
-                try:
-                    r.raise_for_status()
-                except httpx.HTTPStatusError as e:
-                    status = getattr(e.response, "status_code", None)
-                    if status in (400, 404, 422):
-                        r = await client.post(
-                            "/chat/completions",
-                            headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                            json=base_payload,
-                        )
-                        r.raise_for_status()
-                    else:
-                        raise
-
+                r.raise_for_status()
                 return _extract_chat_response_text(r.json())
 
-            text = await _request_vocab_json(prompt)
-            if text:
-                parsed = _extract_vocab_from_text(text)
-                defs = parsed.get("definitions")
-                if isinstance(defs, list) and defs:
-                    normalized_defs: list[dict[str, str]] = []
-                    for d in defs:
-                        if not isinstance(d, dict):
-                            continue
-                        meaning = str(d.get("meaning") or "").strip()
-                        example = str(d.get("example") or "").strip()
-                        example_translation = str(d.get("example_translation") or "").strip()
+            text = ""
+            parsed: dict[str, Any] = {}
+            for _attempt in range(5):
+                text = await _request_vocab_json(prompt)
+                if text:
+                    parsed = _extract_vocab_from_text(text)
+                    defs = parsed.get("definitions")
+                    if isinstance(defs, list) and defs:
+                        break
+                await asyncio.sleep(0.5)
+            else:
+                defs = []
 
-                        if example and not example_translation:
-                            try:
-                                example_translation = await _translate_example_to_zh(example)
-                            except Exception:
-                                example_translation = ""
+            if isinstance(defs, list) and defs:
+                normalized_defs: list[dict[str, str]] = []
+                for d in defs:
+                    if not isinstance(d, dict):
+                        continue
+                    meaning = str(d.get("meaning") or "").strip()
+                    example = str(d.get("example") or "").strip()
+                    example_translation = str(d.get("example_translation") or "").strip()
 
-                        if example and not example_translation:
-                            example_translation = "暂无"
-
-                        if meaning or example or example_translation:
-                            normalized_defs.append(
-                                {
-                                    "meaning": meaning,
-                                    "example": example,
-                                    "example_translation": example_translation,
-                                }
-                            )
-
-                    # If result looks incomplete for common/polysemous terms, retry once with an explicit expand prompt.
-                    if len(normalized_defs) < 2 and _should_expand(t):
+                    if example and not example_translation:
                         try:
-                            t2 = await _request_vocab_json(expand_prompt)
-                            if t2:
-                                p2 = _extract_vocab_from_text(t2)
-                                d2 = p2.get("definitions")
-                                if isinstance(d2, list) and d2:
-                                    for d in d2:
-                                        if not isinstance(d, dict):
-                                            continue
-                                        m2 = str(d.get("meaning") or "").strip()
-                                        e2 = str(d.get("example") or "").strip()
-                                        z2 = str(d.get("example_translation") or "").strip()
-                                        if e2 and not z2:
-                                            try:
-                                                z2 = await _translate_example_to_zh(e2)
-                                            except Exception:
-                                                z2 = ""
-                                        if e2 and not z2:
-                                            z2 = "暂无"
-                                        if m2 or e2 or z2:
-                                            normalized_defs.append(
-                                                {
-                                                    "meaning": m2,
-                                                    "example": e2,
-                                                    "example_translation": z2,
-                                                }
-                                            )
+                            example_translation = await _translate_example_to_zh(example)
                         except Exception:
-                            pass
+                            example_translation = ""
 
-                    # De-duplicate by meaning text.
-                    deduped: list[dict[str, str]] = []
-                    seen: set[str] = set()
-                    for d in normalized_defs:
-                        key = (d.get("meaning") or "").strip()
-                        if not key:
-                            continue
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        deduped.append(d)
+                    if example and not example_translation:
+                        example_translation = "暂无"
 
-                    if deduped:
-                        # Keep legacy top-level keys for backward compatibility.
-                        first = deduped[0]
-                        return {
-                            "meaning": first.get("meaning") or "",
-                            "example": first.get("example") or "",
-                            "example_translation": first.get("example_translation") or "",
-                            "definitions": deduped,
-                        }
+                    if meaning or example or example_translation:
+                        normalized_defs.append(
+                            {
+                                "meaning": meaning,
+                                "example": example,
+                                "example_translation": example_translation,
+                            }
+                        )
 
-                # Legacy single-definition shape.
-                meaning = str(parsed.get("meaning") or "").strip()
-                example = str(parsed.get("example") or "").strip()
-                example_translation = str(parsed.get("example_translation") or "").strip()
-
-                if example and (not example_translation or example_translation == "暂无"):
+                # If result looks incomplete for common/polysemous terms, retry once with an explicit expand prompt.
+                if len(normalized_defs) < 2 and _should_expand(t):
                     try:
-                        example_translation = await _translate_example_to_zh(example)
+                        t2 = await _request_vocab_json(expand_prompt)
+                        if t2:
+                            p2 = _extract_vocab_from_text(t2)
+                            d2 = p2.get("definitions")
+                            if isinstance(d2, list) and d2:
+                                for d in d2:
+                                    if not isinstance(d, dict):
+                                        continue
+                                    m2 = str(d.get("meaning") or "").strip()
+                                    e2 = str(d.get("example") or "").strip()
+                                    z2 = str(d.get("example_translation") or "").strip()
+                                    if e2 and not z2:
+                                        try:
+                                            z2 = await _translate_example_to_zh(e2)
+                                        except Exception:
+                                            z2 = ""
+                                    if e2 and not z2:
+                                        z2 = "暂无"
+                                    if m2 or e2 or z2:
+                                        normalized_defs.append(
+                                            {
+                                                "meaning": m2,
+                                                "example": e2,
+                                                "example_translation": z2,
+                                            }
+                                        )
                     except Exception:
-                        example_translation = example_translation or ""
+                        pass
 
-                if example and not example_translation:
-                    example_translation = "暂无"
+                # De-duplicate by meaning text.
+                deduped: list[dict[str, str]] = []
+                seen: set[str] = set()
+                for d in normalized_defs:
+                    key = (d.get("meaning") or "").strip()
+                    if not key:
+                        continue
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    deduped.append(d)
 
-                return {
-                    "meaning": meaning,
-                    "example": example,
-                    "example_translation": example_translation,
-                    "definitions": [],
-                }
+                if deduped:
+                    # Keep legacy top-level keys for backward compatibility.
+                    first = deduped[0]
+                    return {
+                        "meaning": first.get("meaning") or "",
+                        "example": first.get("example") or "",
+                        "example_translation": first.get("example_translation") or "",
+                        "definitions": deduped,
+                    }
+
+            # Legacy single-definition shape or fallback.
+            meaning = str(parsed.get("meaning") or "").strip()
+            example = str(parsed.get("example") or "").strip()
+            example_translation = str(parsed.get("example_translation") or "").strip()
+
+            if example and (not example_translation or example_translation == "暂无"):
+                try:
+                    example_translation = await _translate_example_to_zh(example)
+                except Exception:
+                    example_translation = example_translation or ""
+
+            if example and not example_translation:
+                example_translation = "暂无"
+
+            return {
+                "meaning": meaning,
+                "example": example,
+                "example_translation": example_translation,
+                "definitions": [],
+            }
     except Exception:
         return {
             "meaning": "暂无（服务暂时不可用，请稍后再试）",
@@ -677,7 +767,7 @@ async def generate_definition(term: str) -> str:
     timeout = httpx.Timeout(effective, connect=min(2.0, effective))
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
             model = await _resolve_llm_model(client, scene="vocab")
             payload: dict[str, Any] = {
                 "model": model,
@@ -752,7 +842,7 @@ async def chat_complete(
     resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
                 custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
@@ -907,7 +997,7 @@ async def chat_complete_multimodal(
     messages.append({"role": "user", "content": user_content})
 
     try:
-        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
                 resolved_model = await _resolve_llm_model(
@@ -1012,7 +1102,7 @@ async def stream_definition(term: str) -> AsyncIterator[str]:
     timeout = httpx.Timeout(settings.llm_timeout_seconds)
 
     try:
-        async with httpx.AsyncClient(base_url=settings.llm_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
             model = await _resolve_llm_model(client, scene="vocab")
             payload: dict[str, Any] = {
                 "model": model,
@@ -1074,7 +1164,7 @@ async def stream_chat(
     resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(base_url=resolved_base_url, timeout=timeout) as client:
+        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
                 custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
@@ -1240,7 +1330,7 @@ def _normalize_essay_result(obj: Any, *, ocr_text: str, language: str) -> dict[s
 async def grade_essay(*, ocr_text: str, language: str) -> dict[str, Any]:
     """作文批改：尽力调用 LLM；失败则返回可用的降级 JSON。
 
-    路由策略：云端优先，1s 内无响应则自动 fallback 到本地模型。
+    路由策略：云端优先，10s 内无响应则自动 fallback 到本地模型。
     temperature = 0.5（评分稳定性优先）。
     """
 
@@ -1258,7 +1348,7 @@ async def grade_essay(*, ocr_text: str, language: str) -> dict[str, Any]:
         content = await router.call_cloud_first_timeout(
             messages,
             temperature=0.5,
-            timeout=1.0,
+            timeout=10.0,
         )
     except Exception:
         return _fallback_essay_result(ocr_text=ocr_text, language=language)

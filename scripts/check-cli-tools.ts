@@ -137,8 +137,10 @@ async function checkCosyVoice() {
     message: 'Wrapper script exists',
   });
   
-  // 检查模型是否存在（使用实际路径）
-  const modelPath = 'E:\\models\\CosyVoice\\CosyVoice\\pretrained_models\\CosyVoice2-0.5B';
+  // 允许通过环境变量覆盖，默认使用仓库相对路径
+  const modelPath = process.env.COSYVOICE_MODEL_PATH
+    ? path.resolve(process.env.COSYVOICE_MODEL_PATH)
+    : path.resolve(__dirname, '../models/CosyVoice/CosyVoice/pretrained_models/CosyVoice2-0.5B');
   if (!fs.existsSync(modelPath)) {
     logResult({
       name: 'CosyVoice Model',

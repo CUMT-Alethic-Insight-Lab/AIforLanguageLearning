@@ -7,17 +7,12 @@ from sqlmodel import create_engine
 
 from app.db import init_db, override_engine_for_tests
 from app.main import app
+from app.settings import settings
 
 
 def _ensure_admin_exists(client: TestClient) -> None:
-    """Ensure an admin user exists for HTTP auth tests."""
-    r = client.post(
-        "/api/auth/register",
-        json={"username": "admin", "email": "admin@example.com", "password": "Admin1234"},
-    )
-    # If the user already exists, the register endpoint returns success=False;
-    # we can safely ignore that as long as the user is present for login.
-    assert r.status_code == 200
+    """The database bootstrap owns the configured admin account."""
+    assert settings.seed_admin_enabled is True
 
 
 def test_auth_login_admin_ok(tmp_path: Path) -> None:
@@ -28,7 +23,13 @@ def test_auth_login_admin_ok(tmp_path: Path) -> None:
 
     client = TestClient(app)
     _ensure_admin_exists(client)
-    resp = client.post("/api/auth/login", json={"username": "admin", "password": "Admin1234"})
+    resp = client.post(
+        "/api/auth/login",
+        json={
+            "username": settings.seed_admin_username,
+            "password": settings.seed_admin_password,
+        },
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["success"] is True
@@ -38,7 +39,7 @@ def test_auth_login_admin_ok(tmp_path: Path) -> None:
     assert data.get("accessToken")
     assert isinstance(data.get("user"), dict)
     assert isinstance(data["user"].get("id"), int)
-    assert data["user"]["username"] == "admin"
+    assert data["user"]["username"] == settings.seed_admin_username
 
 
 def test_auth_login_rejects_wrong_password(tmp_path: Path) -> None:

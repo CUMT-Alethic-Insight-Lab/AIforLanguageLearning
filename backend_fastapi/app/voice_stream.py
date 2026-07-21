@@ -4,9 +4,8 @@ import asyncio
 import base64
 import os
 import time
-import warnings
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from dataclasses import dataclass
+from typing import Callable, Optional
 
 
 @dataclass
@@ -75,6 +74,9 @@ class VoiceStream:
                 self._buffer.extend(raw)
                 self._feed_vad_locked(raw)
             return len(self._buffer)
+
+    def set_transcriber(self, transcriber: Optional[Callable[[bytes, VoiceStreamConfig], str]]) -> None:
+        self._transcriber = transcriber
 
     def vad_should_finalize(self) -> bool:
         return bool(self._vad_should_finalize)
@@ -178,6 +180,7 @@ def try_create_seamless_transcriber(
     model_name: str = "medium",
     device: str = "cpu",
     compute_type: str = "int8",
+    local_files_only: bool = True,
 ) -> Optional[Callable[[bytes, VoiceStreamConfig], str]]:
     """SeamlessM4T ASR 适配（未安装则返回 None）。
 
@@ -202,14 +205,32 @@ def try_create_seamless_transcriber(
     }
     model_id = _MODEL_MAP.get(model_name, model_name)
 
-    # 加载处理器和模型
-    processor = AutoProcessor.from_pretrained(model_id)
-    dtype = torch.float16 if compute_type == "float16" and device != "cpu" else torch.float32
-    model = AutoModelForSpeechSeq2Seq.from_pretrained(
-        model_id,
-        dtype=dtype,
-        device_map=device if device != "cpu" else None,
-    )
+    # 加载处理器和模型。离线/缺模型时快速返回 None，让上层立刻降级。
+    offline_env_backup: dict[str, str | None] = {}
+    if local_files_only:
+        for key in ("HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE"):
+            offline_env_backup[key] = os.environ.get(key)
+            os.environ[key] = "1"
+
+    try:
+        try:
+            processor = AutoProcessor.from_pretrained(model_id, local_files_only=local_files_only)
+            dtype = torch.float16 if compute_type == "float16" and device != "cpu" else torch.float32
+            model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                model_id,
+                dtype=dtype,
+                device_map=device if device != "cpu" else None,
+                local_files_only=local_files_only,
+            )
+        except Exception:
+            return None
+    finally:
+        if local_files_only:
+            for key, old_value in offline_env_backup.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
     if device == "cpu":
         model = model.to("cpu")
     model.eval()
@@ -331,7 +352,7 @@ def try_create_seamless_transcriber(
         with model_lock:
             # 处理音频输入
             inputs = processor(
-                audios=audio_f32,
+                audio=audio_f32,
                 sampling_rate=cfg.sample_rate or 16000,
                 return_tensors="pt",
             )
@@ -345,7 +366,6 @@ def try_create_seamless_transcriber(
                 output_tokens = model.generate(
                     **inputs,
                     tgt_lang=src_lang,
-                    generate_speech=False,
                 )
 
             text = processor.decode(output_tokens[0].tolist(), skip_special_tokens=True)

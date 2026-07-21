@@ -10,10 +10,8 @@ from app.model_router import (
     ModelEndpoint,
     ModelProvider,
     ModelRouter,
-    RoutingDecision,
     SceneType,
     _normalize_expanded_system_prompt,
-    get_model_router,
 )
 from app.token_utils import (
     approximate_token_count,
@@ -270,8 +268,14 @@ class TestIntegration:
         
         # 添加大量消息触发压缩
         for i in range(50):
-            ctx.add_message("user", f"This is a long message number {i} with many words to increase token count")
-            ctx.add_message("assistant", f"This is a detailed response number {i} with even more words to consume tokens")
+            ctx.add_message(
+                "user",
+                f"This is a long message number {i} with many words to increase token count",
+            )
+            ctx.add_message(
+                "assistant",
+                f"This is a detailed response number {i} with even more words to consume tokens",
+            )
         
         # 手动设置低阈值触发压缩
         ctx.max_tokens = 100

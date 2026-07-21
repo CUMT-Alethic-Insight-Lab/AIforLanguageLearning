@@ -1,9 +1,15 @@
 <#
-AI 外语学习系统 - 快速启动脚本 (v2.0)
+AI 外语学习系统 - 快速启动脚本 (v2.1)
 
 支持两种模式：
 1. 开发模式（默认）：启动 FastAPI + Vite 开发服务器
 2. Portable 模式（-Portable）：启动 FastAPI + 已打包的 Electron Portable 版本
+
+已适配模块：
+- 词汇模块 (/v1/vocab/*)
+- 作文模块 (/v1/essays/*, WebSocket /ws/v1)
+- 语音对话 (WebSocket /ws/v1, ASR→LLM→TTS 全链路)
+- 智能助教 (WebSocket /api/v1/realtime-assistant/ws, OCR→LLM→TTS)
 
 原则：控制台输出必须与实际状态一致。
 - 只有在端口监听 / HTTP 健康检查通过后才打印 ✓
@@ -452,5 +458,6 @@ Write-Host ("=" * 60) -ForegroundColor Cyan
 Write-Host "`n服务地址：" -ForegroundColor White
 Write-Host "  • 后端 API:    http://127.0.0.1:$BackendPort" -ForegroundColor White
 Write-Host "  • 前端页面:    $frontendUrl" -ForegroundColor White
-Write-Host "  • WebSocket:   ws://127.0.0.1:$BackendPort/ws/v1" -ForegroundColor White
+Write-Host "  • WebSocket (语音对话): ws://127.0.0.1:$BackendPort/ws/v1" -ForegroundColor White
+Write-Host "  • WebSocket (智能助教): ws://127.0.0.1:$BackendPort/api/v1/realtime-assistant/ws" -ForegroundColor White
 Write-Host "`n提示：本脚本不会强制杀进程；如需停止服务，请关闭各自的新窗口。" -ForegroundColor Gray

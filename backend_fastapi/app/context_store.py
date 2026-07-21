@@ -1,20 +1,24 @@
-"""上下文存储模块 - 提供对话上下文的持久化存储
+"""上下文存储模块（已废弃，不在主链路中使用）
 
-支持：
-- SQLite持久化（默认）
-- Redis支持（可选）
-- 自动保存和恢复
+⚠️  WARNING: 此模块不被任何主链路代码 import，属于死代码。
+    SQLiteContextStore.save() 写入 type="MESSAGE" 事件，
+    WS handler 的 get_all_chat_history_from_events() 只读取
+    USER_MESSAGE / AI_MESSAGE / ASR_FINAL / LLM_RESULT 类型，
+    两者完全不通。保留仅供参考，请勿在新功能中使用。
 """
 
 from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sqlmodel import Session, select
 
 from .db import get_engine
+
+if TYPE_CHECKING:
+    from .model_router import ConversationContext
 
 logger = logging.getLogger(__name__)
 

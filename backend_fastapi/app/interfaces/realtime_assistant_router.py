@@ -8,7 +8,6 @@
 
 from __future__ import annotations
 
-import base64
 import json
 import logging
 from typing import Any
@@ -37,7 +36,8 @@ async def realtime_assistant_ws(websocket: WebSocket) -> None:
     - {"type": "heartbeat"}
 
     后端响应：
-    - {"type": "suggestion", "priority": "high|medium|low", "content": "...", "has_audio": true, "audio_base64": "...", "audio_format": "wav"}
+    - {"type": "suggestion", "priority": "high|medium|low", "content": "...",
+       "has_audio": true, "audio_base64": "...", "audio_format": "wav"}
     - {"type": "ack", "event_type": "..."}
     - {"type": "error", "message": "..."}
     """
@@ -100,6 +100,20 @@ async def realtime_assistant_ws(websocket: WebSocket) -> None:
 
             elif event_type == "heartbeat":
                 response = {"type": "ack", "event_type": "heartbeat"}
+
+            elif event_type == "barge_in":
+                # 教师打断当前 TTS 播报
+                spoken_bytes = int(event.get("spoken_bytes", 0))
+                total_bytes = int(event.get("total_bytes", 0))
+                session.on_barge_in(spoken_bytes, total_bytes)
+                response = {"type": "ack", "event_type": "barge_in"}
+
+            elif event_type == "tts_progress":
+                # 前端上报 TTS 播报进度
+                sent_bytes = int(event.get("sent_bytes", 0))
+                total_bytes = int(event.get("total_bytes", 0))
+                session.on_tts_progress(sent_bytes, total_bytes)
+                response = {"type": "ack", "event_type": "tts_progress"}
 
             else:
                 # 透传未知事件（兼容未来扩展）

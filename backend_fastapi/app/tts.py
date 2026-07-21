@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import io
-import os
-import tempfile
 import threading
 import wave
 
@@ -95,42 +93,57 @@ def _get_kokoro_pipeline():
         if _kokoro_pipeline is not None:
             return _kokoro_pipeline
 
+        # Try original kokoro first, fallback to kokoro-onnx
         try:
             from kokoro import KPipeline  # type: ignore
+            _kokoro_pipeline = ("original", KPipeline(lang_code=(settings.kokoro_lang_code or "a").strip() or "a"))
+            return _kokoro_pipeline
         except ImportError:
-            raise ImportError("kokoro not installed; run: pip install kokoro>=0.9.2")
+            pass
 
-        lang_code = (settings.kokoro_lang_code or "a").strip() or "a"
-        pipeline = KPipeline(lang_code=lang_code)
-        _kokoro_pipeline = pipeline
-        return pipeline
+        try:
+            import os
+
+            from kokoro_onnx import Kokoro  # type: ignore
+
+            model_dir = os.path.join(os.path.dirname(__file__), "..", "data", "models", "kokoro")
+            model_path = os.path.join(model_dir, "onnx", "model.onnx")
+            voices_path = os.path.join(model_dir, "voices", "voices.npy")
+            if not os.path.exists(model_path) or not os.path.exists(voices_path):
+                raise ImportError(f"Kokoro ONNX model not found at {model_dir}")
+            _kokoro_pipeline = ("onnx", Kokoro(model_path, voices_path))
+            return _kokoro_pipeline
+        except ImportError as e:
+            raise ImportError(f"kokoro not installed and kokoro-onnx unavailable: {e}")
 
 
 def _synthesize_kokoro_wav(text: str) -> bytes:
     """Kokoro TTS -> WAV bytes.
 
     82M params, CPU real-time, high quality English TTS.
-    Uses the KPipeline API for phoneme-based generation.
+    Supports both original kokoro (KPipeline) and kokoro-onnx.
     """
 
-    pipeline = _get_kokoro_pipeline()
+    backend, pipeline = _get_kokoro_pipeline()
     voice = (settings.kokoro_voice or "af_bella").strip() or "af_bella"
     speed = float(settings.kokoro_speed or 1.0)
 
-    # KPipeline returns generator of (graphemes, phonemes, audio_np_array)
     import numpy as np  # type: ignore
 
-    audio_chunks: list = []
-    sample_rate = 24000  # Kokoro default
-
-    for _graphemes, _phonemes, audio in pipeline(text or "", voice=voice, speed=speed):
-        if audio is not None and len(audio) > 0:
-            audio_chunks.append(audio)
-
-    if not audio_chunks:
-        raise RuntimeError("Kokoro produced no audio")
-
-    combined = np.concatenate(audio_chunks)
+    if backend == "original":
+        # Original kokoro KPipeline API
+        audio_chunks: list = []
+        sample_rate = 24000
+        for _graphemes, _phonemes, audio in pipeline(text or "", voice=voice, speed=speed):
+            if audio is not None and len(audio) > 0:
+                audio_chunks.append(audio)
+        if not audio_chunks:
+            raise RuntimeError("Kokoro produced no audio")
+        combined = np.concatenate(audio_chunks)
+    else:
+        # kokoro-onnx API
+        audio, sample_rate = pipeline.create(text or "", voice=voice, speed=speed)
+        combined = audio.squeeze() if audio.ndim > 1 else audio
 
     # Convert float32 [-1, 1] to int16 PCM
     pcm = (combined * 32767).astype(np.int16)
@@ -139,7 +152,7 @@ def _synthesize_kokoro_wav(text: str) -> bytes:
     with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
         wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
+        wf.setframerate(int(sample_rate))
         wf.writeframes(pcm.tobytes())
 
     return buf.getvalue()
@@ -195,6 +208,5 @@ def _synthesize_edge_wav(text: str) -> bytes:
 
         logging.getLogger(__name__).warning("pydub not installed; cannot convert Edge TTS MP3 to WAV. Install: pip install pydub")
         raise RuntimeError("pydub required for Edge TTS MP3->WAV conversion")
-
 
 

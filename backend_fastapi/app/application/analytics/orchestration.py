@@ -7,7 +7,7 @@ packing, RAG indexing, and retrieval in one place for analytics workflows.
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
 from sqlmodel import Session, select
@@ -18,12 +18,14 @@ from ...domain.analytics.models import (
     StudentDailySummary,
     StudentLongitudinalSummary,
 )
-from ...domain.models import LearningRecord, StudentProfile
+from ...domain.classroom.models import ClassEnrollment, Classroom
+from ...domain.models import LearningRecord, StudentProfile, VocabularyItem
 from ...infrastructure.persistence.search.analytics_rag import (
     index_analytics_document,
     search_analytics_documents,
 )
-from ...llm import chat_complete, chat_complete_cloud_first
+from ...llm import chat_complete_cloud_first
+from ...models import ConversationEvent, EssaySubmission, UserVocabQuery
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +51,78 @@ METRIC_LABELS = {
 
 
 def resolve_class_id_for_user(session: Session, user_id: int) -> str | None:
-    profile = session.exec(select(StudentProfile).where(StudentProfile.user_id == user_id)).first()
+    """Return the best-known class_id (as str) for *user_id*.
+
+    Resolution priority:
+    1. **ClassEnrollment** (new) — query ``class_enrollments`` for this student.
+       - Exactly one enrollment → ``str(classroom_id)``.
+       - Multiple enrollments → the most recent enrollment (by ``id DESC``,
+         which approximates latest-joined when ``joined_at`` timestamps are
+         close or identical).
+    2. **StudentProfile.class_id** (legacy fallback) — only used when the
+       student has no ``ClassEnrollment`` rows (e.g. data pre-dating the
+       classroom model migration).
+    """
+    # ── 1. ClassEnrollment (new digital classroom) ──────────────────────
+    enrollments = session.exec(
+        select(ClassEnrollment)
+        .where(ClassEnrollment.student_id == user_id)
+        .order_by(ClassEnrollment.id.desc())  # latest enrollment first
+    ).all()
+
+    if len(enrollments) == 1:
+        return str(enrollments[0].classroom_id)
+    if len(enrollments) > 1:
+        return str(enrollments[0].classroom_id)  # id desc → most recent
+
+    # ── 2. Legacy fallback: StudentProfile.class_id (string) ────────────
+    profile = session.exec(
+        select(StudentProfile).where(StudentProfile.user_id == user_id)
+    ).first()
     return profile.class_id if profile else None
 
 
 def get_class_user_ids(session: Session, class_id: str) -> list[int]:
+    """Return user ids belonging to *class_id*.
+
+    Resolution:
+    1. If *class_id* is a pure digit string (e.g. ``"1"``, ``"42"``),
+       treat it as a ``Classroom.id`` and resolve students via
+       ``ClassEnrollment``.
+    2. Otherwise (legacy ``"class_101"`` style) fall back to
+       ``StudentProfile.class_id``.
+    3. If the ClassEnrollment path returns zero students, also try the
+       legacy fallback (the classroom may exist but have no enrollments
+       yet — e.g. during migration).
+    """
+    # ── 1. Try numeric classroom_id → ClassEnrollment ──────────────────
+    numeric_id: int | None = None
+    try:
+        numeric_id = int(class_id)
+    except (ValueError, TypeError):
+        pass
+
+    if numeric_id is not None:
+        enrollment_rows = session.exec(
+            select(ClassEnrollment).where(
+                ClassEnrollment.classroom_id == numeric_id,
+                ClassEnrollment.role == "student",
+            )
+        ).all()
+        # Once a canonical Classroom row exists, its enrollment table is the
+        # authority even when the roster is empty. Falling back to a legacy
+        # profile whose text class_id happens to match would leak non-members
+        # into the teacher's dashboard.
+        if enrollment_rows or session.get(Classroom, numeric_id) is not None:
+            return sorted({e.student_id for e in enrollment_rows})
+
+    # ── 2. Legacy fallback: StudentProfile.class_id ────────────────────
     profiles = list(
-        session.exec(select(StudentProfile).where(StudentProfile.class_id == class_id))
+        session.exec(
+            select(StudentProfile).where(StudentProfile.class_id == class_id)
+        )
     )
-    return [p.user_id for p in profiles]
+    return sorted({p.user_id for p in profiles})
 
 
 def get_class_summaries(
@@ -72,11 +137,93 @@ def get_class_summaries(
     stmt = (
         select(StudentDailySummary)
         .where(StudentDailySummary.user_id.in_(user_ids))
+        .where(StudentDailySummary.class_id == class_id)
         .where(StudentDailySummary.summary_date >= start_date)
         .where(StudentDailySummary.summary_date <= end_date)
         .order_by(StudentDailySummary.summary_date, StudentDailySummary.user_id)
     )
     return list(session.exec(stmt))
+
+
+_ACTIVITY_COUNT_KEYS = (
+    "vocab_count",
+    "essay_count",
+    "event_count",
+    "query_count",
+    "record_count",
+)
+
+
+def summary_has_learning_activity(summary: StudentDailySummary) -> bool:
+    """Return whether a daily summary contains source learning activity.
+
+    New summaries persist source counters in ``raw_snapshot``. Older summaries
+    predate those counters, so their existence remains an activity signal for
+    backward compatibility. A generated summary with all known counters at
+    zero is an analysis result, but not an active-student signal.
+    """
+    raw = summary.raw_snapshot or {}
+    present_counts = [raw[key] for key in _ACTIVITY_COUNT_KEYS if key in raw]
+    if not present_counts:
+        return True
+    return any(isinstance(value, (int, float)) and value > 0 for value in present_counts)
+
+
+def _get_active_class_user_ids(
+    session: Session,
+    enrolled_user_ids: set[int],
+    target_date: date,
+) -> set[int]:
+    if not enrolled_user_ids:
+        return set()
+
+    day_start = datetime.combine(target_date, datetime.min.time())
+    day_end = day_start + timedelta(days=1)
+    sources = (
+        (VocabularyItem, VocabularyItem.user_id, VocabularyItem.created_at),
+        (EssaySubmission, EssaySubmission.user_id, EssaySubmission.created_at),
+        (ConversationEvent, ConversationEvent.user_id, ConversationEvent.created_at),
+        (UserVocabQuery, UserVocabQuery.user_id, UserVocabQuery.created_at),
+        (LearningRecord, LearningRecord.user_id, LearningRecord.created_at),
+    )
+    active_user_ids: set[int] = set()
+    for model, user_column, created_column in sources:
+        rows = session.exec(
+            select(user_column)
+            .select_from(model)
+            .where(user_column.in_(enrolled_user_ids))
+            .where(created_column >= day_start)
+            .where(created_column < day_end)
+        ).all()
+        active_user_ids.update(int(user_id) for user_id in rows)
+    return active_user_ids
+
+
+def get_class_population_counts(
+    session: Session,
+    class_id: str,
+    target_date: date,
+) -> dict[str, int]:
+    """Return non-overlapping class population semantics for one day.
+
+    ``enrolled_students`` is the class roster. ``active_students`` counts
+    roster members with source learning activity that day. ``analyzed_students``
+    counts roster members with a class-scoped daily summary, including summaries
+    generated for an otherwise inactive day.
+    """
+    enrolled_user_ids = set(get_class_user_ids(session, class_id))
+    summaries = get_class_summaries(session, class_id, target_date, target_date)
+    analyzed_user_ids = {summary.user_id for summary in summaries}
+    active_user_ids = _get_active_class_user_ids(session, enrolled_user_ids, target_date)
+    active_user_ids.update(
+        summary.user_id for summary in summaries if summary_has_learning_activity(summary)
+    )
+    return {
+        "total_students": len(enrolled_user_ids),
+        "enrolled_students": len(enrolled_user_ids),
+        "active_students": len(active_user_ids),
+        "analyzed_students": len(analyzed_user_ids),
+    }
 
 
 def _avg(values: list[float | int | None]) -> float | None:
@@ -138,7 +285,11 @@ def _risk_flags(
     grammar_delta = deltas.get("grammar_error_decay_slope", {}).get("delta")
     if isinstance(grammar_delta, (int, float)) and grammar_delta < 0:
         flags.append("语法表现近期回落")
-    unresolved = [item for item in interventions if item.get("status") not in {"resolved", "dismissed"}]
+    unresolved = [
+        item
+        for item in interventions
+        if item.get("status") not in {"resolved", "dismissed"}
+    ]
     if len(unresolved) >= 2:
         flags.append("历史干预任务仍未闭环")
     return flags[:6]
@@ -230,7 +381,10 @@ async def _index_student_summary(summary: StudentLongitudinalSummary) -> None:
             "tags": summary.risk_flags + summary.strength_flags,
             "created_at": summary.updated_at.isoformat(),
         },
-        doc_id=f"student-longitudinal-{summary.user_id}-{summary.class_id or 'none'}-{summary.window_start}-{summary.window_end}",
+        doc_id=(
+            f"student-longitudinal-{summary.user_id}-{summary.class_id or 'none'}-"
+            f"{summary.window_start}-{summary.window_end}"
+        ),
     )
 
 
@@ -246,7 +400,9 @@ async def generate_student_longitudinal_summary(
     if end_date is None:
         end_date = date.today() - timedelta(days=1)
     start_date = end_date - timedelta(days=max(window_days - 1, 0))
-    resolved_class_id = class_id if class_id is not None else resolve_class_id_for_user(session, user_id)
+    resolved_class_id = (
+        class_id if class_id is not None else resolve_class_id_for_user(session, user_id)
+    )
 
     existing = session.exec(
         select(StudentLongitudinalSummary)
@@ -259,15 +415,15 @@ async def generate_student_longitudinal_summary(
     if existing and not force:
         return existing
 
-    summaries = list(
-        session.exec(
-            select(StudentDailySummary)
-            .where(StudentDailySummary.user_id == user_id)
-            .where(StudentDailySummary.summary_date >= start_date)
-            .where(StudentDailySummary.summary_date <= end_date)
-            .order_by(StudentDailySummary.summary_date)
-        )
+    summary_stmt = (
+        select(StudentDailySummary)
+        .where(StudentDailySummary.user_id == user_id)
+        .where(StudentDailySummary.summary_date >= start_date)
+        .where(StudentDailySummary.summary_date <= end_date)
     )
+    if resolved_class_id is not None:
+        summary_stmt = summary_stmt.where(StudentDailySummary.class_id == resolved_class_id)
+    summaries = list(session.exec(summary_stmt.order_by(StudentDailySummary.summary_date)))
     latest = summaries[-1] if summaries else None
     resolved_class_id = resolved_class_id or (latest.class_id if latest else None)
     deltas = _metric_deltas(summaries)
@@ -339,7 +495,7 @@ async def generate_student_longitudinal_summary(
         "interventions": interventions,
         "days_with_summary": len(summaries),
     }
-    record.updated_at = datetime.utcnow()
+    record.updated_at = datetime.now(UTC)
     session.add(record)
     session.flush()
     await _index_student_summary(record)
@@ -388,7 +544,7 @@ async def upsert_analytics_artifact(
     artifact.content = content
     artifact.evidence = evidence or []
     artifact.meta_data = meta_data or {}
-    artifact.updated_at = datetime.utcnow()
+    artifact.updated_at = datetime.now(UTC)
     session.add(artifact)
     session.flush()
     await index_analytics_document(
@@ -433,7 +589,9 @@ async def search_analytics_evidence(
     docs: list[dict[str, Any]] = []
     requested = set(artifact_types or [])
     if not requested or "student_longitudinal_summary" in requested:
-        stmt = select(StudentLongitudinalSummary).order_by(StudentLongitudinalSummary.updated_at.desc())
+        stmt = select(StudentLongitudinalSummary).order_by(
+            StudentLongitudinalSummary.updated_at.desc()
+        )
         if class_id:
             stmt = stmt.where(StudentLongitudinalSummary.class_id == class_id)
         if user_id is not None:
@@ -457,7 +615,11 @@ async def search_analytics_evidence(
         if user_id is not None:
             stmt = stmt.where(AnalyticsArtifact.user_id == user_id)
         if requested:
-            stmt = stmt.where(AnalyticsArtifact.artifact_type.in_(list(requested - {"student_longitudinal_summary"})))
+            stmt = stmt.where(
+                AnalyticsArtifact.artifact_type.in_(
+                    list(requested - {"student_longitudinal_summary"})
+                )
+            )
         for row in list(session.exec(stmt))[: max(0, size - len(docs))]:
             docs.append(
                 {
@@ -482,6 +644,7 @@ async def generate_class_window_analysis(
 ) -> AnalyticsArtifact:
     start_date = target_date - timedelta(days=max(window_days - 1, 0))
     summaries = get_class_summaries(session, class_id, start_date, target_date)
+    population = get_class_population_counts(session, class_id, target_date)
     user_ids = sorted({s.user_id for s in summaries})
     latest_by_student: dict[int, StudentDailySummary] = {}
     for summary in summaries:
@@ -527,7 +690,10 @@ async def generate_class_window_analysis(
     prompt = (
         f"班级ID: {class_id}\n"
         f"分析窗口: {start_date} 至 {target_date}\n"
-        f"班级人数: {len(user_ids)}\n"
+        f"花名册人数: {population['enrolled_students']}\n"
+        f"当天活跃人数: {population['active_students']}\n"
+        f"当天有分析结果人数: {population['analyzed_students']}\n"
+        f"窗口内有分析结果人数: {len(user_ids)}\n"
         f"风险人数: {risk_count}\n"
         f"词汇均值: {avg_vocab}\n"
         f"语法均值: {avg_grammar}\n"
@@ -546,7 +712,8 @@ async def generate_class_window_analysis(
     if "网络不太稳定" in content:
         content = (
             f"{class_id} 班级近{window_days}天整体状态已完成客观聚合。"
-            f"当前风险人数约 {risk_count}，近期主题集中在 {('、'.join(topics[:4]) or '常规学习活动')}。"
+            f"当前风险人数约 {risk_count}，近期主题集中在 "
+            f"{('、'.join(topics[:4]) or '常规学习活动')}。"
         )
 
     return await upsert_analytics_artifact(
@@ -563,7 +730,13 @@ async def generate_class_window_analysis(
         meta_data={
             "window_days": window_days,
             "risk_count": risk_count,
+            # Backward compatibility: historically this meant students with
+            # summaries in the analysis window, not the class roster.
             "student_count": len(user_ids),
+            "enrolled_students": population["enrolled_students"],
+            "active_students": population["active_students"],
+            "analyzed_students": population["analyzed_students"],
+            "window_analyzed_students": len(user_ids),
             "topics": topics,
             "tags": ["class_window_analysis", "teacher_dashboard"],
         },

@@ -13,8 +13,8 @@
 
 from __future__ import annotations
 
-from .client import get_neo4j_client, Neo4jClient
-from .models import WordRelation, WordNode, RecommendationResult, RelationType
+from .client import Neo4jClient, get_neo4j_client
+from .models import RecommendationResult, RelationType, WordNode, WordRelation
 from .service import KnowledgeGraphService, get_kg_service
 
 __all__ = [

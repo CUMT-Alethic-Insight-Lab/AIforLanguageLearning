@@ -5,6 +5,7 @@
  */
 
 import api from './api';
+import { getDefaultBackendUrl, getDefaultBackendWsHost, normalizeBackendUrl, normalizeBackendWsHost } from './backend-url';
 
 /**
  * 应用配置接口定义
@@ -72,25 +73,8 @@ export interface SystemConfig {
 function normalizeConfig(cfg: AppConfig): AppConfig {
   const next = { ...cfg, backend: { ...cfg.backend } }
 
-  const rawUrl = String(next.backend?.url || '').trim()
-  let url = rawUrl
-  if (url && !/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(url)) {
-    url = `http://${url}`
-  }
-  url = url.replace(/\/$/, '')
-  url = url.replace('http://localhost:8011', 'http://localhost:8012')
-  url = url.replace('http://127.0.0.1:8011', 'http://127.0.0.1:8012')
-  url = url.replace('http://localhost:8000', 'http://localhost:8012')
-  url = url.replace('http://127.0.0.1:8000', 'http://127.0.0.1:8012')
-  next.backend.url = url
-
-  const rawWs = String(next.backend?.wsUrl || '').trim()
-  let wsUrl = rawWs.replace(/^wss?:\/\//, '')
-  wsUrl = wsUrl.replace('localhost:8011', 'localhost:8012')
-  wsUrl = wsUrl.replace('127.0.0.1:8011', '127.0.0.1:8012')
-  wsUrl = wsUrl.replace('localhost:8000', 'localhost:8012')
-  wsUrl = wsUrl.replace('127.0.0.1:8000', '127.0.0.1:8012')
-  next.backend.wsUrl = wsUrl
+  next.backend.url = normalizeBackendUrl(next.backend?.url)
+  next.backend.wsUrl = normalizeBackendWsHost(next.backend?.wsUrl || next.backend.url)
 
   return next
 }
@@ -126,7 +110,7 @@ export const ConfigService = {
       general: { theme: 'dark', language: 'zh-CN', autoUpdate: true },
       audio: { inputDevice: 'default', outputDevice: 'default', volume: 80 },
       ai: { model: 'local-model', temperature: 0.7, voice: 'alloy' },
-      backend: { url: 'http://localhost:8012', wsUrl: 'localhost:8012' }
+      backend: { url: getDefaultBackendUrl(), wsUrl: getDefaultBackendWsHost() }
     };
 
     // 本地缓存（用于 api.ts 动态 baseURL 等）

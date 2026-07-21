@@ -12,7 +12,7 @@ from sqlmodel import Session, select
 
 from ...db import get_engine
 from ...domain.analytics.models import AnalyticsArtifact, ClassDailySnapshot, StudentDailySummary
-from ...llm import chat_complete, chat_complete_cloud_first
+from ...llm import chat_complete_cloud_first
 from .orchestration import (
     generate_class_window_analysis,
     generate_student_longitudinal_summary,

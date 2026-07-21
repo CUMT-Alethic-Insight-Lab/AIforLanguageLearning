@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any
 
@@ -36,18 +37,32 @@ class ESClient:
     def __init__(self, hosts: list[str] | None = None):
         self.hosts = hosts or ["http://localhost:9200"]
         self._client: AsyncElasticsearch | None = None
+        self._loop_id: int | None = None
 
     async def connect(self) -> AsyncElasticsearch:
         if not ELASTICSEARCH_AVAILABLE:
             raise RuntimeError("elasticsearch package is not installed")
-        if self._client is None:
-            self._client = AsyncElasticsearch(self.hosts)
+        current_loop_id = id(asyncio.get_running_loop())
+        if self._client is None or self._loop_id != current_loop_id:
+            if self._client is not None:
+                try:
+                    await self._client.close()
+                except Exception:
+                    pass
+            self._client = AsyncElasticsearch(
+                self.hosts,
+                request_timeout=2,
+                retry_on_timeout=False,
+                max_retries=0,
+            )
+            self._loop_id = current_loop_id
         return self._client
 
     async def close(self) -> None:
         if self._client is not None:
             await self._client.close()
             self._client = None
+            self._loop_id = None
 
     @property
     def client(self) -> AsyncElasticsearch | None:

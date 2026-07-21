@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import logging
 import re
@@ -25,12 +26,11 @@ logger = logging.getLogger(__name__)
 
 from .context_store import get_context_store
 from .prompts import render_prompt
-from .retry_utils import RETRY_CONFIG_LLM_API, retry_async
-from .runtime_config import get_runtime_config, get_scene_model, update_runtime_config
+from .retry_utils import RETRY_CONFIG_LLM_API
+from .runtime_config import get_runtime_config
 from .settings import settings
 from .token_utils import (
     compress_messages,
-    count_messages_tokens,
     count_tokens,
 )
 
@@ -82,65 +82,121 @@ class ConversationMessage:
 
 @dataclass
 class ConversationContext:
-    """对话上下文"""
+    """对话上下文 - 支持分层记忆（短期消息 + 长期记忆点）"""
     conversation_id: str
     session_id: str
     messages: list[ConversationMessage] = field(default_factory=list)
     max_messages: int = 20  # 保留最近20轮
     max_tokens: int = 4000  # 上下文Token上限
     token_threshold: float = 0.8  # 80%触发摘要
-    
+    # 分层记忆
+    memory_points: list[str] = field(default_factory=list)  # 长期记忆点
+    _collapsed_summary: str = ""  # 已折叠的旧对话摘要
+    _collapse_threshold: int = 10  # 超过此轮数触发折叠
+
     def add_message(self, role: str, content: str, token_count: int = 0) -> None:
-        """添加消息，维护滑动窗口"""
-        # 如果没有提供token_count，自动计算
+        """添加消息，维护滑动窗口，并在必要时折叠旧消息"""
         if token_count == 0 and content:
             token_count = count_tokens(content)
-        
+
         msg = ConversationMessage(
             role=role,
             content=content,
             token_count=token_count
         )
         self.messages.append(msg)
-        
-        # 保留最近N轮 (每轮 = user + assistant)
+
+        # 分层折叠：非 system 消息超过阈值时，将中间轮次折叠为 summary
+        self._maybe_collapse()
+
+        # 硬上限保护：保留最近N轮
         max_total = self.max_messages * 2
-        if len(self.messages) > max_total:
-            # 保留system消息和最近的消息
+        non_system = [m for m in self.messages if m.role != "system"]
+        if len(non_system) > max_total:
             system_msgs = [m for m in self.messages if m.role == "system"]
-            other_msgs = [m for m in self.messages if m.role != "system"]
-            other_msgs = other_msgs[-(max_total - len(system_msgs)):]
-            self.messages = system_msgs + other_msgs
-    
+            # 保留最近的 max_total 条非 system 消息
+            keep_non_system = non_system[-max_total:]
+            self.messages = system_msgs + keep_non_system
+
+    def _maybe_collapse(self) -> None:
+        """当非 system 消息轮数超过阈值时，将旧消息折叠为摘要占位。"""
+        non_system = [m for m in self.messages if m.role != "system"]
+        if len(non_system) <= self._collapse_threshold:
+            return
+
+        # 将最早的几轮（保留最近 threshold 轮）折叠
+        to_fold = non_system[: -(self._collapse_threshold)]
+        if len(to_fold) < 4:
+            return  # 太少不折叠
+
+        # 生成轻量级摘要（用户输入的前 30 字 + 助手回复的前 30 字）
+        summary_parts: list[str] = []
+        for i in range(0, len(to_fold) - 1, 2):
+            user_msg = to_fold[i]
+            assistant_msg = to_fold[i + 1] if i + 1 < len(to_fold) else None
+            if user_msg.role == "user":
+                user_preview = user_msg.content[:30].replace("\n", " ")
+                if assistant_msg and assistant_msg.role == "assistant":
+                    assistant_preview = assistant_msg.content[:30].replace("\n", " ")
+                    summary_parts.append(f"[用户]{user_preview}... → [助手]{assistant_preview}...")
+                else:
+                    summary_parts.append(f"[用户]{user_preview}...")
+
+        if summary_parts:
+            self._collapsed_summary = "此前对话摘要：" + " | ".join(summary_parts)
+
+        # 从 messages 中移除已折叠的消息，替换为单条 summary
+        keep = [m for m in self.messages if m.role == "system" or m not in to_fold]
+        # 在 system 之后插入 summary
+        system_msgs = [m for m in keep if m.role == "system"]
+        rest = [m for m in keep if m.role != "system"]
+        if self._collapsed_summary:
+            summary_msg = ConversationMessage(
+                role="system",
+                content=f"[对话历史摘要] {self._collapsed_summary}",
+                token_count=count_tokens(self._collapsed_summary),
+            )
+            self.messages = system_msgs + [summary_msg] + rest
+        else:
+            self.messages = system_msgs + rest
+
+    def add_memory_point(self, point: str) -> None:
+        """添加长期记忆点（如用户偏好、关键事实）"""
+        p = (point or "").strip()
+        if p and p not in self.memory_points:
+            self.memory_points.append(p)
+
+    def get_enhanced_system_prompt(self, base_prompt: str = "") -> str:
+        """将记忆点合并到 system prompt 中"""
+        if not self.memory_points:
+            return base_prompt
+        memory_section = "\n\n【已记住的信息】\n" + "\n".join(f"- {p}" for p in self.memory_points)
+        if base_prompt:
+            return base_prompt + memory_section
+        return memory_section.lstrip()
+
     def get_total_tokens(self) -> int:
         """获取总Token数"""
         return sum(m.token_count for m in self.messages)
-    
+
     def should_compress(self) -> bool:
         """判断是否需要压缩上下文"""
         return self.get_total_tokens() > self.max_tokens * self.token_threshold
-    
+
     def compress_if_needed(self) -> bool:
-        """
-        如果需要，压缩上下文
-        
-        Returns:
-            bool: 是否进行了压缩
-        """
+        """如果需要，压缩上下文"""
         if not self.should_compress():
             return False
-        
-        # 转换为OpenAI格式并压缩
+
         messages = self.to_openai_messages()
         compressed = compress_messages(messages, self.max_tokens)
-        
-        # 重建消息列表
+
         self.messages = []
         for msg in compressed:
             self.add_message(msg["role"], msg["content"])
-        
+
         return True
-    
+
     def to_openai_messages(self) -> list[dict[str, str]]:
         """转换为OpenAI格式"""
         return [{"role": m.role, "content": m.content} for m in self.messages]
@@ -160,20 +216,48 @@ def _resolve_model_id_sync(endpoint: ModelEndpoint) -> str:
             return primary
     except Exception:
         pass
-    return mid or "local-model"
+    return mid or "qwen/qwen3.5-9b"
+
+
+class _EndpointHealth:
+    """端点健康状态（轻量级，无需持久化）"""
+    def __init__(self) -> None:
+        self.success_count: int = 0
+        self.failure_count: int = 0
+        self.last_check: float = 0.0
+        self.last_latency_ms: float = 0.0
+        self.healthy: bool = True
+
+    @property
+    def success_rate(self) -> float:
+        total = self.success_count + self.failure_count
+        if total == 0:
+            return 1.0  # 无历史时默认为健康
+        return self.success_count / total
+
+    def record(self, success: bool, latency_ms: float = 0.0) -> None:
+        if success:
+            self.success_count += 1
+        else:
+            self.failure_count += 1
+        self.last_latency_ms = latency_ms
+        # 最近 5 次内失败超过 3 次标记为不健康
+        total = self.success_count + self.failure_count
+        if total > 0:
+            self.healthy = self.success_rate >= 0.4  # 容忍阈值
 
 
 class ModelRouter:
     """模型路由器 - 核心类"""
-    
-    # 场景到模型提供商的映射
-    SCENE_PROVIDER_MAP: dict[SceneType, ModelProvider] = {
+
+    # 默认场景到模型提供商的映射（可被运行时配置覆盖）
+    _DEFAULT_SCENE_PROVIDER_MAP: dict[SceneType, ModelProvider] = {
         SceneType.CHAT: ModelProvider.LOCAL,
         SceneType.VOCAB: ModelProvider.LOCAL,
         SceneType.ESSAY: ModelProvider.KIMI,
         SceneType.SCENARIO_EXPANSION: ModelProvider.KIMI,
     }
-    
+
     def _resolve_model_id(self, endpoint: ModelEndpoint) -> str:
         """解析模型 ID，避免占位符导致 LM Studio 选择错误模型。"""
         return _resolve_model_id_sync(endpoint)
@@ -181,15 +265,85 @@ class ModelRouter:
     def __init__(self) -> None:
         self._endpoints: dict[ModelProvider, list[ModelEndpoint]] = {}
         self._contexts: dict[str, ConversationContext] = {}
+        self._health: dict[str, _EndpointHealth] = {}  # base_url -> health
         self._init_endpoints()
+        self._load_scene_provider_map()
+
+    def _health_key(self, endpoint: ModelEndpoint) -> str:
+        return f"{endpoint.provider.value}::{endpoint.base_url}::{endpoint.model_id}"
+
+    def _get_health(self, endpoint: ModelEndpoint) -> _EndpointHealth:
+        key = self._health_key(endpoint)
+        if key not in self._health:
+            self._health[key] = _EndpointHealth()
+        return self._health[key]
+
+    def _record_health(self, endpoint: ModelEndpoint, success: bool, latency_ms: float = 0.0) -> None:
+        self._get_health(endpoint).record(success, latency_ms)
+
+    def _is_healthy(self, endpoint: ModelEndpoint) -> bool:
+        return self._get_health(endpoint).healthy
+
+    def _load_scene_provider_map(self) -> None:
+        """尝试从运行时配置加载场景映射覆盖。"""
+        try:
+            runtime = get_runtime_config()
+            overrides = runtime.get("scene_provider_map", {})
+            self._scene_overrides: dict[str, str] = {
+                k: v for k, v in overrides.items()
+                if k in {s.value for s in SceneType}
+                and v in {p.value for p in ModelProvider}
+            }
+        except Exception:
+            self._scene_overrides = {}
+
+    def _get_scene_provider(self, scene: SceneType) -> ModelProvider:
+        """获取场景对应的提供商，支持运行时覆盖。"""
+        override = self._scene_overrides.get(scene.value)
+        if override:
+            return ModelProvider(override)
+        return self._DEFAULT_SCENE_PROVIDER_MAP.get(scene, ModelProvider.LOCAL)
+
+    def _apply_scene_model(self, endpoint: ModelEndpoint, scene: SceneType) -> ModelEndpoint:
+        """将按场景配置的 model_id 注入到路由结果中。"""
+        runtime = get_runtime_config()
+        scene_models = (((runtime.get("models") or {}).get("scene") or {}))
+        scene_model = str(scene_models.get(scene.value) or "").strip()
+        if not scene_model or scene_model in {"local-model", "local-llm", "default"}:
+            return endpoint
+        if endpoint.provider == ModelProvider.KIMI and not scene_model.startswith(("moonshot", "kimi")):
+            return endpoint
+        if scene_model == endpoint.model_id:
+            return endpoint
+        return dataclasses.replace(endpoint, model_id=scene_model)
+
+    def update_scene_provider(self, scene: SceneType | str, provider: ModelProvider | str) -> None:
+        """运行时更新场景-提供商映射（仅内存，重启后失效）。"""
+        if isinstance(scene, str):
+            scene = SceneType(scene)
+        if isinstance(provider, str):
+            provider = ModelProvider(provider)
+        self._scene_overrides[scene.value] = provider.value
+        logger.info(f"Updated scene provider mapping: {scene.value} -> {provider.value}")
+
+    def reset_scene_provider(self, scene: SceneType | str | None = None) -> None:
+        """重置场景-提供商映射到默认值。"""
+        if scene is None:
+            self._scene_overrides.clear()
+            logger.info("Reset all scene provider mappings to defaults")
+            return
+        if isinstance(scene, str):
+            scene = SceneType(scene)
+        self._scene_overrides.pop(scene.value, None)
+        logger.info(f"Reset scene provider mapping for {scene.value} to default")
     
     def _init_endpoints(self) -> None:
         """初始化模型端点配置"""
         # 本地模型端点：优先使用运行时配置中的 primary（由 list_available_llm_models 维护）
-        # 避免使用 settings.llm_model 占位符（如 "local-model"）导致 LM Studio 选择错误的大模型
+        # 避免使用 settings.llm_model 占位符导致 LM Studio 选择错误的大模型
         runtime = get_runtime_config()
         primary_model = str(((runtime.get("models") or {}).get("primary") or "")).strip()
-        local_model_id = primary_model if primary_model and primary_model not in {"local-model", "local-llm", "default", ""} else settings.llm_model
+        local_model_id = primary_model if primary_model and primary_model not in {"local-model", "local-llm", "default", ""} else getattr(settings, "llm_model", "qwen/qwen3.5-9b")
 
         local_endpoint = ModelEndpoint(
             provider=ModelProvider.LOCAL,
@@ -201,7 +355,7 @@ class ModelRouter:
             priority=1
         )
         self._endpoints[ModelProvider.LOCAL] = [local_endpoint]
-        
+
         # Kimi API端点 (从环境变量或运行时配置读取)
         kimi_base_url = self._get_kimi_base_url()
         kimi_api_key = self._get_kimi_api_key()
@@ -210,7 +364,7 @@ class ModelRouter:
                 provider=ModelProvider.KIMI,
                 base_url=kimi_base_url,
                 api_key=kimi_api_key,
-                model_id="moonshot-v1-auto",  # OpenAI兼容默认模型
+                model_id="moonshot-v1-auto",  # Kimi API 通用模型名称
                 timeout_connect=5.0,
                 timeout_read=30.0,
                 priority=1
@@ -225,9 +379,10 @@ class ModelRouter:
         base_url = kimi_config.get("base_url", "")
         if base_url:
             return base_url
-        # 从环境变量读取
-        import os
-        return os.getenv("KIMI_BASE_URL", "https://api.moonshot.cn/v1")
+        configured = str(getattr(settings, "kimi_base_url", "") or "").strip()
+        if configured:
+            return configured
+        return "https://api.moonshot.cn/v1"
     
     def _get_kimi_api_key(self) -> str:
         """获取Kimi API密钥"""
@@ -236,12 +391,11 @@ class ModelRouter:
         api_key = kimi_config.get("api_key", "")
         if api_key:
             return api_key
-        import os
-        return os.getenv("KIMI_API_KEY", "")
+        return str(getattr(settings, "kimi_api_key", "") or "").strip()
     
     def route(self, scene: SceneType | str) -> RoutingDecision:
         """
-        根据场景路由到合适的模型
+        根据场景路由到合适的模型，支持运行时覆盖和健康状态感知。
         
         Args:
             scene: 场景类型
@@ -252,26 +406,51 @@ class ModelRouter:
         if isinstance(scene, str):
             scene = SceneType(scene)
         
-        # 获取场景对应的提供商
-        provider = self.SCENE_PROVIDER_MAP.get(scene, ModelProvider.LOCAL)
+        # 获取场景对应的提供商（支持运行时覆盖）
+        provider = self._get_scene_provider(scene)
         
-        # 获取该提供商的端点列表
+        # 获取该提供商的端点列表，按健康状态排序
         endpoints = self._endpoints.get(provider, [])
+        if endpoints:
+            # 健康端点优先，同健康状态下按 priority 排序
+            endpoints = sorted(
+                endpoints,
+                key=lambda e: (0 if self._is_healthy(e) else 1, e.priority)
+            )
+
         if not endpoints:
             # 回退到本地模型
             endpoints = self._endpoints.get(ModelProvider.LOCAL, [])
-        
-        # 按优先级排序
-        endpoints = sorted(endpoints, key=lambda e: e.priority)
+            endpoints = sorted(
+                endpoints,
+                key=lambda e: (0 if self._is_healthy(e) else 1, e.priority)
+            )
         
         primary = endpoints[0] if endpoints else None
         fallbacks = endpoints[1:] if len(endpoints) > 1 else []
         
-        # 当主选为云端 KIMI 时，追加本地模型作为跨提供商故障回退
+        # 追加跨提供商故障回退，保证单一提供商不可用时仍可继续工作。
         if provider == ModelProvider.KIMI:
-            local_eps = self._endpoints.get(ModelProvider.LOCAL, [])
-            if local_eps:
-                fallbacks.extend(sorted(local_eps, key=lambda e: e.priority))
+            cross_provider = ModelProvider.LOCAL
+        elif provider == ModelProvider.LOCAL:
+            cross_provider = ModelProvider.KIMI
+        else:
+            cross_provider = None
+
+        if cross_provider is not None:
+            cross_eps = self._endpoints.get(cross_provider, [])
+            if cross_eps:
+                cross_eps = sorted(
+                    cross_eps,
+                    key=lambda e: (0 if self._is_healthy(e) else 1, e.priority)
+                )
+                fallbacks.extend(cross_eps)
+
+        if primary is None:
+            raise RuntimeError(f"No model endpoints available for scene={scene.value}")
+
+        primary = self._apply_scene_model(primary, scene)
+        fallbacks = [self._apply_scene_model(endpoint, scene) for endpoint in fallbacks]
         
         # 场景扩写使用thinking模式，需要不同的temperature
         temperature = 0.7
@@ -458,43 +637,76 @@ class ModelRouter:
         stream: bool,
         temperature: float
     ) -> AsyncIterator[str]:
-        """调用具体端点（带重试逻辑）"""
-        last_error: Exception | None = None
+        """调用具体端点（带重试逻辑和健康状态追踪）"""
+        import time as _time
         config = RETRY_CONFIG_LLM_API
-        
+        overall_success = False
+
         for attempt in range(config.max_retries + 1):
+            t0 = _time.perf_counter()
             try:
                 async for chunk in self._call_endpoint_with_retry(
                     endpoint, messages, stream, temperature
                 ):
                     yield chunk
+                overall_success = True
                 return  # 成功，结束
             except Exception as e:
-                last_error = e
-                
+                latency_ms = (_time.perf_counter() - t0) * 1000
+                self._record_health(endpoint, success=False, latency_ms=latency_ms)
+
                 if attempt >= config.max_retries:
                     logger.error(
                         f"Endpoint {endpoint.provider.value} failed after {config.max_retries + 1} attempts. "
                         f"Last error: {e}"
                     )
                     raise
-                
+
                 from .retry_utils import calculate_delay
                 delay = calculate_delay(attempt, config)
-                
+
                 logger.warning(
                     f"Endpoint {endpoint.provider.value} failed (attempt {attempt + 1}). "
                     f"Retrying in {delay:.2f}s. Error: {e}"
                 )
-                
+
                 await asyncio.sleep(delay)
+            finally:
+                if overall_success:
+                    latency_ms = (_time.perf_counter() - t0) * 1000
+                    self._record_health(endpoint, success=True, latency_ms=latency_ms)
 
     async def call_cloud_local_race(
         self,
         messages: list[dict[str, str]],
         temperature: float = 0.7,
     ) -> str:
-        """同时调用 KIMI 和 LOCAL，谁先成功返回用谁。
+        """同时调用 KIMI 和 LOCAL，按 TTFT 选择胜者后返回完整文本。
+
+        旧接口保持返回字符串；需要首 token 体验的调用方应使用
+        ``call_cloud_local_race_stream``。
+        """
+        chunks = [
+            chunk
+            async for chunk in self.call_cloud_local_race_stream(
+                messages=messages,
+                temperature=temperature,
+            )
+        ]
+        text = "".join(chunks).strip()
+        if not text:
+            raise RuntimeError("All model endpoints failed")
+        return text
+
+    async def call_cloud_local_race_stream(
+        self,
+        messages: list[dict[str, str]],
+        temperature: float = 0.7,
+    ) -> AsyncIterator[str]:
+        """同时调用 KIMI 和 LOCAL，谁先产出首个 token 谁胜出并继续流式输出。
+
+        优先调度历史成功率高的端点；不健康端点延迟 200ms 启动，
+        避免在端点已明显故障时仍与其竞争。
 
         若 KIMI 未配置，直接回退到 LOCAL。
         所有任务失败时抛 RuntimeError。
@@ -505,31 +717,76 @@ class ModelRouter:
         if not kimi_eps:
             if not local_eps:
                 raise RuntimeError("No endpoints available")
-            return await _call_endpoint_text(local_eps[0], messages, temperature)
+            async for chunk in self._call_endpoint(local_eps[0], messages, True, temperature):
+                if chunk:
+                    yield chunk
+            return
 
-        tasks: list[asyncio.Task[str]] = []
-        for ep in kimi_eps:
-            tasks.append(asyncio.create_task(_call_endpoint_text(ep, messages, temperature)))
-        for ep in local_eps:
-            tasks.append(asyncio.create_task(_call_endpoint_text(ep, messages, temperature)))
+        all_eps = [(ep, self._get_health(ep).success_rate) for ep in (kimi_eps + local_eps)]
+        # 按成功率降序排列，成功率高的优先创建任务
+        all_eps.sort(key=lambda x: x[1], reverse=True)
 
-        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-
-        for task in done:
+        async def _race_first_token(endpoint: ModelEndpoint) -> dict[str, Any]:
+            stream_iter = self._call_endpoint(endpoint, messages, True, temperature)
             try:
-                return task.result()
+                async for delta in stream_iter:
+                    if delta:
+                        return {
+                            "success": True,
+                            "endpoint": endpoint,
+                            "stream_iter": stream_iter,
+                            "first_delta": delta,
+                        }
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                continue
+                pass
+            return {"success": False, "endpoint": endpoint}
 
-        for task in pending:
-            try:
-                return await task
-            except Exception:
-                continue
+        task_map: dict[asyncio.Task[dict[str, Any]], ModelEndpoint] = {}
+        for ep, rate in all_eps:
+            # 不健康端点（成功率 < 0.6）延迟启动，降低竞争优先级
+            if rate < 0.6:
+                await asyncio.sleep(0.2)
+            task = asyncio.create_task(_race_first_token(ep))
+            task_map[task] = ep
 
-        raise RuntimeError("All model endpoints failed")
+        pending = set(task_map)
+        winner: dict[str, Any] | None = None
+        try:
+            while pending and winner is None:
+                done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    try:
+                        result = task.result()
+                        if bool(result.get("success")):
+                            winner = result
+                            break
+                    except Exception:
+                        continue
+            if winner is not None:
+                for other in pending:
+                    other.cancel()
+        finally:
+            if winner is None:
+                for task in pending:
+                    task.cancel()
+
+        if winner is None:
+            raise RuntimeError("All model endpoints failed")
+
+        first_delta = str(winner.get("first_delta") or "")
+        if first_delta:
+            yield first_delta
+        stream_iter = winner.get("stream_iter")
+        try:
+            async for delta in stream_iter:
+                if delta:
+                    yield delta
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            return
 
     async def call_cloud_first_timeout(
         self,
@@ -550,6 +807,14 @@ class ModelRouter:
             return await _call_endpoint_text(local_eps[0], messages, temperature)
 
         cloud_task = asyncio.create_task(_call_endpoint_text(kimi_eps[0], messages, temperature))
+
+        if not local_eps:
+            # 仅云端可用时，直接等待云端结果
+            try:
+                return await cloud_task
+            except Exception as e:
+                raise RuntimeError(f"Cloud endpoint failed and no local fallback: {e}") from e
+
         local_task = asyncio.create_task(_call_endpoint_text(local_eps[0], messages, temperature))
 
         try:
@@ -831,7 +1096,7 @@ async def chat_with_context(
     system_prompt: str = ""
 ) -> AsyncIterator[str]:
     """
-    带上下文的对话: 使用本地Qwen模型
+    带上下文的对话: 云端/本地竞速，谁先成功用谁。
     
     Args:
         conversation_id: 对话ID
@@ -857,13 +1122,13 @@ async def chat_with_context(
     # 路由决策
     decision = router.route(SceneType.CHAT)
     
-    # 调用模型
+    # chat 场景按架构要求使用云端/本地竞速，避免本地端点不可用时串行阻塞。
     messages = context.to_openai_messages()
-    assistant_response = ""
-    
-    async for chunk in router.call_with_fallback(decision, messages, stream=True):
-        assistant_response += chunk
-        yield chunk
+    assistant_response = await router.call_cloud_local_race(
+        messages,
+        temperature=decision.temperature,
+    )
+    yield assistant_response
     
     # 保存助手回复到上下文
     context.add_message("assistant", assistant_response)
@@ -874,7 +1139,10 @@ async def chat_with_context(
 
 async def generate_vocab_with_routing(term: str, language: str = "en") -> dict[str, Any]:
     """
-    词汇生成: 使用Kimi API生成结构化词汇信息
+    词汇生成: 默认使用本地模型生成结构化词汇信息。
+
+    当前默认路由遵循 SceneType.VOCAB -> LOCAL，
+    可由 runtime_config.scene_provider_map 在运行时覆盖。
     
     Args:
         term: 词汇
@@ -955,7 +1223,7 @@ async def grade_essay_with_routing(
     criteria: list[str] | None = None
 ) -> dict[str, Any]:
     """
-    作文批改: 使用Kimi API进行多维度评分
+    作文批改: 云端优先，多维度评分超时则回退到本地。
     
     Args:
         essay_text: 作文文本
@@ -1007,8 +1275,14 @@ async def grade_essay_with_routing(
     ]
     
     result = ""
-    async for chunk in router.call_with_fallback(decision, messages, stream=False):
-        result += chunk
+    try:
+        result = await router.call_cloud_first_timeout(
+            messages,
+            temperature=decision.temperature,
+            timeout=10.0,
+        )
+    except Exception:
+        result = ""
     
     # 解析JSON结果
     try:

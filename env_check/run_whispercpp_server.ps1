@@ -1,12 +1,22 @@
 param(
-  [string]$ServerExe = "E:\\tools\\whisper.cpp\\server.exe",  # whisper.cpp server binary path
-  [string]$ModelPath = "E:\\models\\whisper.cpp\\ggml-base.bin", # GGML/GGUF model path
+  [string]$ServerExe = "..\\tools\\whisper.cpp\\server.exe",  # whisper.cpp server binary path (relative to env_check)
+  [string]$ModelPath = "..\\models\\whisper.cpp\\ggml-base.bin", # GGML/GGUF model path (relative to env_check)
   [int]$Port = 8080,
   [int]$Threads = 8,
   [switch]$GPU = $false
 )
 
 $ErrorActionPreference = 'Stop'
+
+$scriptRoot = Split-Path -Parent $PSCommandPath
+if (-not [System.IO.Path]::IsPathRooted($ServerExe)) {
+  $ServerExe = Join-Path $scriptRoot $ServerExe
+}
+if (-not [System.IO.Path]::IsPathRooted($ModelPath)) {
+  $ModelPath = Join-Path $scriptRoot $ModelPath
+}
+$ServerExe = [System.IO.Path]::GetFullPath($ServerExe)
+$ModelPath = [System.IO.Path]::GetFullPath($ModelPath)
 
 if (-not (Test-Path $ServerExe)) {
   Write-Host "[whispercpp] server.exe not found: $ServerExe" -ForegroundColor Yellow

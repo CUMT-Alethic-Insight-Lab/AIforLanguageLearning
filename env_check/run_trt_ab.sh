@@ -6,7 +6,6 @@ if [ -f ~/.venvs/ptsrc/bin/activate ]; then
   # shellcheck disable=SC1090
   source ~/.venvs/ptsrc/bin/activate
 fi
-cd /mnt/e/projects/AiforForiegnLanguageLearning
 python -m env_check.run_cosyvoice2_trt_ab \
   --cmd "python -m env_check.run_cosyvoice2_zero_shot --text '你好世界' --prompt_wav env_check/zero_shot_prompt.wav --use_flow_cache 1 --use_fp16 0" \
   --trt-env COSY_LOAD_TRT \
