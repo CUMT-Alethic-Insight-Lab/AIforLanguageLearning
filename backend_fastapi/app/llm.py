@@ -3,9 +3,10 @@ from __future__ import annotations
 import asyncio
 import json
 import re
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator
 
 import httpx
+from openai import AsyncOpenAI
 
 from .prompts import render_prompt
 from .runtime_config import get_runtime_config, get_scene_model, update_runtime_config
@@ -13,6 +14,18 @@ from .settings import settings
 
 _LLM_MODEL_CACHE: str | None = None
 _LLM_MODEL_LOCK = asyncio.Lock()
+
+
+def _make_openai_client(
+    base_url: str, api_key: str, timeout: httpx.Timeout
+) -> AsyncOpenAI:
+    """构造 OpenAI 兼容客户端（禁用 SDK 内置重试，重试策略由上层统一管理）。"""
+    return AsyncOpenAI(
+        base_url=base_url,
+        api_key=api_key,
+        timeout=timeout,
+        max_retries=0,
+    )
 
 
 def _is_placeholder_model(model_id: str) -> bool:
@@ -72,27 +85,17 @@ async def list_available_llm_models() -> list[str]:
 
     timeout = httpx.Timeout(min(float(settings.llm_timeout_seconds), 8.0), connect=2.0)
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
-            resp = await client.get(
-                "/models",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-            )
-            resp.raise_for_status()
-            data = resp.json()
+        async with _make_openai_client(
+            settings.llm_base_url, settings.llm_api_key, timeout
+        ) as client:
+            page = await client.models.list()
+            ids = [
+                m.id.strip() for m in page.data if isinstance(m.id, str) and m.id.strip()
+            ]
     except Exception:
         cfg = get_runtime_config()
         cached = (((cfg.get("models") or {}).get("available") or []))
         return [str(x).strip() for x in cached if isinstance(x, str) and str(x).strip()]
-
-    raw = data.get("data")
-    ids: list[str] = []
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            model_id = item.get("id")
-            if isinstance(model_id, str) and model_id.strip():
-                ids.append(model_id.strip())
 
     ranked = _rank_models(ids)
     # 始终使用排序后的最优模型作为 primary，不保留旧缓存。
@@ -281,39 +284,7 @@ def _extract_chat_response_text(data: Any) -> str:
     return ""
 
 
-async def _list_models_from_client(client: httpx.AsyncClient, *, api_key: str) -> list[str]:
-    """List available chat-capable models from the provided client endpoint."""
-
-    try:
-        resp = await client.get(
-            "/models",
-            headers={"Authorization": f"Bearer {api_key}"},
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception:
-        return []
-
-    raw = data.get("data")
-    ids: list[str] = []
-    if isinstance(raw, list):
-        for item in raw:
-            if not isinstance(item, dict):
-                continue
-            model_id = item.get("id")
-            if isinstance(model_id, str) and model_id.strip():
-                ids.append(model_id.strip())
-
-    return _rank_models(ids)
-
-
-async def _resolve_llm_model(
-    client: httpx.AsyncClient,
-    *,
-    scene: str = "chat",
-    api_key: str | None = None,
-    use_global_cache: bool = True,
-) -> str:
+async def _resolve_llm_model(*, scene: str = "chat") -> str:
     """Resolve a usable model id for OpenAI-compatible servers.
 
     Strategy:
@@ -577,8 +548,10 @@ async def generate_vocab_fields(term: str) -> dict[str, Any]:
     timeout = httpx.Timeout(effective, connect=min(2.0, effective))
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
-            model = await _resolve_llm_model(client, scene="vocab")
+        async with _make_openai_client(
+            settings.llm_base_url, settings.llm_api_key, timeout
+        ) as client:
+            model = await _resolve_llm_model(scene="vocab")
 
             async def _translate_example_to_zh(example_en: str) -> str:
                 ex = (example_en or "").strip()
@@ -588,41 +561,29 @@ async def generate_vocab_fields(term: str) -> dict[str, Any]:
                     "把下面这句英文例句翻译成中文。只输出中文翻译本身，不要输出任何多余内容。\n"
                     f"英文：{ex}"
                 )
-                payload: dict[str, Any] = {
-                    "model": model,
-                    "messages": [
+                r = await client.chat.completions.create(
+                    model=model,
+                    messages=[
                         {"role": "system", "content": "You are a helpful assistant."},
                         {"role": "user", "content": translate_prompt},
                     ],
-                    "temperature": 0.0,
-                    "max_tokens": 160,
-                }
-                r = await client.post(
-                    "/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                    json=payload,
+                    temperature=0.0,
+                    max_tokens=160,
                 )
-                r.raise_for_status()
-                txt = _extract_chat_response_text(r.json())
+                txt = _extract_chat_response_text(r.model_dump())
                 return (txt or "").strip().strip('"')
 
             async def _request_vocab_json(user_prompt: str) -> str:
-                payload: dict[str, Any] = {
-                    "model": model,
-                    "messages": [
+                r = await client.chat.completions.create(
+                    model=model,
+                    messages=[
                         {"role": "system", "content": "You are a helpful assistant. Respond with valid JSON only. Do not output any thinking process, reasoning, or explanation. Output ONLY the JSON object, nothing else."},
                         {"role": "user", "content": user_prompt},
                     ],
-                    "temperature": 0.2,
-                    "max_tokens": 700,
-                }
-                r = await client.post(
-                    "/chat/completions",
-                    headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                    json=payload,
+                    temperature=0.2,
+                    max_tokens=700,
                 )
-                r.raise_for_status()
-                return _extract_chat_response_text(r.json())
+                return _extract_chat_response_text(r.model_dump())
 
             text = ""
             parsed: dict[str, Any] = {}
@@ -767,23 +728,19 @@ async def generate_definition(term: str) -> str:
     timeout = httpx.Timeout(effective, connect=min(2.0, effective))
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
-            model = await _resolve_llm_model(client, scene="vocab")
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": [
+        async with _make_openai_client(
+            settings.llm_base_url, settings.llm_api_key, timeout
+        ) as client:
+            model = await _resolve_llm_model(scene="vocab")
+            resp = await client.chat.completions.create(
+                model=model,
+                messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.2,
-            }
-            resp = await client.post(
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json=payload,
+                temperature=0.2,
             )
-            resp.raise_for_status()
-            data = resp.json()
+            data = resp.model_dump()
             # OpenAI 兼容：choices[0].message.content
             text = _extract_chat_response_text(data)
             if text:
@@ -842,28 +799,16 @@ async def chat_complete(
     resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
+        async with _make_openai_client(resolved_base_url, resolved_api_key, timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
-                custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
-                resolved_model = await _resolve_llm_model(
-                    client,
-                    scene="chat",
-                    api_key=resolved_api_key,
-                    use_global_cache=not custom_endpoint,
-                )
-            payload: dict[str, Any] = {
-                "model": resolved_model,
-                "messages": _build_chat_messages(system_prompt=sp, user_text=ut, history=history),
-                "temperature": temperature,
-            }
-            resp = await client.post(
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {resolved_api_key}"},
-                json=payload,
+                resolved_model = await _resolve_llm_model(scene="chat")
+            resp = await client.chat.completions.create(
+                model=resolved_model,
+                messages=_build_chat_messages(system_prompt=sp, user_text=ut, history=history),
+                temperature=temperature,
             )
-            resp.raise_for_status()
-            data = resp.json()
+            data = resp.model_dump()
             text = _extract_chat_response_text(data)
             if text:
                 return text
@@ -997,28 +942,17 @@ async def chat_complete_multimodal(
     messages.append({"role": "user", "content": user_content})
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
+        async with _make_openai_client(resolved_base_url, resolved_api_key, timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
-                resolved_model = await _resolve_llm_model(
-                    client,
-                    scene="chat",
-                    api_key=resolved_api_key,
-                    use_global_cache=True,
-                )
-            payload: dict[str, Any] = {
-                "model": resolved_model,
-                "messages": messages,
-                "temperature": temperature,
-                "max_tokens": max_tokens,
-            }
-            resp = await client.post(
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {resolved_api_key}"},
-                json=payload,
+                resolved_model = await _resolve_llm_model(scene="chat")
+            resp = await client.chat.completions.create(
+                model=resolved_model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
             )
-            resp.raise_for_status()
-            data = resp.json()
+            data = resp.model_dump()
             text = _extract_chat_response_text(data)
             if text:
                 return text
@@ -1026,34 +960,6 @@ async def chat_complete_multimodal(
         return "（网络不太稳定，请稍后再试）"
 
     return "（LLM 输出为空）"
-
-
-SSEEvent = tuple[Literal["data", "done"], str]
-
-
-def _parse_openai_sse_line(line: str) -> SSEEvent | None:
-    """Parse a single SSE line from OpenAI-compatible streaming.
-
-    Expected shapes:
-    - 'data: {json...}'
-    - 'data: [DONE]'
-    - empty / keep-alive lines
-    """
-
-    s = (line or "").strip()
-    if not s:
-        return None
-
-    if not s.startswith("data:"):
-        return None
-
-    payload = s.removeprefix("data:").strip()
-    if not payload:
-        return None
-
-    if payload == "[DONE]":
-        return ("done", "")
-    return ("data", payload)
 
 
 def _extract_delta_text(obj: Any) -> str:
@@ -1102,39 +1008,24 @@ async def stream_definition(term: str) -> AsyncIterator[str]:
     timeout = httpx.Timeout(settings.llm_timeout_seconds)
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=settings.llm_base_url, timeout=timeout) as client:
-            model = await _resolve_llm_model(client, scene="vocab")
-            payload: dict[str, Any] = {
-                "model": model,
-                "messages": [
+        async with _make_openai_client(
+            settings.llm_base_url, settings.llm_api_key, timeout
+        ) as client:
+            model = await _resolve_llm_model(scene="vocab")
+            stream = await client.chat.completions.create(
+                model=model,
+                messages=[
                     {"role": "system", "content": "You are a helpful assistant."},
                     {"role": "user", "content": prompt},
                 ],
-                "temperature": 0.2,
-                "stream": True,
-            }
+                temperature=0.2,
+                stream=True,
+            )
 
-            async with client.stream(
-                "POST",
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {settings.llm_api_key}"},
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
-                async for line in resp.aiter_lines():
-                    evt = _parse_openai_sse_line(line)
-                    if evt is None:
-                        continue
-                    kind, raw = evt
-                    if kind == "done":
-                        break
-                    try:
-                        obj = json.loads(raw)
-                    except Exception:
-                        continue
-                    delta = _extract_delta_text(obj)
-                    if delta:
-                        yield delta
+            async for chunk in stream:
+                delta = _extract_delta_text(chunk.model_dump())
+                if delta:
+                    yield delta
     except Exception:
         return
 
@@ -1164,47 +1055,21 @@ async def stream_chat(
     resolved_api_key = str(api_key or "").strip() or settings.llm_api_key
 
     try:
-        async with httpx.AsyncClient(transport=httpx.AsyncHTTPTransport(retries=0), base_url=resolved_base_url, timeout=timeout) as client:
+        async with _make_openai_client(resolved_base_url, resolved_api_key, timeout) as client:
             resolved_model = str(model or "").strip()
             if not resolved_model:
-                custom_endpoint = bool(str(base_url or "").strip() or str(api_key or "").strip())
-                resolved_model = await _resolve_llm_model(
-                    client,
-                    scene="chat",
-                    api_key=resolved_api_key,
-                    use_global_cache=not custom_endpoint,
-                )
-            payload: dict[str, Any] = {
-                "model": resolved_model,
-                "messages": _build_chat_messages(system_prompt=sp, user_text=ut, history=history),
-                "temperature": temperature,
-                "stream": True,
-            }
-            async with client.stream(
-                "POST",
-                "/chat/completions",
-                headers={"Authorization": f"Bearer {resolved_api_key}"},
-                json=payload,
-            ) as resp:
-                resp.raise_for_status()
+                resolved_model = await _resolve_llm_model(scene="chat")
+            stream = await client.chat.completions.create(
+                model=resolved_model,
+                messages=_build_chat_messages(system_prompt=sp, user_text=ut, history=history),
+                temperature=temperature,
+                stream=True,
+            )
 
-                async for line in resp.aiter_lines():
-                    evt = _parse_openai_sse_line(line)
-                    if evt is None:
-                        continue
-
-                    kind, raw = evt
-                    if kind == "done":
-                        break
-
-                    try:
-                        obj = json.loads(raw)
-                    except Exception:
-                        continue
-
-                    delta = _extract_delta_text(obj)
-                    if delta:
-                        yield delta
+            async for chunk in stream:
+                delta = _extract_delta_text(chunk.model_dump())
+                if delta:
+                    yield delta
     except asyncio.CancelledError:
         raise
     except Exception:

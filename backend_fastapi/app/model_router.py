@@ -21,6 +21,7 @@ from enum import Enum
 from typing import Any, AsyncIterator
 
 import httpx
+from openai import AsyncOpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -582,46 +583,39 @@ class ModelRouter:
                 endpoint.timeout_read,
                 connect=endpoint.timeout_connect
             )
-            
-            async with httpx.AsyncClient(base_url=endpoint.base_url, timeout=timeout) as client:
+
+            async with AsyncOpenAI(
+                base_url=endpoint.base_url,
+                api_key=endpoint.api_key,
+                timeout=timeout,
+                max_retries=0,
+            ) as client:
                 model_id = self._resolve_model_id(endpoint)
-                payload = {
-                    "model": model_id,
-                    "messages": messages,
-                    "stream": stream,
-                    "temperature": temperature
-                }
-                
+
                 if stream:
-                    async with client.stream(
-                        "POST",
-                        "/chat/completions",
-                        headers={"Authorization": f"Bearer {endpoint.api_key}"},
-                        json=payload
-                    ) as resp:
-                        resp.raise_for_status()
-                        async for line in resp.aiter_lines():
-                            if line.startswith("data: "):
-                                data = line[6:]
-                                if data == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data)
-                                    delta = chunk.get("choices", [{}])[0].get("delta", {})
-                                    content = delta.get("content", "")
-                                    if content:
-                                        yield content
-                                except json.JSONDecodeError:
-                                    continue
-                else:
-                    resp = await client.post(
-                        "/chat/completions",
-                        headers={"Authorization": f"Bearer {endpoint.api_key}"},
-                        json=payload
+                    stream_resp = await client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        stream=True,
+                        temperature=temperature
                     )
-                    resp.raise_for_status()
-                    data = resp.json()
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                    async for chunk in stream_resp:
+                        obj = chunk.model_dump()
+                        choices = obj.get("choices") or [{}]
+                        delta = (choices[0] or {}).get("delta") or {}
+                        content = delta.get("content", "")
+                        if content:
+                            yield content
+                else:
+                    resp = await client.chat.completions.create(
+                        model=model_id,
+                        messages=messages,
+                        stream=False,
+                        temperature=temperature
+                    )
+                    obj = resp.model_dump()
+                    choices = obj.get("choices") or [{}]
+                    content = (choices[0] or {}).get("message", {}).get("content", "")
                     yield content
         
         # 使用指数退避重试
@@ -848,22 +842,21 @@ async def _call_endpoint_text(
     read_timeout = min(endpoint.timeout_read, float(settings.llm_timeout_seconds))
     connect_timeout = min(endpoint.timeout_connect, 2.0)
     timeout = httpx.Timeout(read_timeout, connect=connect_timeout)
-    async with httpx.AsyncClient(base_url=endpoint.base_url, timeout=timeout) as client:
+    async with AsyncOpenAI(
+        base_url=endpoint.base_url,
+        api_key=endpoint.api_key,
+        timeout=timeout,
+        max_retries=0,
+    ) as client:
         model_id = _resolve_model_id_sync(endpoint)
-        payload: dict[str, Any] = {
-            "model": model_id,
-            "messages": messages,
-            "stream": False,
-            "temperature": temperature,
-        }
-        resp = await client.post(
-            "/chat/completions",
-            headers={"Authorization": f"Bearer {endpoint.api_key}"},
-            json=payload,
+        resp = await client.chat.completions.create(
+            model=model_id,
+            messages=messages,
+            stream=False,
+            temperature=temperature,
         )
-        resp.raise_for_status()
-        data = resp.json()
-        content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+        obj = resp.model_dump()
+        content = (obj.get("choices") or [{}])[0].get("message", {}).get("content", "")
         if not content or not content.strip():
             raise ValueError("Empty LLM response")
         return content.strip()
