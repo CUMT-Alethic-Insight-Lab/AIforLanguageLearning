@@ -24,6 +24,10 @@ dependencies = [
   "minio>=7.2",
   "python-multipart>=0.0.9",
   "webrtcvad>=2.0.10",
+  "tenacity>=8.2",
+  "redis>=5.0",
+  "prometheus-client>=0.20",
+  "psutil>=5.9",
 ]
 
 [project.optional-dependencies]

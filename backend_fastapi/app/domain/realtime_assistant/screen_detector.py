@@ -184,6 +184,7 @@ class ScreenChangeDetector:
         try:
             from io import BytesIO
 
+            import numpy as np
             from PIL import Image
 
             i1 = Image.open(BytesIO(img1_bytes)).convert("L")
@@ -191,13 +192,12 @@ class ScreenChangeDetector:
             if i1.size != i2.size:
                 return 1.0
 
-            diff = 0
-            total = i1.size[0] * i1.size[1]
-            for x in range(i1.size[0]):
-                for y in range(i1.size[1]):
-                    if abs(i1.getpixel((x, y)) - i2.getpixel((x, y))) > 30:
-                        diff += 1
-            return diff / total if total else 0.0
+            a1 = np.asarray(i1, dtype=np.int16)
+            a2 = np.asarray(i2, dtype=np.int16)
+            total = a1.size
+            if total == 0:
+                return 0.0
+            return float((np.abs(a1 - a2) > 30).sum() / total)
         except Exception as exc:
             logger.debug("Pixel diff failed: %s", exc)
             return 0.5
