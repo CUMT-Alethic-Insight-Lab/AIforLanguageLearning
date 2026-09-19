@@ -1,12 +1,11 @@
 /**
  * @fileoverview 实时助教 WebSocket 服务 (RTA Socket)
  * @description 封装与后端 /api/v1/realtime-assistant/ws 的 WebSocket 连接。
- *              支持自动重连、消息分发、屏幕帧/ASR/显式请求等事件发送。
+ *              连接管理/重连/消息分发由 BaseWsService 提供；
+ *              本类负责 RTA URL 构建、离线消息队列与领域事件发送。
  */
 
-import { ref } from 'vue';
-
-type MessageHandler = (msg: any) => void;
+import { BaseWsService } from './ws-base';
 
 export interface RtaConnectOptions {
   backendWsUrl: string; // e.g. "localhost:8012"
@@ -14,17 +13,12 @@ export interface RtaConnectOptions {
   username?: string;
 }
 
-class RtaSocketService {
-  private ws: WebSocket | null = null;
-  private url: string = '';
-
-  private reconnectAttempts = 0;
-  private maxReconnectAttempts = 5;
-  private messageHandlers: MessageHandler[] = [];
+class RtaSocketService extends BaseWsService {
   private pendingMessages: any[] = [];
 
-  public isConnected = ref(false);
-  public isConnecting = ref(false);
+  constructor() {
+    super('RTA');
+  }
 
   public connect(options: RtaConnectOptions) {
     const host = options.backendWsUrl.replace(/^wss?:\/\//, '').replace(/\/$/, '');
@@ -35,52 +29,9 @@ class RtaSocketService {
     this.doConnect();
   }
 
-  private doConnect() {
-    if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) return;
-
-    this.isConnecting.value = true;
-    console.log('[RTA] Connecting:', this.url);
-    this.ws = new WebSocket(this.url);
-
-    this.ws.onopen = () => {
-      console.log('[RTA] Connected');
-      this.isConnected.value = true;
-      this.isConnecting.value = false;
-      this.reconnectAttempts = 0;
-      // Flush pending messages
-      while (this.pendingMessages.length > 0) {
-        const msg = this.pendingMessages.shift();
-        this.send(msg);
-      }
-    };
-
-    this.ws.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data);
-        this.notifyHandlers(data);
-      } catch (e) {
-        console.error('[RTA] Message parse error:', e);
-      }
-    };
-
-    this.ws.onclose = () => {
-      console.log('[RTA] Disconnected');
-      this.isConnected.value = false;
-      this.isConnecting.value = false;
-      this.handleReconnect();
-    };
-
-    this.ws.onerror = (err) => {
-      console.error('[RTA] Error:', err);
-      this.isConnected.value = false;
-      this.isConnecting.value = false;
-    };
-  }
-
+  /** 发送 JSON 消息；未连接时入离线队列，连接建立后冲刷。 */
   public send(data: any) {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify(data));
-    } else {
+    if (!this.sendRaw(JSON.stringify(data))) {
       this.pendingMessages.push(data);
     }
   }
@@ -91,7 +42,10 @@ class RtaSocketService {
   }
 
   /** 发送鼠标框选事件 */
-  public sendMouseLasso(region: { x1: number; y1: number; x2: number; y2: number }, imageBase64?: string) {
+  public sendMouseLasso(
+    region: { x1: number; y1: number; x2: number; y2: number },
+    imageBase64?: string
+  ) {
     this.send({ type: 'mouse_lasso', region, image_base64: imageBase64, timestamp: Date.now() });
   }
 
@@ -110,32 +64,11 @@ class RtaSocketService {
     this.send({ type: 'heartbeat' });
   }
 
-  public onMessage(handler: MessageHandler) {
-    this.messageHandlers.push(handler);
-    return () => {
-      this.messageHandlers = this.messageHandlers.filter(h => h !== handler);
-    };
-  }
-
-  private notifyHandlers(msg: any) {
-    this.messageHandlers.forEach(h => h(msg));
-  }
-
-  private handleReconnect() {
-    if (this.reconnectAttempts < this.maxReconnectAttempts) {
-      const delay = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
-      console.log(`[RTA] Reconnecting in ${delay}ms...`);
-      setTimeout(() => {
-        this.reconnectAttempts++;
-        this.doConnect();
-      }, delay);
-    }
-  }
-
-  public disconnect() {
-    if (this.ws) {
-      this.ws.close();
-      this.ws = null;
+  protected onOpen(): void {
+    // Flush pending messages queued while offline
+    while (this.pendingMessages.length > 0) {
+      const msg = this.pendingMessages.shift();
+      if (msg !== undefined) this.send(msg);
     }
   }
 }
