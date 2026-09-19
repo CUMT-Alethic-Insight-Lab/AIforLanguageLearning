@@ -267,8 +267,7 @@ RTA 默认用云端 Kimi，可通过 `AIFL_RTA_LLM_BASE_URL` 等环境变量切�
 │   └── alembic/                   # 数据库迁移
 │
 ├── docs/                          # 架构与开发文档
-├── scripts/                       # start.ps1 / start_infra_native.ps1 / check-services.ts
-└── shared/types/                  # 前后端共享类型
+└── scripts/                       # start.ps1 / start_infra_native.ps1 / check-services.ts
 ```
 
 ### 分层约定
