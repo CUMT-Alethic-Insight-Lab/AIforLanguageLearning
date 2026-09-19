@@ -95,7 +95,7 @@ routers/ & interfaces/ → application/ → domain/ → infrastructure/
 | 数据库 | `AIFL_DATABASE_URL` | `sqlite:///./data/app.db` |
 | LLM API | `AIFL_LLM_BASE_URL` | http://127.0.0.1:1234/v1 (LM Studio) |
 | LLM 模型 | `AIFL_LLM_MODEL` | qwen/qwen3.5-9b |
-| ASR开关 | `AIFL_ENABLE_ASR` | false |
+| ASR开关 | `AIFL_ENABLE_ASR` | true |
 | JWT 密钥 | `AIFL_JWT_SECRET` | 需修改 |
 
 **两套配置机制**：
@@ -148,7 +148,7 @@ cd app/v5 && npm run dist    # 输出至 release/
 
 - **统一入口**：`POST /v1/essays/grade` (文本或图片)
 - **OCR 处理**：PaddleOCR 图片转文本
-- **评分维度**：内容(30%) + 结构(25%) + 语言(25%) + 语法(20%)
+- **评分维度**：六维度——内容(25%) + 结构/词汇/语法/流畅度/逻辑(各15%)
 - **等级映射**：A+/A/B+/B/C/D
 
 ### 语音对话模块

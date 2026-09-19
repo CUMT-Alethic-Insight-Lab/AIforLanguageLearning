@@ -1,5 +1,6 @@
-# 🤖 AI for Foreign Language Learning (AIFL)
-### 全栈式本地化外语学习 AI 助手 · 教师端 + 学生端 · 端云协同
+# AI for Foreign Language Learning (AIFL)
+
+全栈本地化外语学习平台：词汇学习、作文批改、实时语音对话、课堂实时助教、学情分析。
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/Python-3.10%2B%20%7C%203.14-blue)
@@ -7,337 +8,191 @@
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.110%2B-teal)
 ![Electron](https://img.shields.io/badge/Electron-31.x-slateblue)
 
----
+AIFL 是一个运行在桌面端（Electron）的外语学习应用。设计原则是端云协同、数据留在本地：学习数据（作文、录音、学习轨迹）默认存本地 SQLite，AI 推理优先走本地 LM Studio，仅在需要更强模型时调用云端 Kimi API。
 
-> **外行人一句话**：这是一个装在电脑上的"AI 外语私教"，能帮你查单词、改作文、练口语，所有 AI 推理都可以完全本地化运行，不用担心隐私泄露。
->
-> **内行人一句话**：基于 FastAPI + Vue 3 + Electron 的全栈外语学习平台，支持多模态 LLM 路由（本地 LM Studio ↔ 云端 Kimi）、实时语音对话（ASR→LLM→TTS 端到端 <1s）、实时课堂助教（RTA，屏幕感知 + 语音唤醒 + 结构化决策）、学情分析 Agent 集群、知识图谱关联推荐，采用 SQLite/SQLModel + Redis + ES + Neo4j + MinIO 的多存储策略，目标硬件为 AMD 9950X3D + RTX 5080 16GB 全本地推理。
+技术栈：FastAPI + SQLModel 后端，Vue 3 + Electron 前端，本地 LLM（LM Studio / Qwen3.5-9B）与云端 Kimi 双路路由，ASR 用 SeamlessM4T（CPU），TTS 用 Kokoro（CPU），OCR 用 PaddleOCR。可选接入 Redis / Elasticsearch / Neo4j / MinIO，不装也能跑。
 
----
+## 目录
 
-## 📑 目录
+- [功能](#功能)
+- [系统架构](#系统架构)
+- [快速开始](#快速开始)
+- [后端配置](#后端配置)
+- [依赖服务](#依赖服务)
+- [代码结构与设计](#代码结构与设计)
+- [API 速查](#api-速查)
+- [开发指南](#开发指南)
+- [硬件推荐](#硬件推荐)
+- [故障排查](#故障排查)
 
-- [🎯 项目概述](#-项目概述)
-- [🖼️ 系统全景图](#️-系统全景图)
-- [✨ 核心功能矩阵](#-核心功能矩阵)
-- [🚀 快速开始](#-快速开始)
-- [⚙️ 后端服务配置详解](#️-后端服务配置详解)
-- [🧩 依赖服务矩阵](#-依赖服务矩阵)
-- [🏗️ 代码实现逻辑与架构设计](#️-代码实现逻辑与架构设计)
-- [📡 API 接口速查](#-api-接口速查)
-- [🔧 开发指南](#-开发指南)
-- [🖥️ 硬件推荐与性能基准](#️-硬件推荐与性能基准)
-- [🐛 故障排查](#-故障排查)
+## 功能
 
----
+### 学生端
 
-## 🎯 项目概述
+| 模块 | 功能 | 实现位置 |
+|------|------|---------|
+| 词汇 | 查词、OCR 识词、LLM 生成释义与 CEFR 分级、SM-2 间隔复习、知识图谱关联 | `routers/vocab.py`、`domain/srs/` |
+| 作文 | 文本或图片（OCR）提交，六维度评分（内容/结构/词汇/语法/流畅度/逻辑），错误纠正与全文润色 | `routers/essays.py`、`domain/essay_scoring.py` |
+| 口语对话 | WebSocket 实时语音对话，云端与本地 LLM 竞速响应，支持打断续接 | `main.py` (`/ws/v1`)、`voice_stream.py` |
+| 学习记录 | 学习时长统计、能力雷达、薄弱点分析 | `routers/learning.py` |
 
-AIFL 是一个面向中高级外语学习者的智能化学习平台，核心设计理念是**"端云协同、数据自治"**——所有敏感学习数据（作文、口语录音、学习轨迹）默认留在本地，AI 推理优先走本地 GPU（LM Studio），仅在本地资源不足或需要更强模型时自动 fallback 到云端 Kimi API。
+### 教师端
 
-### 三大核心场景
+| 模块 | 功能 | 实现位置 |
+|------|------|---------|
+| 实时助教 (RTA) | 屏幕感知 + 语音唤醒（"Hi Helix"），LLM 结构化决策是否介入，默认静默弹窗、必要时 TTS 播报 | `domain/realtime_assistant/session.py` |
+| 学情分析 | 多维度班级/学生报告、周报生成、干预任务 | `application/analytics/` |
+| 管理面板 | 用户管理、配置热更新、服务健康检查、日志查看 | `interfaces/admin_router.py` |
+| 悬浮窗 | Ctrl+Shift+S 截图查词、Ctrl+Shift+C 划词查词 | `electron/main/managers/system-integration-manager.ts` |
 
-| 场景 | 用户价值 | 技术亮点 |
-|------|---------|---------|
-| **智能词汇** | 输入一个单词，AI 给出 CEFR 分级、多义项、真题考点、记忆曲线 | LLM 结构化 JSON 输出 + SM-2 遗忘曲线算法 |
-| **作文批改** | 粘贴作文，AI 从 6 维度评分并给出全文润色 | Jinja2 Prompt 模板 + 多模态 OCR（图片作文） |
-| **口语对话** | 与 AI 外教实时语音对话，可随时打断 | WebSocket 流式协议 + VAD 语音端点检测 + Barge-in 打断续接 |
-
-### 两大教师端特色
-
-| 场景 | 用户价值 | 技术亮点 |
-|------|---------|---------|
-| **实时助教 (RTA)** | 课堂上隐形 AI 助教，只在必要时语音/弹窗提醒 | 屏幕帧变化检测 + ASR 唤醒词 "Hi Helix" + LLM 结构化决策（should_intervene / use_tts） |
-| **学情分析** | 自动生成班级/学生多维学情报告 | 20+ 维度分析 + 三层 Agent 架构 + 干预任务生成 |
-
----
-
-## 🖼️ 系统全景图
+## 系统架构
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              AIFL 系统全景图                                 │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                                                                             │
-│  ┌─────────────────────────────┐    ┌─────────────────────────────────────┐ │
-│  │      前端 (Electron + Vue)   │    │           后端 (FastAPI)             │ │
-│  │      app/v5/                 │    │      backend_fastapi/app/            │ │
-│  │  ┌───────────────────────┐   │    │  ┌─────────────────────────────────┐ │ │
-│  │  │  Vue 3 SPA (教师/学生) │   │◄──►│  │  Routers (REST + WebSocket)      │ │ │
-│  │  │  - 词汇/作文/对话/分析  │   │ WS │  │  - vocab / essays / voice        │ │ │
-│  │  │  - 实时助教悬浮窗       │   │    │  │  - analytics / admin / auth      │ │ │
-│  │  │  - 系统设置面板         │   │    │  │  - realtime-assistant (RTA)      │ │ │
-│  │  └───────────────────────┘   │    │  └─────────────────────────────────┘ │ │
-│  │  ┌───────────────────────┐   │    │  ┌─────────────────────────────────┐ │ │
-│  │  │  Electron Main        │   │    │  │  Domain Services                 │ │ │
-│  │  │  - 系统托盘/全局快捷键 │   │    │  │  - 词汇生成 (LLM JSON 解析)       │ │ │
-│  │  │  - 智能悬浮窗 overlay  │   │    │  │  - 作文批改 (6 维度评分)          │ │ │
-│  │  │  - 屏幕截图/ASR/TTS   │   │    │  │  - 实时助教 Session (感知-决策)   │ │ │
-│  │  └───────────────────────┘   │    │  │  - 学情分析 Agent 集群            │ │ │
-│  └─────────────────────────────┘    │  └─────────────────────────────────┘ │ │
-│                                     │  ┌─────────────────────────────────┐ │ │
-│                                     │  │  Infrastructure                  │ │ │
-│                                     │  │  - LLM 路由 (本地 ↔ 云端竞速)    │ │ │
-│                                     │  │  - TTS 合成 (Kokoro CPU)         │ │ │
-│                                     │  │  - ASR 识别 (SeamlessM4T CPU)    │ │ │
-│                                     │  │  - OCR 识别 (Surya/Paddle)       │ │ │
-│                                     │  └─────────────────────────────────┘ │ │
-│                                     └──────────────────────────────────────┘ │
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │                         数据层 (多存储策略)                               ││
-│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────────┐  ││
-│  │  │ SQLite   │ │ Redis    │ │ ES       │ │ Neo4j    │ │ MinIO        │  ││
-│  │  │ (主业务)  │ │ (缓存/队列)│ │ (全文搜索)│ │ (知识图谱)│ │ (文件/对象)   │  ││
-│  │  │ SQLModel │ │ Celery   │ │ 词汇索引  │ │ 词关系网  │ │ 作文/截图    │  ││
-│  │  └──────────┘ └──────────┘ └──────────┘ └──────────┘ └──────────────┘  ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                             │
-│  ┌─────────────────────────────────────────────────────────────────────────┐│
-│  │                         AI 推理层 (端云协同)                              ││
-│  │  ┌────────────────────────┐    ┌───────────────────────────────────────┐ ││
-│  │  │ 本地 LM Studio (GPU)   │    │ 云端 Kimi API (fallback)              │ ││
-│  │  │ - Qwen3.5-9B (对话)    │    │ - moonshot-v1-auto                    │ ││
-│  │  │ - Qwen-VL (多模态)     │    │ - 网络异常时自动降级                   │ ││
-│  │  │ - RTX 5080 16GB        │    │                                       │ ││
-│  │  └────────────────────────┘    └───────────────────────────────────────┘ ││
-│  └─────────────────────────────────────────────────────────────────────────┘│
-│                                                                             │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────┐    ┌─────────────────────────────────────┐
+│   前端 (Electron + Vue 3)    │    │           后端 (FastAPI)             │
+│   app/v5/                    │    │   backend_fastapi/app/               │
+│  ┌───────────────────────┐   │    │  ┌─────────────────────────────────┐ │
+│  │ Vue 3 SPA (教师/学生)  │   │◄──►│  │ Routers / Interfaces (REST+WS)   │ │
+│  │ 词汇/作文/对话/分析    │   │ WS │  │ vocab/essays/voice/analytics/    │ │
+│  │ RTA 悬浮窗/设置面板    │   │    │  │ admin/auth/realtime-assistant    │ │
+│  └───────────────────────┘   │    │  └─────────────────────────────────┘ │
+│  ┌───────────────────────┐   │    │  ┌─────────────────────────────────┐ │
+│  │ Electron Main          │   │    │  │ Application / Domain             │ │
+│  │ 托盘/全局快捷键/overlay│   │    │  │ 词汇生成/作文评分/SM-2/RTA 会话  │ │
+│  └───────────────────────┘   │    │  │ 学情分析编排                     │ │
+└─────────────────────────────┘    │  └─────────────────────────────────┘ │
+                                   │  ┌─────────────────────────────────┐ │
+                                   │  │ Infrastructure                   │ │
+                                   │  │ LLM 路由(本地↔云端竞速)          │ │
+                                   │  │ TTS: Kokoro → Edge-TTS → 静音    │ │
+                                   │  │ ASR: SeamlessM4T (CPU)           │ │
+                                   │  │ OCR: PaddleOCR → RapidOCR        │ │
+                                   │  └─────────────────────────────────┘ │
+                                   └──────────────────────────────────────┘
+
+数据层: SQLite/SQLModel (主业务) + 可选 Redis (缓存/队列) / Elasticsearch (词汇全文搜索)
+        / Neo4j (知识图谱) / MinIO (对象存储)
+
+AI 推理层: 本地 LM Studio (Qwen3.5-9B) ↔ 云端 Kimi API (moonshot-v1-auto)，竞速或降级
 ```
 
----
-
-## ✨ 核心功能矩阵
-
-### 学生端功能
-
-| 模块 | 功能点 | 技术实现 |
-|------|--------|---------|
-| **词汇** | 查词、OCR 识词、AI 生成释义、SM-2 复习、知识图谱关联 | `routers/vocab.py` + `llm.py` + `domain/srs/` |
-| **作文** | 提交作文、AI 批改（6 维度评分）、错误纠正、全文润色 | `routers/essays.py` + Jinja2 Prompt |
-| **对话** | 实时语音对话、场景选择、打断续接、TTS 播放 | `main.py` WebSocket + `voice_stream.py` |
-| **学习记录** | 学习时长统计、能力雷达图、薄弱环节分析 | `routers/learning.py` + ECharts |
-
-### 教师端功能
-
-| 模块 | 功能点 | 技术实现 |
-|------|--------|---------|
-| **实时助教 (RTA)** | 屏幕感知、语音唤醒 "Hi Helix"、智能建议、TTS 打断 | `domain/realtime_assistant/session.py` |
-| **学情分析** | 班级 Dashboard、学生画像、周报生成、干预任务 | `application/analytics/` |
-| **管理面板** | 用户管理、配置热更新、服务健康检查、日志查看 | `interfaces/admin_router.py` |
-| **悬浮窗查词** | Ctrl+Shift+S 截图查词、Ctrl+Shift+C 划词查词 | `electron/main/managers/system-integration-manager.ts` |
-
----
-
-## 🚀 快速开始
+## 快速开始
 
 ### 环境要求
 
-| 组件 | 最低要求 | 推荐配置 |
-|------|---------|---------|
-| OS | Windows 10 / Ubuntu 20.04 | Windows 11 / Ubuntu 22.04 |
-| Python | 3.10 | **3.13.5 或 3.14.0** |
+| 组件 | 最低 | 推荐 |
+|------|------|------|
+| OS | Windows 10 / Ubuntu 20.04 | Windows 11 |
+| Python | 3.10 | 3.13+ |
 | Node.js | 18 | 20 LTS |
-| GPU | 无（CPU 模式）| RTX 5080 16GB（本地 LLM） |
-| 内存 | 16GB | 64GB（9950X3D 平台） |
-| 磁盘 | 10GB | 50GB SSD |
+| GPU | 无（CPU 模式） | 16GB 显存（本地 LLM） |
+| 内存 | 16GB | 32GB+ |
 
-### 第一步：克隆仓库并创建虚拟环境
+### 1. 克隆并安装后端
 
 ```bash
-# 克隆项目
-git clone <repo-url>
-cd AiforForiegnLanguageLearning
+git clone https://github.com/CUMT-Alethic-Insight-Lab/AIforLanguageLearning.git
+cd AIforLanguageLearning/backend_fastapi
 
-# 创建 Python 虚拟环境 (后端)
-cd backend_fastapi
 python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-# Linux/macOS
-source .venv/bin/activate
-
-# 安装依赖
-pip install -e ".[dev]"
-```
-
-### 第二步：配置环境变量
-
-创建 `backend_fastapi/.env` 文件（参考已有 `.env` 模板）：
-
-```env
-# ===== 基础配置 =====
-AIFL_APP_ENV=development
-AIFL_PORT=8012
-
-# ===== LLM 配置 (本地 LM Studio) =====
-AIFL_LLM_BASE_URL=http://127.0.0.1:1234/v1
-AIFL_LLM_API_KEY=lm-studio
-AIFL_LLM_MODEL=local-model
-AIFL_LLM_TIMEOUT_SECONDS=30
-
-# ===== 数据库 =====
-AIFL_DATABASE_URL=sqlite:///./data/app.db
-
-# ===== JWT =====
-AIFL_JWT_SECRET=your-super-secret-key-change-this-in-production
-
-# ===== 基础设施 (可选，按需启用) =====
-AIFL_REDIS_URL=redis://localhost:6379/0
-AIFL_ES_URL=http://localhost:9200
-AIFL_NEO4J_URL=bolt://localhost:7687
-AIFL_NEO4J_USER=neo4j
-AIFL_NEO4J_PASSWORD=password
-AIFL_MINIO_ENDPOINT=localhost:9000
-AIFL_MINIO_ACCESS_KEY=minioadmin
-AIFL_MINIO_SECRET_KEY=minioadmin
-
-# ===== 语音模块 =====
-AIFL_ENABLE_ASR=true
-AIFL_ASR_BACKEND=seamless
-AIFL_ASR_MODEL=small
-AIFL_ASR_DEVICE=cpu
-AIFL_ASR_COMPUTE_TYPE=int8
-
-# ===== 实时助教 (RTA) =====
-AIFL_RTA_ENABLED=true
-AIFL_RTA_LLM_MODEL=moonshot-v1-auto
-AIFL_RTA_LLM_BASE_URL=
-AIFL_RTA_LLM_API_KEY=
-AIFL_RTA_LLM_TIMEOUT=15
-AIFL_RTA_COOLDOWN=5
-AIFL_RTA_MAX_CONTEXT=6
-AIFL_RTA_TTS_ENABLED=true
-```
-
-### 第三步：启动 LM Studio（本地 LLM）
-
-1. 下载并安装 [LM Studio](https://lmstudio.ai/)
-2. 加载推荐模型：**`Qwen3.5-9B-Instruct`**（或 `Qwen3.5-9B-Instruct-GGUF`）
-3. 开启 Local Server，默认端口 `1234`
-4. 确认模型已加载，左侧显示绿色状态
-
-> ⚠️ **重要**：请勿加载 `Qwen3.5-35B-A3B` 或其他大 MoE 模型作为默认对话模型，除非显式需要。35B 模型虽然激活参数只有 3B，但加载/切换成本高，且会挤占显存。系统已通过 `_score_llm_model` 排序逻辑自动优先选择 9B。
-
-### 第四步：启动基础设施服务（可选）
-
-```powershell
-# 在项目根目录运行 PowerShell 脚本
-./scripts/start_infra_native.ps1
-```
-
-这会启动 Redis、RabbitMQ、Elasticsearch（如果已安装）。
-
-### 第五步：启动后端
-
-```bash
-cd backend_fastapi
 .venv\Scripts\activate        # Windows
 source .venv/bin/activate     # Linux/macOS
 
-# 方式 1：直接启动
-uvicorn app.main:app --host 0.0.0.0 --port 8012 --reload
-
-# 方式 2：通过脚本（推荐，自动检查依赖）
-../scripts/start.ps1
+pip install -e ".[dev]"
 ```
 
-### 第六步：启动前端
+### 2. 配置环境变量
 
-```bash
+在 `backend_fastapi/.env` 中配置（全部以 `AIFL_` 为前缀）：
+
+```env
+AIFL_APP_ENV=development
+AIFL_PORT=8012
+AIFL_DATABASE_URL=sqlite:///./data/app.db
+AIFL_JWT_SECRET=change-this-in-production
+
+# 本地 LLM (LM Studio)
+AIFL_LLM_BASE_URL=http://127.0.0.1:1234/v1
+AIFL_LLM_API_KEY=lm-studio
+AIFL_LLM_MODEL=local-model
+
+# 可选基础设施
+AIFL_REDIS_URL=redis://localhost:6379/0
+AIFL_ES_URL=http://localhost:9200
+AIFL_NEO4J_URL=bolt://localhost:7687
+AIFL_MINIO_ENDPOINT=localhost:9000
+
+# 语音 / 实时助教
+AIFL_ENABLE_ASR=true
+AIFL_ASR_BACKEND=seamless
+AIFL_RTA_ENABLED=true
+AIFL_RTA_LLM_MODEL=moonshot-v1-auto
+```
+
+### 3. 启动 LM Studio
+
+1. 安装 [LM Studio](https://lmstudio.ai/)
+2. 加载 `Qwen3.5-9B-Instruct`（GGUF）
+3. 开启 Local Server（默认端口 1234）
+
+注意：不建议把 35B 级 MoE 模型设为默认对话模型。系统的 `_rank_models` 排序会自动优先选择小模型，但如果 `runtime_config.json` 里缓存了错误的模型 ID，可能误调大模型。
+
+### 4. 启动
+
+```powershell
+# 可选：启动本地基础设施 (Redis / ES 等)
+./scripts/start_infra_native.ps1
+
+# 后端
+cd backend_fastapi
+uvicorn app.main:app --host 0.0.0.0 --port 8012 --reload
+
+# 前端（另开终端）
 cd app/v5
 npm install
 npm run dev
 ```
 
-前端开发服务器默认运行在 `http://localhost:5173`，会自动代理到后端 `http://localhost:8012`。
+一键脚本：`./scripts/start.ps1` 会检查环境并同时拉起前后端。
 
-### 第七步：验证
+### 5. 验证
 
-- 打开浏览器访问 `http://localhost:5173`
-- 或使用 Swagger UI 测试 API：`http://localhost:8012/docs`
+- 前端：`http://localhost:5173`
+- API 文档：`http://localhost:8012/docs`
 - 健康检查：`GET http://localhost:8012/health`
 
----
+## 后端配置
 
-## ⚙️ 后端服务配置详解
+### 两套配置机制
 
-### 1. 配置加载优先级
+| 机制 | 位置 | 用途 |
+|------|------|------|
+| Settings | `app/settings.py` | 启动时加载，环境变量 > `.env` > 默认值，Pydantic Settings 管理 |
+| Runtime Config | `data/runtime_config.json` | 运行时热更新：模型选择、温度等，前端设置面板直接写入 |
 
-后端采用 **Pydantic Settings** 管理配置，加载优先级从高到低：
+### LLM 模型解析链
 
-```
-环境变量 > .env 文件 > 默认值
-```
+调用 `chat_complete()` 未显式传 `model` 时，按以下顺序解析：
 
-所有配置项定义在 `backend_fastapi/app/settings.py` 中，支持通过 `AIFL_` 前缀的环境变量覆盖。
+1. `runtime_config.json` 的场景模型 `models.scene.{scene}`
+2. `runtime_config.json` 的主模型 `models.primary`
+3. Settings 默认模型 `settings.llm_model`
+4. 查询 LM Studio `/models`，按 `_rank_models` 排序取最优（小模型优先；名称含 vl +200、thinking +300、coder +150、a3b/moe +50 的惩罚分）
 
-### 2. 运行时配置热更新
+### 语音对话的 LLM 策略
 
-`backend_fastapi/app/runtime_config.json` 是运行时可写的配置存储，用于：
-- 前端设置面板实时修改模型选择、温度等参数
-- `list_available_llm_models()` 自动缓存 LM Studio 的可用模型列表
-- Prompt 模板热替换
-
-```json
-{
-  "models": {
-    "primary": "qwen/qwen3.5-9b",
-    "available": ["qwen3.5-9b", "qwen/qwen3.5-9b", ...],
-    "scene": {
-      "chat": "qwen/qwen3.5-9b",
-      "vocab": "",
-      "essay": "",
-      "analytics": ""
-    }
-  }
-}
-```
-
-> ⚠️ **注意**：`runtime_config.json` 中的 `models.primary` 会被 `list_available_llm_models()` 自动刷新。如果手动修改，确保使用正确的模型 ID，否则可能导致错误调用大模型。
-
-### 3. LLM 模型解析链
-
-当调用 `chat_complete()` 或 `chat_complete_multimodal()` 且未显式传入 `model` 参数时，系统按以下优先级解析模型：
-
-```
-1. 场景模型 (runtime_config.json models.scene.{scene})
-2. 主模型 (runtime_config.json models.primary)
-3. Settings 默认模型 (settings.llm_model)
-4. 查询 LM Studio /models 端点，按 _rank_models 排序取最优
-   - 排序规则：参数量越小越优先
-   - 惩罚项：vl(+200), thinking(+300), coder(+150), a3b/moe(+50)
-```
-
-### 4. 语音对话链路配置
-
-语音对话（`main.py` WebSocket `/api/voice/start`）采用**云端优先 + 本地兜底**策略：
+语音链路（`main.py` 的 `/ws/v1`）采用**竞速**：云端 Kimi（配置了 `KIMI_API_KEY` 时）与本地 LM Studio 并发请求，首 token 先到者胜出，慢的一方取消。模型名：
 
 ```python
-voice_cloud_model = "moonshot-v1-auto"    # Kimi 云端模型
-voice_local_model = "qwen3.5-9b"          # 本地 LM Studio 模型
+voice_cloud_model = "moonshot-v1-auto"   # Kimi 云端
+voice_local_model = "qwen3.5-9b"         # 本地 LM Studio
 ```
 
-- 若配置了 `KIMI_API_KEY`，优先调用 Kimi，1 秒超时无响应则 fallback 到本地
-- 若未配置 Kimi，直接走本地模型
-- 支持 Barge-in 打断：用户在 AI 播报时发送新音频，系统计算已播报字节比例，将未播报内容注入下一轮上下文
+### 实时助教 (RTA) 决策流程
 
-### 5. 实时助教 (RTA) 配置
-
-RTA 默认使用云端 Kimi（`moonshot-v1-auto`），但可通过环境变量切换到本地：
-
-```env
-AIFL_RTA_LLM_MODEL=qwen3.5-9b
-AIFL_RTA_LLM_BASE_URL=http://127.0.0.1:1234/v1
-AIFL_RTA_LLM_API_KEY=lm-studio
-```
-
-RTA 的核心决策逻辑：
-1. **触发源**：屏幕帧变化 / ASR 语音 / 鼠标框选 / 显式唤醒
-2. **预筛选**：`SmartTriggerEngine` + `ProactiveSuggestionEngine` 检测关键词和信号
-3. **LLM 决策**：`_generate_suggestion()` 调用 LLM，要求返回结构化 JSON
+1. 触发源：屏幕帧变化 / ASR 语音 / 鼠标框选 / 唤醒词
+2. 预筛选：`SmartTriggerEngine` + `ProactiveSuggestionEngine` 检测关键词与信号
+3. LLM 决策：要求返回结构化 JSON：
    ```json
    {
      "should_intervene": true,
@@ -347,414 +202,168 @@ RTA 的核心决策逻辑：
      "urgency": "medium"
    }
    ```
-4. **TTS 条件触发**：仅当 `use_tts=true` 时才合成 Kokoro 音频，默认静默显示
+4. `use_tts=false` 时仅弹窗显示，`true` 时才合成 Kokoro 语音播报
 
----
+RTA 默认用云端 Kimi，可通过 `AIFL_RTA_LLM_BASE_URL` 等环境变量切到本地。
 
-## 🧩 依赖服务矩阵
+## 依赖服务
 
-### 必需依赖
+### 必需
 
-| 服务 | 用途 | 安装方式 | 默认端口 |
-|------|------|---------|---------|
-| **Python 3.10+** | 后端运行时 | 官网下载 | - |
-| **Node.js 18+** | 前端构建 | 官网下载 | - |
-| **LM Studio** | 本地 LLM 推理 | [lmstudio.ai](https://lmstudio.ai/) | 1234 |
-| **SQLite** | 主数据库 | Python 内置 | - |
+| 服务 | 用途 |
+|------|------|
+| Python 3.10+ | 后端运行时 |
+| Node.js 18+ | 前端构建 |
+| LM Studio | 本地 LLM 推理（端口 1234） |
+| SQLite | 主数据库（内置） |
 
-### 可选依赖（按需启用）
+### 可选（不装时自动降级）
 
-| 服务 | 用途 | 安装方式 | 默认端口 | 不启用时的降级行为 |
-|------|------|---------|---------|-------------------|
-| **Redis** | 缓存、Celery 消息队列 | `scoop install redis` / Docker | 6379 | 本地内存字典 |
-| **RabbitMQ** | Celery  broker | `scoop install rabbitmq` / Docker | 5672 | 直接同步执行 |
-| **Elasticsearch** | 词汇全文搜索 | `scoop install elasticsearch` | 9200 | 数据库 LIKE 查询 |
-| **Neo4j** | 知识图谱存储 | Docker / 官网 | 7687 | 跳过图谱功能 |
-| **MinIO** | 对象存储（作文图片等） | Docker / 官网 | 9000 | 本地文件系统 |
-| **Celery Worker** | 异步任务（作文批改、周报生成） | `celery -A app.infrastructure.messaging.celery_app worker` | - | 同步阻塞执行 |
+| 服务 | 用途 | 端口 | 降级行为 |
+|------|------|------|---------|
+| Redis | 缓存、Celery 队列 | 6379 | 本地内存字典 |
+| RabbitMQ | Celery broker | 5672 | 同步执行 |
+| Elasticsearch | 词汇全文搜索 | 9200 | 数据库 LIKE 查询 |
+| Neo4j | 知识图谱 | 7687 | 跳过图谱推荐 |
+| MinIO | 对象存储 | 9000 | 本地文件系统 |
+| Celery Worker | 异步任务（作文批改、周报） | - | 同步阻塞执行 |
 
-### 一键启动脚本
+## 代码结构与设计
 
-```powershell
-# 启动所有基础设施
-./scripts/start_infra_native.ps1
-
-# 启动后端 + 前端开发服务器
-./scripts/start.ps1
-
-# 仅启动服务健康检查
-./scripts/check-services.ts
-```
-
----
-
-## 🏗️ 代码实现逻辑与架构设计
-
-> 本节面向希望深入理解系统设计的开发者。
-
-### 1. 项目目录结构
+### 目录结构
 
 ```
-AiforForiegnLanguageLearning/
-├── app/v5/                          # 前端 (Vue 3 + Electron)
-│   ├── electron/main/               # Electron 主进程
-│   │   ├── managers/                # 窗口管理、系统托盘、IPC
-│   │   └── preload.ts               # 预加载脚本 (contextBridge)
-│   ├── public/overlay.html          # 智能悬浮窗独立页面
-│   ├── src/
-│   │   ├── views/                   # 页面级组件
-│   │   ├── components/              # 通用组件
-│   │   ├── stores/                  # Pinia 状态管理
-│   │   ├── services/                # API 服务封装
-│   │   └── types/                   # TypeScript 类型声明
-│   └── package.json
+├── app/v5/                        # 前端 (Vue 3 + Electron)
+│   ├── electron/main/             # 主进程：窗口/托盘/IPC 管理
+│   ├── public/overlay.html        # RTA 悬浮窗页面
+│   └── src/
+│       ├── views/                 # 页面组件
+│       ├── components/            # 通用组件
+│       ├── stores/                # Pinia 状态
+│       └── services/              # API 封装
 │
-├── backend_fastapi/                 # 后端 (FastAPI)
+├── backend_fastapi/
 │   ├── app/
-│   │   ├── main.py                  # FastAPI 应用入口 + WebSocket 语音链路
-│   │   ├── settings.py              # Pydantic Settings 配置中心
-│   │   ├── llm.py                   # LLM 调用封装 (OpenAI 兼容) + 模型解析
-│   │   ├── model_router.py          # 多模型路由 (本地 ↔ 云端竞速)
-│   │   ├── tts.py                   # TTS 合成 (Kokoro + Edge-TTS fallback)
-│   │   ├── voice_stream.py          # ASR (SeamlessM4T) + VAD
-│   │   ├── ocr.py                   # OCR 图像识别
-│   │   ├── db.py                    # SQLModel / SQLAlchemy 数据库会话
-│   │   ├── runtime_config.py        # 运行时可变配置 (热更新)
-│   │   ├── prompts/                 # Jinja2 Prompt 模板
-│   │   │   ├── essay_grade.j2
-│   │   │   └── ...
-│   │   ├── domain/                  # 领域层 (核心业务逻辑)
-│   │   │   ├── models.py            # SQLModel 实体定义
-│   │   │   ├── realtime_assistant/  # RTA 实时助教
-│   │   │   │   ├── session.py       # 单会话感知-决策-行动闭环
-│   │   │   │   ├── suggestion_engine.py  # 主动建议引擎
-│   │   │   │   ├── trigger_engine.py     # 智能触发决策
-│   │   │   │   └── screen_detector.py    # 屏幕变化检测
-│   │   │   └── srs/                 # SM-2 间隔重复算法
-│   │   ├── application/             # 应用层 (用例编排)
-│   │   │   └── analytics/           # 学情分析
-│   │   │       ├── agents.py        # LLM Agent 定义
-│   │   │       ├── orchestration.py # 分析编排器
-│   │   │       ├── weekly_report.py # 周报生成
-│   │   │       └── daily_summary.py # 日报汇总
-│   │   ├── interfaces/              # 接口适配层 (REST + WS)
-│   │   │   ├── admin_router.py      # 管理面板 API
-│   │   │   ├── auth_router.py       # 认证 API
-│   │   │   └── realtime_assistant_router.py  # RTA WebSocket
-│   │   ├── routers/                 # 业务路由
-│   │   │   ├── vocab.py             # 词汇 API
-│   │   │   ├── essays.py            # 作文 API
-│   │   │   ├── voice.py             # 语音对话 HTTP API
-│   │   │   ├── learning.py          # 学习记录 API
-│   │   │   ├── system.py            # 系统配置 API
-│   │   │   └── compat_legacy.py     # 旧版兼容 API
-│   │   └── infrastructure/          # 基础设施层
-│   │       ├── security.py          # JWT / 密码哈希
-│   │       ├── messaging/           # Celery / 消息队列
-│   │       └── persistence/         # ES / Neo4j 客户端
-│   ├── data/                        # SQLite 数据库 + runtime_config.json
-│   ├── tests/                       # pytest 测试集
-│   ├── alembic/                     # 数据库迁移
-│   └── pyproject.toml
+│   │   ├── main.py                # 应用入口 + 语音 WebSocket (/ws/v1)
+│   │   ├── settings.py            # Pydantic Settings
+│   │   ├── llm.py                 # LLM 调用封装 + 模型解析
+│   │   ├── model_router.py        # 本地/云端路由
+│   │   ├── tts.py                 # Kokoro → Edge-TTS → 静音
+│   │   ├── voice_stream.py        # ASR (SeamlessM4T) + VAD
+│   │   ├── ocr.py                 # PaddleOCR → RapidOCR
+│   │   ├── runtime_config.py      # 运行时配置热更新
+│   │   ├── prompts/               # Jinja2 Prompt 模板
+│   │   ├── domain/                # 领域层
+│   │   │   ├── models.py          # User / VocabularyItem / LearningRecord 等
+│   │   │   ├── srs/               # SM-2 间隔重复
+│   │   │   ├── realtime_assistant/# RTA：session / trigger / suggestion / screen
+│   │   │   └── classroom/         # Classroom / ClassEnrollment
+│   │   ├── application/           # 应用层：学情分析编排、周报、日报
+│   │   ├── interfaces/            # 接口层：admin / auth / analytics / RTA 等 router
+│   │   ├── routers/               # 业务路由：vocab / essays / voice / learning / system
+│   │   └── infrastructure/        # 安全、消息队列、ES/Neo4j 客户端
+│   ├── data/                      # SQLite 数据库 + runtime_config.json
+│   ├── tests/                     # pytest
+│   └── alembic/                   # 数据库迁移
 │
-├── docs/                            # 架构文档
-│   ├── Detailed_System_Architecture.md
-│   └── agent_prompts/               # Agent Prompt 设计文档
-│
-├── scripts/                         # 自动化脚本
-│   ├── start.ps1
-│   ├── start_infra_native.ps1
-│   └── check-services.ts
-│
-├── shared/types/                    # 前后端共享类型
-└── README.md
+├── docs/                          # 架构与开发文档
+├── scripts/                       # start.ps1 / start_infra_native.ps1 / check-services.ts
+└── shared/types/                  # 前后端共享类型
 ```
 
-### 2. 后端架构：分层设计
+### 分层约定
 
-采用 **Clean Architecture 简化版**——四层分离，但不过度抽象：
+`interfaces/routers → application → domain → infrastructure`，只允许上层依赖下层。
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Interfaces (接口层)                                          │
-│  - FastAPI Routers / WebSocket Endpoints                     │
-│  - 负责：序列化/反序列化、认证鉴权、参数校验                  │
-│  - 不直接调用外部服务，只调用 Application / Domain          │
-├─────────────────────────────────────────────────────────────┤
-│  Application (应用层)                                         │
-│  - 用例编排：analytics orchestration、RTA session           │
-│  - 负责：事务边界、跨领域协调、DTO 转换                     │
-├─────────────────────────────────────────────────────────────┤
-│  Domain (领域层)                                              │
-│  - 核心业务：词汇生成、作文评分、SM-2 算法、RTA 决策         │
-│  - 负责：业务规则、领域模型、不依赖外部框架                   │
-├─────────────────────────────────────────────────────────────┤
-│  Infrastructure (基础设施层)                                  │
-│  - 外部适配：数据库、LLM HTTP 客户端、TTS、ASR、缓存         │
-│  - 负责：技术细节、框架代码、可替换的实现                     │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 3. LLM 调用链路详解
+### 语音 WebSocket 协议 (`/ws/v1`)
 
 ```
-┌─────────────┐     ┌─────────────────┐     ┌─────────────────────┐
-│   Router    │────►│  model_router   │────►│  _resolve_llm_model │
-│  (业务路由)  │     │  (多模型路由)    │     │  (模型解析 + 缓存)   │
-└─────────────┘     └─────────────────┘     └─────────────────────┘
-                                                       │
-              ┌────────────────────────────────────────┘
-              ▼
-┌─────────────────────┐     ┌─────────────────────┐
-│  chat_complete()    │     │ chat_complete_multimodal()
-│  (纯文本对话)        │     │ (文本 + 图片多模态)
-└─────────────────────┘     └─────────────────────┘
-              │                           │
-              ▼                           ▼
-┌─────────────────────────────────────────────────────────┐
-│  _build_chat_messages()                                  │
-│  - system_prompt (Jinja2 模板)                           │
-│  - history (最近 N 轮上下文)                              │
-│  - user_text / image_base64                              │
-└─────────────────────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  httpx.AsyncClient → POST /chat/completions            │
-│  - OpenAI 兼容格式                                       │
-│  - 支持 streaming / non-streaming                        │
-└─────────────────────────────────────────────────────────┘
-              │
-              ▼
-┌─────────────────────────────────────────────────────────┐
-│  _extract_chat_response_text() / _extract_delta_text()  │
-│  - 处理 content / reasoning_content / delta 多种格式    │
-│  - 容错空响应、异常 JSON                                  │
-└─────────────────────────────────────────────────────────┘
+Client                             Server
+  │────── AUDIO_START ──────────────►│  开始一轮对话
+  │────── AUDIO_CHUNK (binary) ─────►│  音频流
+  │                                  │  VAD → ASR → LLM(竞速) → TTS
+  │◄───── ASR_PARTIAL / ASR_FINAL ───│  转写中间/最终结果
+  │◄───── LLM_TOKEN / LLM_RESULT ────│  流式/完整回复
+  │◄───── TTS_CHUNK / TTS_RESULT ────│  音频分片/完毕
+  │◄───── TASK_FINISHED ─────────────│  本轮结束
+  │────── AUDIO_BARGE_IN ───────────►│  用户打断：取消当前 TTS，
+  │                                  │  未播报内容注入下一轮上下文
 ```
 
-### 4. 语音对话 WebSocket 协议
+### 数据模型
 
-```
-Client (Electron)              Server (FastAPI)
-      │                              │
-      ├────── WS CONNECT ───────────►│
-      │                              │
-      ├────── AUDIO_START ──────────►│  开始新对话轮次
-      │                              │
-      ├────── AUDIO_CHUNK (binary) ─►│  音频流 (Opus / PCM)
-      │                              │  ┌── VAD 检测语音端点
-      │                              │  ├── ASR 识别 (SeamlessM4T)
-      │                              │  ├── LLM 推理 (Kimi → 本地 fallback)
-      │                              │  └── TTS 合成 (Kokoro)
-      │                              │
-      │◄───── ASR_PARTIAL ──────────┤  实时转写中间结果
-      │◄───── ASR_FINAL ────────────┤  最终转写文本
-      │◄───── LLM_TOKEN ────────────┤  流式生成 token (调试)
-      │◄───── LLM_RESULT ───────────┤  完整回复文本
-      │◄───── TTS_CHUNK (base64) ───┤  音频分片 (WAV)
-      │◄───── TTS_RESULT ───────────┤  音频发送完毕
-      │◄───── TASK_FINISHED ────────┤  本轮结束
-      │                              │
-      ├────── AUDIO_END ────────────►│  用户停止说话
-      │                              │
-      ├────── AUDIO_BARGE_IN ───────►│  用户打断，取消当前 TTS
-      │                              │
-```
+- `User`、`StudentProfile`、`VocabularyItem`、`LearningRecord`、`LearningPath` — `app/domain/models.py`
+- `ConversationEvent`、`EssaySubmission` — `app/models.py`
+- `Classroom`、`ClassEnrollment` — `app/domain/classroom/models.py`
+- `PromptRegistry`（Prompt 模板版本管理）— `app/domain/prompt_management/models.py`
 
-### 5. 实时助教 (RTA) 决策流
+## API 速查
 
-```
-屏幕帧 / ASR / 框选 / 唤醒词
-        │
-        ▼
-┌─────────────────────────────┐
-│  SmartTriggerEngine         │  事件缓冲区 + 优先级决策
-│  ProactiveSuggestionEngine  │  关键词检测（犹豫/重复/纠错/唤醒）
-└─────────────────────────────┘
-        │
-        ▼ 触发条件满足
-┌─────────────────────────────┐
-│  RealtimeAssistantSession   │
-│  ._generate_suggestion()     │
-│                             │
-│  1. 组装 Prompt (课件+语音) │
-│  2. LLM 调用 (多模态降级)   │
-│  3. _extract_rta_decision() │  解析 JSON 决策
-│  4. should_intervene?       │
-│     ├── false → 静默丢弃    │
-│     └── true  → 继续        │
-│  5. use_tts?                │
-│     ├── false → 仅 overlay  │
-│     └── true  → overlay + TTS│
-└─────────────────────────────┘
-        │
-        ▼
-┌─────────────────────────────┐
-│  WebSocket → 前端 overlay   │
-│  悬浮窗显示 (entry/loading/result)
-└─────────────────────────────┘
-```
-
-### 6. 数据库实体关系
-
-核心实体（`app/domain/models.py`）：
-
-- **User** - 用户（学生/教师/管理员，RBAC 权限）
-- **Vocabulary** - 词汇条目（单词、CEFR 级别、义项 JSON）
-- **VocabularyReview** - 复习记录（SM-2 参数：interval, repetitions, ease_factor, next_review）
-- **EssaySubmission** - 作文提交（原文、批改结果 JSON、分数）
-- **Conversation** - 对话会话（语音对话上下文）
-- **LearningRecord** - 学习记录（时长、模块、正确率）
-- **Class** / **ClassAssignment** - 班级与学生分配
-- **PromptTemplate** - Prompt 模板版本管理
-
-### 7. 关键设计模式
-
-| 模式 | 应用位置 | 说明 |
-|------|---------|------|
-| **Repository** | `db.py` + `routers/` | SQLModel Session 依赖注入 |
-| **Strategy** | `model_router.py` | 本地/云端模型竞速策略 |
-| **Chain of Responsibility** | `llm.py` 降级链 | 多模态 → 纯文本 → 竞速 → fallback |
-| **State Machine** | `session.py` RTA | 会话状态管理（_active, _lock） |
-| **Observer** | `suggestion_engine.py` | ASR 流事件监听与信号检测 |
-| **Template Method** | `prompts/*.j2` | Jinja2 Prompt 模板化 |
-
----
-
-## 📡 API 接口速查
-
-### 核心 REST API
+### REST
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
-| `POST /v1/vocab/lookup` | 查词 | 传入单词，返回结构化释义 |
-| `POST /v1/vocab/lookup-ocr` | OCR 查词 | 传入图片 Base64，识别后查词 |
-| `POST /v1/essays/grade` | 作文批改 | 6 维度评分 + 润色 |
-| `GET /api/voice/generate-prompt` | 生成对话提示 | 按场景生成开场白 |
-| `POST /api/auth/login` | 登录 | JWT Token |
-| `GET /api/admin/services` | 服务健康检查 | LLM / ASR / TTS / 基础设施 |
-| `GET /health` | 健康检查 | 服务存活探针 |
+| `/v1/vocab/lookup` | POST | 查词，返回结构化释义 |
+| `/v1/vocab/lookup-ocr` | POST | 图片 OCR 后查词 |
+| `/v1/essays/grade` | POST | 作文批改（六维度评分） |
+| `/api/voice/generate-prompt` | POST | 按场景生成对话开场白 |
+| `/api/auth/login` | POST | 登录，返回 JWT |
+| `/api/admin/services` | GET | 服务健康检查 |
+| `/health` | GET | 存活探针 |
 
-### WebSocket 端点
+### WebSocket
 
 | 端点 | 说明 |
 |------|------|
-| `WS /api/voice/start` | 语音对话主链路 |
-| `WS /api/v1/realtime-assistant/ws` | 实时助教 |
+| `/ws/v1` | 语音对话主链路 |
+| `/api/v1/realtime-assistant/ws` | 实时助教 |
 
-### Swagger UI
+完整文档见启动后的 `http://localhost:8012/docs`。
 
-启动后端后访问：`http://localhost:8012/docs`
-
----
-
-## 🔧 开发指南
-
-### 后端开发
+## 开发指南
 
 ```bash
+# 后端
 cd backend_fastapi
-.venv\Scripts\activate
+pytest                      # 单元测试（asyncio_mode=auto）
+ruff check app/             # 代码检查 (line-length=100)
+alembic revision --autogenerate -m "change" && alembic upgrade head
 
-# 运行测试
-pytest tests/ -q
-
-# 运行特定测试
-pytest tests/test_realtime_assistant.py -v
-
-# 代码格式化
-ruff check .
-ruff format .
-
-# 数据库迁移
-alembic revision --autogenerate -m "describe_change"
-alembic upgrade head
-```
-
-### 前端开发
-
-```bash
+# 前端
 cd app/v5
-npm run dev          # 开发服务器
-npm run build        # 生产构建 (vue-tsc + vite)
-npm run build:electron   # 编译 Electron 主进程
-electron-builder     # 打包可执行文件
+npm run dev                 # 开发服务器
+npm run build               # 生产构建 (vue-tsc + vite)
+npm run dist                # Electron 打包，输出至 release/
 ```
 
-### 添加新 Router
+新增 router：在 `interfaces/`（新功能）或 `routers/` 下创建文件，在 `main.py` 中 `app.include_router()`。
 
-1. 在 `backend_fastapi/app/routers/` 创建新文件
-2. 继承 `APIRouter`，定义端点
-3. 在 `backend_fastapi/app/main.py` 中 `app.include_router()`
-4. 更新 `README.md` API 速查表
+更多规范见 [AGENTS.md](AGENTS.md) 和 [docs/development_guide/](docs/development_guide/)。
 
----
+## 硬件推荐
 
-## 🖥️ 硬件推荐与性能基准
+全本地推理的参考配置：
 
-### 推荐配置（全本地推理）
-
-| 组件 | 型号 | 用途分配 |
-|------|------|---------|
+| 组件 | 型号 | 用途 |
+|------|------|------|
 | CPU | AMD Ryzen 9 9950X3D | ASR / OCR / TTS / 业务逻辑 |
-| GPU | RTX 5080 16GB | LLM 推理 (Qwen3.5-9B ~7GB) |
-| 内存 | 64GB DDR5-5600 | 多模型并发缓冲 |
-| 存储 | 1TB NVMe SSD | 模型文件 + 数据库 |
+| GPU | RTX 5080 16GB | LLM 推理（Qwen3.5-9B 约 7GB） |
+| 内存 | 64GB DDR5 | 多模型并发缓冲 |
 
-### 各模块资源占用
+各模块大致开销：LLM 约 7GB 显存、TTS（Kokoro）与 ASR（SeamlessM4T）均跑 CPU。主链路不常驻 GPU 大型 TTS，16GB 显存可同时容纳 LLM 和一个视觉模型。
 
-| 模块 | GPU 显存 | GPU 利用率 | 延迟 |
-|------|---------|-----------|------|
-| LLM (Qwen3.5-9B) | ~7GB | 30-40% | ~500ms/token |
-| TTS (Kokoro CPU) | 0GB | 0% | 500-1200ms |
-| ASR (SeamlessM4T CPU) | 0GB | 0% | ~300ms |
-| VLM (MiniCPM-V) | ~4GB | - | - |
+## 故障排查
 
-> 💡 **显存优化**：当前主链路已去除 XTTS 常驻 GPU 依赖，16GB 显存可舒适容纳 LLM + VLM。
+| 现象 | 可能原因 | 处理 |
+|------|---------|------|
+| `ModuleNotFoundError` | venv 未激活或依赖未装 | `pip install -e ".[dev]"` |
+| `Address already in use` | 8012 端口被占 | 杀掉占用进程或改 `AIFL_PORT` |
+| 调用了非预期的大模型 | `runtime_config.json` 缓存了错误模型 ID | 删除 `backend_fastapi/data/runtime_config.json` 后重启 |
+| `404 model not found` | LM Studio 未加载模型 | 加载 `Qwen3.5-9B-Instruct` |
+| LLM 响应极慢 | 显存不足换页 | 换更小模型或释放显存 |
+| 语音对话无声音 | 麦克风权限 / ASR 未启用 / LM Studio 未运行 | 检查 `AIFL_ENABLE_ASR` 与后端日志中的 ASR/TTS 报错 |
+| 前端 `vue-tsc` 报错 | 类型不匹配 | `npm run build` 会严格检查，按报错修 |
 
----
+## 许可证
 
-## 🐛 故障排查
-
-### 后端启动失败
-
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `ModuleNotFoundError` | 虚拟环境未激活或依赖未安装 | `pip install -e ".[dev]"` |
-| `Address already in use` | 端口 8012 被占用 | `lsof -i :8012`  kill 掉，或改 `AIFL_PORT` |
-| `Pydantic validation error` | `.env` 文件格式错误 | 检查是否有中文引号或缺失值 |
-
-### LLM 调用异常
-
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| 总是调用 35B 大模型 | `runtime_config.json` 缓存污染 | 删除 `backend_fastapi/data/runtime_config.json` 重启，或检查 `llm.py` `_resolve_llm_model` |
-| `404 model not found` | LM Studio 未加载对应模型 | 在 LM Studio 中加载 `Qwen3.5-9B` |
-| 响应极慢 | GPU 显存不足导致换页 | 关闭其他 GPU 程序，或换更小模型 |
-| 返回 `(网络不太稳定)` | LM Studio 未启动或端口错误 | 检查 `AIFL_LLM_BASE_URL` 和 LM Studio Server 状态 |
-
-### 前端构建失败
-
-| 现象 | 原因 | 解决 |
-|------|------|------|
-| `vue-tsc` 类型错误 | TS 类型不匹配 | `npm run build` 会严格检查，修复类型声明 |
-| Electron 打包失败 | 缺少 `electron-builder` 配置 | 检查 `app/v5/package.json` `build` 字段 |
-
-### 语音对话无声音
-
-1. 检查浏览器/Electron 是否有麦克风权限
-2. 检查 `AIFL_ENABLE_ASR=true`
-3. 检查 LM Studio 是否运行（本地 fallback 需要）
-4. 查看后端日志是否有 `ASR failed` 或 `TTS failed`
-
----
-
-## 📄 许可证
-
-MIT License © 2025 AIFL Team
-
----
-
-*README 版本: v2.0*  
-*更新日期: 2026-04-19*
+MIT License © 2025-2026 CUMT Alethic Insight Lab
