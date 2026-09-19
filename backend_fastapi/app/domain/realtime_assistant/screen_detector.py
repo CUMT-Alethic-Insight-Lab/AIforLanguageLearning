@@ -62,7 +62,9 @@ class ScreenChangeDetector:
         self.last_hash: Any = None
         self.last_capture: bytes | None = None
 
-    def detect_change(self, current_frame: bytes, *, format_hint: str = "jpeg") -> ScreenChangeResult:
+    def detect_change(
+        self, current_frame: bytes, *, format_hint: str = "jpeg"
+    ) -> ScreenChangeResult:
         """检测屏幕是否发生显著变化。
 
         Args:
