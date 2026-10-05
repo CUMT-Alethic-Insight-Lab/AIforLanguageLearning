@@ -111,8 +111,8 @@ env_check/tmp/
 app/v5/resources/whisper/*.zip
 
 # Test media assets (large binary files, not for version control)
-testresources/*.wav
-testresources/*.png
+scripts/model_experiments/*.wav
+scripts/model_experiments/*.png
 app/v5/resources/whisper/*.bin
 app/v5/resources/whisper/Release/
 app/v5/resources/whisper/*.exe

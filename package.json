@@ -1,16 +1,6 @@
 {
-  "devDependencies": {
-    "@types/bcrypt": "^5.0.0",
-    "@types/jest": "^29.5.14",
-    "@types/supertest": "^6.0.3",
-    "jest": "^29.7.0",
-    "pure-rand": "^7.0.1",
-    "supertest": "^7.1.4",
-    "ts-jest": "^29.4.6",
-    "yargs": "^18.0.0"
-  },
+  "private": true,
   "dependencies": {
-    "axios": "^1.13.2",
-    "bcrypt": "^6.0.0"
+    "axios": "^1.13.2"
   }
 }

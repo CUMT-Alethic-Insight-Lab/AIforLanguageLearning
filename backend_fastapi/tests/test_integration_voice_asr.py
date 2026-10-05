@@ -41,7 +41,7 @@ def _expected_contains() -> str:
 def _load_asr_test_pcm_16k() -> bytes:
     repo_root = Path(__file__).resolve().parents[2]
     candidate_paths = [
-        repo_root / "testresources" / "ASRtest.wav",
+        repo_root / "scripts" / "model_experiments" / "ASRtest.wav",
         repo_root / "tests" / "test-audio.wav",
         repo_root / "app" / "v5" / "resources" / "whisper" / "test_hello.wav",
         repo_root / "env_check" / "zero_shot_prompt.wav",
